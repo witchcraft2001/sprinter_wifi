@@ -7,7 +7,13 @@
 	DEFINE	_ESP_TCP
 
 TCP_DEFAULT_TIMEOUT	EQU 5000
+	IFDEF	TCP_LONG_OPEN_TIMEOUT
+TCP_OPEN_TIMEOUT	EQU 60000			; DNS plus an external ESP8266 TCP connect
+	ELSE
 TCP_OPEN_TIMEOUT	EQU 20000			; connect timeout; was 60000 — too long to wait out a wedged/half-open link
+	ENDIF
+TCP_BUSY_RETRIES	EQU 10				; CIPSTART retries while the ESP answers "busy p..."
+TCP_BUSY_DELAY		EQU 400				; ms between busy retries
 TCP_CMD_SIZE		EQU 192
 TCP_LINE_SIZE		EQU 64
 TCP_DEBUG_SIZE		EQU 12
@@ -52,11 +58,42 @@ OPEN
 	CALL	APPEND_STR
 
 	LD	HL,CMD_BUFFER
-	LD	DE,WIFI.RS_BUFF
 	LD	BC,TCP_OPEN_TIMEOUT
+	JP	TX_CMD_BUSY_RETRY
+
+; ------------------------------------------------------
+; Send the AT command at HL (timeout BC), retrying while the ESP answers
+; "busy p...". Right after NETUP's join the IP stack may still be coming up,
+; so the first network command of a utility fails with RES_BUSY even though
+; plain AT already works; a short settle-and-retry loop bridges that window
+; the same way PING's dedicated loop does.
+; Out: CF=0/A=0 on success, CF=1/A=result code on failure.
+; ------------------------------------------------------
+TX_CMD_BUSY_RETRY
+	LD	(BUSY_CMD),HL
+	LD	(BUSY_TIMEOUT),BC
+	LD	A,TCP_BUSY_RETRIES
+	LD	(BUSY_LEFT),A
+.TRY
+	LD	HL,(BUSY_CMD)
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,(BUSY_TIMEOUT)
 	CALL	WIFI.UART_TX_CMD
 	AND	A
 	RET	Z
+	CP	RES_BUSY
+	JR	NZ,.FAIL
+	LD	A,(BUSY_LEFT)
+	AND	A
+	JR	Z,.EXHAUSTED
+	DEC	A
+	LD	(BUSY_LEFT),A
+	LD	HL,TCP_BUSY_DELAY
+	CALL	UTIL.DELAY
+	JR	.TRY
+.EXHAUSTED
+	LD	A,RES_BUSY
+.FAIL
 	SCF
 	RET
 
@@ -146,6 +183,9 @@ START_SEND_BUFFER
 ; - Data is binary; no zero terminator is appended.
 ; ------------------------------------------------------
 RECEIVE
+	; Reassert the profile-specific streaming trigger without flushing queued
+	; +IPD bytes. The 2.2.1 routine is a no-op and retains its proven trigger 8.
+	CALL	WIFI.UART_SET_DATA_RX_MODE
 	LD	(RECV_PTR),HL
 	LD	(RECV_REMAIN),BC
 	LD	(RECV_TIMEOUT),DE
@@ -800,6 +840,11 @@ LSR_ACCUM	DB 0
 RBT_CANCEL_TICK	DW 0
 
 LINE_REMAIN	DB 0
+
+; TX_CMD_BUSY_RETRY state
+BUSY_CMD	DW 0
+BUSY_TIMEOUT	DW 0
+BUSY_LEFT	DB 0
 
 ; Pointer into IPD_PREFIX while WAIT_SEND_OK is incrementally checking
 ; whether the line being accumulated starts with "+IPD,". Set to zero

@@ -42,8 +42,8 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   the file exists, WGET asks `[R]esume / [O]verwrite / [C]ancel`; `-y` (or `-f`)
   overwrites without prompting and `-r` resumes (appends, HTTP Range) without
   prompting.
-- `NTP.EXE` sets DSS time using ESP-AT SNTP and the `TZ`/`NTP` values from
-  `NET.CFG`.
+- `NTP.EXE` sets DSS time over UDP NTP using the `NET_TZ`/`NET_NTP` values
+  published by `NETUP.EXE`.
 - `NETPROBE.EXE` checks low-level UART and ESP-AT firmware response. It is a
   diagnostic tool, not a network bring-up command.
 - `NETRESET.EXE` resets and reinitializes the ESP module.
@@ -189,8 +189,13 @@ Wi-Fi association; a remaining failure prints the actual ESP response and
 returns status `3`.
 
 `NETRESET.EXE` and `WTERM.EXE` are recovery/manual tools and use the default
-115200 startup speed after ESP reset. Automated clients use `BAUD` from
-`NET.CFG` when the file is available.
+115200 startup speed after ESP reset. Client utilities never read `NET.CFG`
+themselves (the file belongs to `NETUP.EXE`/`NETCFG.EXE`): they take the UART
+speed from the `NET_BAUD` environment variable published by a successful
+`NETUP.EXE` run, falling back to 115200 when it is not set. This makes the
+tools independent of the current directory they are started from. They also
+use `NET_ESP_FLOW=3` or `0` to reproduce NETUP's negotiated local UART mode;
+clients do not resend `AT+UART_CUR` or toggle AFE during the live session.
 
 ## Exit Codes
 

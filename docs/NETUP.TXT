@@ -28,8 +28,8 @@ Behavior
 
   At every speed, including the 115200 default, NETUP configures the ESP as
   AT+UART_CUR=<baud>,8,1,0,3 and the TL16C550 with RTS/CTS auto-flow. It does
-  not fall back to flow=0: that would make a slow DSS consumer lose input while
-  the ESP keeps transmitting.
+  fall back to a matched flow=0/manual-RTS mode only when the hardware CTS path
+  cannot be verified; NET_ESP_FLOW tells later utilities which mode was used.
 
   After a successful connection, the package utilities can use the current
   network settings until DSS is restarted.
@@ -54,6 +54,10 @@ Firmware profiles and session settings
   "ESP firmware profile: 2.2.2" and is published as NET_ESP_FW. Programs
   must not use AT+CIPRECVMODE=1 when NET_ESP_FW=2.2.1; 2.2.2 is the profile
   intended for software that needs that command.
+
+  NETUP also publishes NET_ESP_FLOW=3 when hardware RTS/CTS was negotiated,
+  or NET_ESP_FLOW=0 after the speed-only fallback. Other utilities use this
+  value to initialize their local UART without changing the live ESP session.
 
   NETUP does not try a second command dialect for every setting. If a required
   command fails, it prints the response collected from the ESP before the

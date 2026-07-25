@@ -24,10 +24,11 @@ CMDLINE_ADDR		EQU LOAD_ADDR - 0x80
 STACK_TOP		EQU 0x8000
 WIN2_BASE		EQU 0x8000
 SCROLL_STACK_TOP	EQU 0xBFF0		; temp stack: DSS Scroll repages WIN1
-; The UART is flow-controlled while terminal rendering runs, so a 352-byte
-; staging block is sufficient and retains the mandatory 256-byte WIN1 stack
-; margin after the shared dual-firmware UART negotiation code.
-RECV_BUFFER_SIZE	EQU 352
+; The UART is flow-controlled while terminal rendering runs, so a small
+; staging block is sufficient; 272 still covers a full 256-byte burst with
+; header slack and retains the mandatory 256-byte WIN1 stack margin after
+; the shared env-baud/busy-retry startup code.
+RECV_BUFFER_SIZE	EQU 272
 RX_DRAIN_SPIN		EQU 200			; RX_DRAIN inter-byte wait (bridges ~87us gaps)
 HOST_SIZE		EQU 96
 PORT_SIZE		EQU 8
@@ -145,16 +146,14 @@ START
 	JP	C,NO_WIFI
 	CALL	WCOMMON.REQUIRE_NET_UP
 
-	CALL	NETCFG.LOAD
-	CALL	NETCFG.APPLY_UART_BAUD
+	CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 	CALL	WIFI.UART_INIT
 
 	LD	HL,CMD_AT
 	CALL	SEND_CMD_RECOVER
 	LD	HL,CMD_ECHO_OFF
 	CALL	SEND_CMD
-	; Transparent mode can receive continuously, so explicitly pair the local
-	; 16550 AFE+RTS setup with ESP-AT flow=3 on every program launch.
+	; Verify the NET_ESP_FLOW-selected local mode before transparent traffic.
 	CALL	WCOMMON.SETUP_UART_FLOW
 	AND	A
 	JR	Z,.UART_FLOW_OK

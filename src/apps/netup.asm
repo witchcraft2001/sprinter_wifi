@@ -8,6 +8,10 @@ DEFAULT_TIMEOUT		EQU 2000
 JOIN_TIMEOUT		EQU 30000
 UART_SWITCH_SETTLE	EQU 300
 UART_VERIFY_RETRIES	EQU 6		; AT attempts after a baud switch before giving up
+NETUP_BUSY_RETRIES	EQU 10		; command retries while the ESP answers "busy p..."
+NETUP_BUSY_DELAY	EQU 500		; ms between busy retries
+NETUP_IP_RETRIES	EQU 30		; AT+CIFSR polls while the DHCP lease is pending
+NETUP_IP_DELAY		EQU 500		; ms between CIFSR polls
 EXE_DIR_SIZE		EQU 272		; APPINFO path (up to 256) + "NET.CFG",0
 
 ; NETUP normally determines the profile with AT+SYSSTORE?. The package-wide
@@ -117,10 +121,12 @@ START
 	LD	BC,JOIN_TIMEOUT
 	CALL	SEND_CMD_TIMEOUT
 
-	CALL	APPLY_DNS_OPTIONAL
-
 	PRINTLN MSG_IP_INFO
 	CALL	QUERY_STATION_INFO
+
+	; Apply optional network settings only after CIFSR/CIPSTA proved that the
+	; station and DHCP route are ready.
+	CALL	APPLY_DNS_OPTIONAL
 
 	PRINTLN MSG_PUBLISH_ENV
 	CALL	PUBLISH_NET_ENV
@@ -217,7 +223,7 @@ DETECT_ESP_FIRMWARE
 	ELSE
 	LD	HL,CMD_SYSSTORE_QUERY
 	LD	BC,DEFAULT_TIMEOUT
-	CALL	SEND_CMD_STATUS_TIMEOUT
+	CALL	SEND_CMD_BUSY_TIMEOUT		; previous command may still be finishing
 	AND	A
 	JR	Z,.FW222
 	CP	RES_ERROR
@@ -348,28 +354,15 @@ SEND_AT_STARTUP
 	JP	SEND_CMD
 
 APPLY_UART_SETTING
-	; Every network executable reinitializes its own 16550, so NETUP also makes
-	; the ESP-side UART contract explicit even at the default 115200 baud:
-	; AT+UART_CUR=<baud>,8,1,0,3 paired with local AFE+RTS. GET_UART_DIVISOR
-	; treats an empty/unknown BAUD as the safe 115200 divisor (8).
-	CALL	NETCFG.GET_UART_DIVISOR
-	CP	8
-	JR	NZ,.CUSTOM_BAUD
-	PRINTLN	MSG_UART_DEFAULT
-
-.CUSTOM_BAUD
-	; Keep the established 2.2.1 UART contract untouched: that firmware was
-	; qualified for two months with manual RTS and ESP flow=0.  The 2.2.2 AFE
-	; experiment is selected only for its profile (or a forced 2.2.2 build).
-	IFDEF	ESP_AT_FORCE_221
-	JR		.LEGACY_NO_FLOW
-	ELSE
-	IFNDEF	ESP_AT_FORCE_222
-	LD		A,(ESP_FW_PROFILE)
-	CP		ESP_FW_221
-	JR		Z,.LEGACY_NO_FLOW
-	ENDIF
-	ENDIF
+	; Negotiate the ESP UART exactly once per NETUP session, including 115200.
+	; Client programs subsequently read NET_BAUD and NET_ESP_FLOW and configure
+	; only their local 16550; they must not repeat AT+UART_CUR or toggle AFE in
+	; the middle of a live session. Both firmware profiles use the field-proven
+	; flow=3 contract whenever the card wiring accepts it. With
+	; flow=0 the ESP ignores CTS, so the manual RTS pauses used by every
+	; download path stop working on the wire and the RX FIFO overruns at
+	; higher bauds. Modules whose RTS/CTS pins are unusable still fall back
+	; to the speed-only (flow=0) contract below.
 	; Enable FULL hardware flow control (flow=3) when switching baud. This is
 	; what gives the host's 16550 auto-flow a working CTS (so AT commands go
 	; out) AND lets the ESP pause its TX under load — essential at higher bauds
@@ -383,14 +376,27 @@ APPLY_UART_SETTING
 	AND	A
 	JR	Z,.FLOW_OK
 
+	; A syntactic ERROR/FAIL or persistent busy means AT+UART_CUR was rejected
+	; before changing the UART, so it is safe to try the flow=0 form at the
+	; current baud. Any other result may mean that ESP changed baud before its
+	; final reply was received; do not reset a successfully associated module
+	; or blindly send another command at an uncertain baud.
+	LD	(UART_VERIFY_RESULT),A
+	LD	A,(UART_SET_RESULT)
+	CP	RES_ERROR
+	JR	Z,.TRY_NO_FLOW
+	CP	RES_FAIL
+	JR	Z,.TRY_NO_FLOW
+	CP	RES_BUSY
+	JR	NZ,.SETTING_FAILED
+.TRY_NO_FLOW
 	PRINTLN	MSG_UART_RETRY_NOFLOW
-	CALL	RECOVER_UART_DEFAULT
 	CALL	TRY_UART_NO_FLOW
 	AND	A
 	JR	Z,.SPEED_ONLY_OK
 
 	LD	(UART_VERIFY_RESULT),A
-	CALL	RECOVER_UART_DEFAULT
+.SETTING_FAILED
 	LD	A,(UART_SET_RESULT)
 	AND	A
 	JR	NZ,.HAVE_ERROR
@@ -405,20 +411,13 @@ APPLY_UART_SETTING
 	LD	B,3
 	JP	WCOMMON.EXIT
 .FLOW_OK
+	LD	A,'3'
+	LD	(ESP_FLOW_MODE),A
 	PRINTLN	MSG_UART_FLOW_OK
 	RET
-.LEGACY_NO_FLOW
-	CALL	TRY_UART_NO_FLOW
-	AND	A
-	JR		Z,.SPEED_ONLY_OK
-	LD	(UART_VERIFY_RESULT),A
-	CALL	RECOVER_UART_DEFAULT
-	LD	A,(UART_SET_RESULT)
-	AND	A
-	JR		NZ,.HAVE_ERROR
-	LD	A,(UART_VERIFY_RESULT)
-	JR		.HAVE_ERROR
 .SPEED_ONLY_OK
+	LD	A,'0'
+	LD	(ESP_FLOW_MODE),A
 	PRINTLN	MSG_UART_SPEED_ONLY
 	RET
 
@@ -438,12 +437,15 @@ TRY_UART_NO_FLOW
 TRY_UART_COMMAND
 	LD	HL,CMD_BUFF
 	LD	BC,DEFAULT_TIMEOUT
-	CALL	SEND_CMD_STATUS_TIMEOUT
+	CALL	SEND_CMD_BUSY_TIMEOUT		; previous command may still be finishing
 	LD	(UART_SET_RESULT),A
-	; ERROR/FAIL means ESP did not accept this command and did not switch baud.
+	; ERROR/FAIL means ESP did not accept this command and did not switch
+	; baud. A persistent busy also means the command was dropped unexecuted.
 	CP	RES_ERROR
 	JR	Z,.NO_SWITCH
 	CP	RES_FAIL
+	JR	Z,.NO_SWITCH
+	CP	RES_BUSY
 	JR	Z,.NO_SWITCH
 
 	; OK or timeout can both mean ESP accepted the command and changed baud
@@ -493,20 +495,10 @@ TRY_UART_COMMAND
 	DEC	A
 	LD	(UART_VERIFY_LEFT),A
 	JR	NZ,.VLOOP
-	CALL	RECOVER_UART_DEFAULT
 	LD	A,(UART_VERIFY_RESULT)
 	RET
 .NO_SWITCH
 	LD	(UART_VERIFY_RESULT),A
-	RET
-
-RECOVER_UART_DEFAULT
-	CALL	INIT_UART_DEFAULT
-	CALL	WIFI.ESP_RESET
-	CALL	INIT_UART_DEFAULT
-	LD	HL,CMD_AT
-	LD	BC,DEFAULT_TIMEOUT
-	CALL	SEND_CMD_STATUS_TIMEOUT
 	RET
 
 ; CF=0 when NET.CFG BAUD is 115200.
@@ -534,10 +526,13 @@ SEND_CMD
 	JP	SEND_CMD_TIMEOUT
 
 SEND_CMD_TIMEOUT
-	CALL	SEND_CMD_STATUS_TIMEOUT
+	CALL	SEND_CMD_BUSY_TIMEOUT
 	AND	A
 	RET	Z
 	JP	COMMAND_ERROR_EXIT
+
+; The busy-response retry loop is shared with its host-side Z80 harness.
+	INCLUDE "netup_busy_retry.asm"
 
 ; ------------------------------------------------------
 ; Print the actual ESP response before exiting with a command error.
@@ -566,9 +561,8 @@ SEND_CMD_STATUS_TIMEOUT
 ; Send non-critical command. Print a warning and continue on failure.
 ; ------------------------------------------------------
 SEND_CMD_OPTIONAL
-	LD	DE,WIFI.RS_BUFF
 	LD	BC,DEFAULT_TIMEOUT
-	CALL	WIFI.UART_TX_CMD
+	CALL	SEND_CMD_BUSY_TIMEOUT		; IP stack may answer busy post-join
 	AND	A
 	RET	Z
 	PUSH	AF
@@ -595,16 +589,46 @@ SEND_CMD_PRINT
 ; through SEND_CMD, before NET_* is published.
 ; ------------------------------------------------------
 QUERY_STATION_INFO
+	; CWJAP reports OK when the association is up, but the DHCP lease can
+	; still be pending. Poll AT+CIFSR until a real station IP shows up instead
+	; of failing on the first empty answer: busy replies return immediately
+	; now, so nothing else paces this wait.
+	LD	A,NETUP_IP_RETRIES
+	LD	(IP_WAIT_LEFT),A
+	JR	.IP_TRY
+.NOT_READY
+	LD	A,(IP_WAIT_LEFT)
+	AND	A
+	JP	Z,NETWORK_NOT_READY_EXIT
+	DEC	A
+	LD	(IP_WAIT_LEFT),A
+	LD	A,(IP_WAIT_SHOWN)
+	AND	A
+	JR	NZ,.WAIT
+	INC	A
+	LD	(IP_WAIT_SHOWN),A
+	PRINTLN	MSG_WAIT_IP
+.WAIT
+	LD	HL,NETUP_IP_DELAY
+	CALL	UTIL.DELAY
+.IP_TRY
 	LD	HL,CMD_CIFSR
-	CALL	SEND_CMD
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_CMD_BUSY_TIMEOUT
+	AND	A
+	JR	Z,.HAVE_RESP
+	CP	RES_BUSY
+	JR	Z,.NOT_READY			; still busy -> keep waiting
+	JP	COMMAND_ERROR_EXIT
+.HAVE_RESP
 	LD	HL,PAT_STAIP
 	LD	DE,NET_IP_BUF
 	CALL	EXTRACT_QUOTED_FIELD
-	JR	C,NETWORK_NOT_READY_EXIT
+	JR	C,.NOT_READY
 	LD	HL,LIT_ZERO_IP
 	LD	DE,NET_IP_BUF
 	CALL	UTIL.STRCMP
-	JR	NC,NETWORK_NOT_READY_EXIT
+	JR	NC,.NOT_READY
 	LD	HL,PAT_STAMAC
 	LD	DE,NET_MAC_BUF
 	CALL	EXTRACT_QUOTED_FIELD
@@ -782,6 +806,7 @@ BUILD_CIPDNS_CMD
 ; "NAME=" which DELETES the variable.
 ;   NET      = WIFI            network-type marker
 ;   NET_ESP_FW = 2.2.1/2.2.2   selected ESP-AT firmware profile
+;   NET_ESP_FLOW = 3/0         negotiated UART flow-control mode
 ;   NET_IP   = station IP      (AT+CIFSR STAIP)
 ;   NET_MAC  = station MAC      (AT+CIFSR STAMAC)
 ;   NET_GW   = gateway          (AT+CIPSTA gateway)
@@ -814,6 +839,18 @@ PUBLISH_NET_ENV
 	LD	IX,V_ESP_FW_222
 .FW_SET
 	LD	HL,N_NET_ESP_FW
+	CALL	SETENV_NAME_VAL
+
+	; Publish the negotiated ESP UART contract. Client executables are separate
+	; processes and reinitialize the 16550, so they must reproduce this local
+	; MCR mode without issuing AT+UART_CUR again.
+	LD	A,(ESP_FLOW_MODE)
+	CP	'3'
+	LD	IX,V_ESP_FLOW_0
+	JR	NZ,.FLOW_SET
+	LD	IX,V_ESP_FLOW_3
+.FLOW_SET
+	LD	HL,N_NET_ESP_FLOW
 	CALL	SETENV_NAME_VAL
 
 	; Runtime values, collected after the mandatory association check.
@@ -876,6 +913,8 @@ CLEAR_NET_ENV
 	LD	HL,N_NET_ESP_HW
 	CALL	CLEAR_ENV_NAME
 	LD	HL,N_NET_ESP_FW
+	CALL	CLEAR_ENV_NAME
+	LD	HL,N_NET_ESP_FLOW
 	CALL	CLEAR_ENV_NAME
 	LD	HL,N_NET_IP_SRC
 	CALL	CLEAR_ENV_NAME
@@ -1020,13 +1059,14 @@ ESP_HW_BASE	DB "/#3E8",0
 ; Variable names match the rtl8019as package (NET_IP_SRC/IP/MASK/GW/MAC/DNS1/
 ; DNS2/NTP/TZ) so programs read the same vars on either card. NET=WIFI is this
 ; package's network-type marker, NET_ESP_HW is the slot/I/O-base in the same
-; "S/#HHH" form as rtl8019as NET_RTL_HW, and NET_ESP_FW is the selected
-; 2.2.1/2.2.2 AT profile. NET_BAUD and NET_SSID are Wi-Fi-specific additions
-; with no rtl8019as analogue.
+; "S/#HHH" form as rtl8019as NET_RTL_HW, NET_ESP_FW is the selected
+; 2.2.1/2.2.2 AT profile, and NET_ESP_FLOW is the negotiated ESP UART
+; flow-control mode. NET_BAUD and NET_SSID are Wi-Fi-specific additions.
 NET_ENV_NAMES
 N_NET		DB "NET",0
 N_NET_ESP_HW	DB "NET_ESP_HW",0
 N_NET_ESP_FW	DB "NET_ESP_FW",0
+N_NET_ESP_FLOW	DB "NET_ESP_FLOW",0
 N_NET_IP_SRC	DB "NET_IP_SRC",0
 N_NET_IP	DB "NET_IP",0
 N_NET_MASK	DB "NET_MASK",0
@@ -1043,6 +1083,8 @@ LIT_EMPTY	DB 0
 LIT_ZERO_IP	DB "0.0.0.0",0
 V_ESP_FW_221	DB "2.2.1",0
 V_ESP_FW_222	DB "2.2.2",0
+V_ESP_FLOW_0	DB "0",0
+V_ESP_FLOW_3	DB "3",0
 V_STATIC	DB "STATIC",0
 V_DHCP		DB "DHCP",0
 PAT_STAIP	DB "STAIP",0
@@ -1050,29 +1092,10 @@ PAT_STAMAC	DB "STAMAC",0
 PAT_GATEWAY	DB "gateway",0
 PAT_NETMASK	DB "netmask",0
 
-; ------------------------------------------------------
-; Append ASCIIZ from DE to buffer at HL.
-; ------------------------------------------------------
-APPEND_STR
-	LD	A,(DE)
-	AND	A
-	RET	Z
-	LD	(HL),A
-	INC	HL
-	INC	DE
-	JR	APPEND_STR
-
-; ------------------------------------------------------
-; Append ASCIIZ from IX to buffer at HL.
-; ------------------------------------------------------
-APPEND_IX_STR
-	LD	A,(IX+0)
-	AND	A
-	RET	Z
-	LD	(HL),A
-	INC	HL
-	INC	IX
-	JR	APPEND_IX_STR
+; Shared with the host-side command-builder harness. Every append copies its
+; trailing zero, so UART_TX_STRING cannot run past a dynamic command into dirty
+; runtime BSS and feed a second line to ESP while the first is still executing.
+	INCLUDE "asciiz_append.asm"
 
 ; ------------------------------------------------------
 ; Print ESP response buffer with LF -> CRLF conversion.
@@ -1156,6 +1179,8 @@ MSG_IP_INFO
 	DB "IP information:",0
 MSG_NO_STATION_IP
 	DB "ESP has no station IP; Wi-Fi connection is not ready.",0
+MSG_WAIT_IP
+	DB "Waiting for station IP (DHCP)...",0
 MSG_PUBLISH_ENV
 	DB "Publishing NET_* environment variables.",0
 MSG_DONE
@@ -1177,7 +1202,13 @@ UART_VERIFY_RESULT
 	DB 0
 UART_NO_FLOW_VERIFY
 	DB 0
+ESP_FLOW_MODE
+	DB '0'
 UART_VERIFY_LEFT
+	DB 0
+IP_WAIT_LEFT
+	DB 0
+IP_WAIT_SHOWN
 	DB 0
 
 CMD_AT

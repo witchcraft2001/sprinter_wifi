@@ -68,8 +68,7 @@ START
 	LD	(MSG_SLOT_NO),A
 	PRINTLN MSG_WIFI_FOUND
 
-	CALL	NETCFG.LOAD
-	CALL	NETCFG.APPLY_UART_BAUD
+	CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 	CALL	WIFI.UART_INIT
 	PRINTLN MSG_UART_READY
 
@@ -79,8 +78,7 @@ START
 	LD	HL,CMD_ECHO_OFF
 	CALL	SEND_CMD
 
-	; Reapply ESP flow=3 because each executable reinitializes the local 16550
-	; with AFE+RTS and must keep both UART ends in the same mode.
+	; Verify the NET_ESP_FLOW-selected local mode without changing the ESP.
 	CALL	WCOMMON.SETUP_UART_FLOW
 	AND	A
 	JR	Z,.UART_FLOW_OK

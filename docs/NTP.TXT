@@ -7,10 +7,12 @@ Usage
   NTP.EXE
 
 Configuration
-  NTP reads these values from NET.CFG:
+  NTP reads these environment variables, published by NETUP.EXE from NET.CFG:
 
-  TZ   Time zone offset, for example +6, +5:30 or -3:30.
-  NTP  Time server name, for example pool.ntp.org.
+  NET_TZ   Time zone offset, for example +6, +5:30 or -3:30.
+  NET_NTP  Time server name, for example pool.ntp.org.
+
+  NTP does not read NET.CFG itself; run NETUP.EXE first.
 
 Typical sequence
   NETUP.EXE

@@ -7,13 +7,18 @@
 
 	MODULE NETCFG
 
-; Most clients keep this parser buffer in WIN1. The forced 2.2.2 FTP backend
-; marks its include with NETCFG_COMPACT_BUFFER to retain its stack margin;
-; ordinary NET.CFG files are far smaller than either limit.
+; Most clients keep this parser buffer in WIN1. Utilities that only consume
+; NETUP's published session values never call LOAD/PARSE and need only the
+; scalar CFG_* slots (not a file buffer). Memory-tight ORG 0x4100 utilities
+; which still load NET.CFG use the compact parser buffer.
+	IFDEF	NETCFG_SESSION_ONLY
+CFG_BUFF_SIZE	EQU 1
+	ELSE
 	IFDEF	NETCFG_COMPACT_BUFFER
-CFG_BUFF_SIZE	EQU 1792
+CFG_BUFF_SIZE	EQU 1536
 	ELSE
 CFG_BUFF_SIZE	EQU 2048
+	ENDIF
 	ENDIF
 DSS_CREATE_OVERWRITE	EQU 0x0A
 

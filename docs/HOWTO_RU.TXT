@@ -58,8 +58,8 @@ Sprinter ESP Network Kit - Быстрый старт (HOWTO)
   FTP  host file [-u user -p pass]   скачать по FTP
   TFTP host GET file -o FILE          скачать по TFTP
   NTP                       установить часы DSS по сети
-                            Сервер NTP и таймзона берутся из NET.CFG
-                            (NTP=, TZ=).
+                            Сервер NTP и таймзона берутся из переменных
+                            NET_NTP/NET_TZ, публикуемых NETUP.
   WTERM                     открывает ручной терминал ESP-AT для ввода
                             команд вручную.
 

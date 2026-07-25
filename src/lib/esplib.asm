@@ -87,6 +87,7 @@ RES_CONNECTED	EQU 5
 RES_NOT_CONN	EQU 6
 RES_ENABLED		EQU 7
 RES_DISABLED 	EQU	8
+RES_BUSY		EQU 9
 
 ;ENABLE_RTS_CTR  EQU 0
 
@@ -161,8 +162,25 @@ UART_INIT
 
 	CALL 	ISA.ISA_OPEN
 	LD		IX, PORT_UART_A
-	; Restore the complete field-proven 2.2.1 FIFO setup (trigger 8, no
-	; init-time reset). 2.2.2 uses the clean trigger-4 AFE setup.
+	; Preserve the field-proven 2.2.1 trigger-8 path. 2.2.2 uses trigger 4 to
+	; leave more CTS reaction margin, including command responses: CIPSTART may
+	; be followed immediately by a server greeting in +IPD before the caller
+	; can switch from command parsing to the streaming receive routine.
+	IFDEF	WIFI_STABLE_ACTIVE_RX
+	IFDEF	ESP_AT_FORCE_221
+	LD		A,FCR_TR8 | FCR_FIFO
+	ELSE
+	; Universal FTP still selects the firmware profile from NET_ESP_FW. Keep
+	; the exact 2.2.1 initialization untouched; its 2.2.2 compatibility path
+	; uses the same proven trigger but starts from clean FIFOs.
+	LD		A,(UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_221
+	LD		A,FCR_TR8 | FCR_RESET_RX | FCR_RESET_TX | FCR_FIFO
+	JR		NZ,.STABLE_FCR_READY
+	LD		A,FCR_TR8 | FCR_FIFO
+.STABLE_FCR_READY
+	ENDIF
+	ELSE
 	IFDEF	ESP_AT_FORCE_221
 	LD		A,FCR_TR8 | FCR_FIFO
 	ELSE
@@ -177,6 +195,7 @@ UART_INIT
 .FCR_READY
 	ENDIF
 	ENDIF
+	ENDIF
 	LD		(IX+_FCR),A
 	XOR 	A
 	LD 		(IX+_IER), A								; Disable interrupts
@@ -188,8 +207,8 @@ UART_INIT
 	XOR 	A
 	LD		(IX+_DLM), A
 	LD 		(IX+_LCR), LCR_WL8							; 8bit word, disable latch
-	; Begin in manual RTS mode. AFE is enabled only after the caller verifies
-	; that the ESP runtime RTS/CTS pins actually work.
+	; Apply the mode selected before initialization: NETUP starts manually,
+	; while clients load the negotiated value from NET_ESP_FLOW.
 	LD		A,(UART_FLOW_MODE)
 	AND	A
 	LD		A,MCR_RTS
@@ -274,6 +293,7 @@ UART_RX_PAUSE
 
 UART_RX_RESUME
 	PUSH	DE,HL
+	CALL	UART_SET_DATA_RX_MODE
 	LD		A,(UART_FLOW_MODE)
 	LD		E,MCR_RTS
 	AND		A
@@ -284,6 +304,29 @@ UART_RX_RESUME
 	CALL	UART_WRITE
 	POP	HL,DE
 	RET
+
+; Select the profile-specific FIFO trigger before streaming payload data,
+; without clearing bytes that may already have arrived. The 2.2.1 path is
+; intentionally left untouched. The 2.2.2 command path already uses trigger 4,
+; so this is normally an idempotent write that also repairs inherited UART
+; state without flushing queued bytes.
+UART_SET_DATA_RX_MODE
+	IFDEF	WIFI_STABLE_ACTIVE_RX
+	RET
+	ELSE
+	IFDEF	ESP_AT_FORCE_221
+	RET
+	ELSE
+	IFNDEF	ESP_AT_FORCE_222
+	LD		A,(UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	RET		NZ
+	ENDIF
+	LD		E,FCR_TR4 | FCR_FIFO
+	LD		HL,REG_FCR
+	JP		UART_WRITE
+	ENDIF
+	ENDIF
 
 ; ------------------------------------------------------
 ; Read TL16C550 register
@@ -445,6 +488,19 @@ UTXS_TXNR
 	;IFUSED	UART_EMPTY_RS
 UART_EMPTY_RS
 	PUSH 	DE, HL
+	; Keep the complete field-proven 2.2.1 command path unchanged. For 2.2.2,
+	; trigger 4 is required even while waiting for a command response: after a
+	; successful CIPSTART the peer can send its greeting immediately, so the
+	; final OK and the first +IPD bytes form one continuous UART burst. Trigger
+	; 8 leaves too little CTS reaction margin and was observed as an overrun in
+	; FTP before the greeting could be consumed.
+	;
+	; The earlier attribution of truncated PING replies to trigger 4 was wrong:
+	; PING's dynamically built command lacked its NUL terminator and transmitted
+	; dirty BSS after CR/LF. Keep trigger selection profile-specific here.
+	IFDEF	WIFI_STABLE_ACTIVE_RX
+	LD		E,FCR_TR8 | FCR_RESET_RX | FCR_FIFO
+	ELSE
 	IFDEF	ESP_AT_FORCE_221
 	LD		E,FCR_TR8 | FCR_RESET_RX | FCR_FIFO
 	ELSE
@@ -457,6 +513,7 @@ UART_EMPTY_RS
 	JR		NZ,.FCR_READY
 	LD		E,FCR_TR8 | FCR_RESET_RX | FCR_FIFO
 .FCR_READY
+	ENDIF
 	ENDIF
 	ENDIF
 	LD		HL, REG_FCR
@@ -511,6 +568,15 @@ UART_WAIT_RS_INT
 UVR_NEXT_INT
 	LD		HL, REG_LSR
 	LD		A,(HL)
+	; LSR errors are cleared by reading the register. Preserve them for
+	; UART_TX_CMD so a truncated/corrupted line followed by a valid OK cannot
+	; be mistaken for a successful command.
+	PUSH	AF
+	AND		LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+	LD		HL,CMD_LSR_ACCUM
+	OR		(HL)
+	LD		(HL),A
+	POP		AF
 	AND		LSR_DR
 	JR		NZ,UVR_OK_INT
 	CALL	UTIL.DELAY_1MS
@@ -578,14 +644,19 @@ ESP_RESET
 ; ------------------------------------------------------
 	;IFUSED	UART_TX_CMD
 UART_TX_CMD
-	PUSH	BC, DE, HL		
+	PUSH	BC, DE, HL
+	XOR		A
+	LD		(CMD_LSR_ACCUM),A
 
-	LD		A, low RS_BUFF_SIZE
+	; Keep 4 tail bytes free: the counted stores may fill the area exactly,
+	; and the terminator/LF that close each line are written without a BC
+	; decrement of their own.
+	LD		A, low (RS_BUFF_SIZE-4)
 	LD		(BSIZE), A
-	LD		A, high RS_BUFF_SIZE
+	LD		A, high (RS_BUFF_SIZE-4)
 	LD		(BSIZE+1), A
 
-	;LD		(RESBUF),DE
+	LD		(RESBUF),DE
 	XOR		A
 	LD		(DE), A
 
@@ -598,7 +669,7 @@ UART_TX_CMD
 	JR		NC, UTC_STRT_RX
 	; error, transmit timeout
 	LD		A, RES_TX_TIMEOUT
-	JR		UTC_RET_NO_CLOSE
+	JP		UTC_RET_NO_CLOSE
 UTC_STRT_RX		
 	; no transmit timeout, receive response
 	; IX - pointer to begin of current line
@@ -615,7 +686,7 @@ UTC_RCV_NXT
 	XOR		A
 	LD		(DE),A								; preserve a safe ASCIIZ partial response
 	LD		A, RES_RS_TIMEOUT
-	JR		UTC_RET
+	JP		UTC_RET
 	; no receive timeout
 UTC_NO_RT
 	; read symbol from tty
@@ -650,11 +721,23 @@ UTC_END
 	LD		A, RES_ERROR
 	; It is 'FAIL<LF>'?
 	JR		UTC_RET
-UTC_CP_FAIL		
+UTC_CP_FAIL
 	LD		HL,MSG_FAIL
 	CALL	@UTIL.STRCMP
-	JR		C, UTC_NOMSG
+	JR		C, UTC_CP_BUSY
 	LD		A, RES_FAIL
+	JR		UTC_RET
+UTC_CP_BUSY
+	; "busy p..."/"busy s..." is a terminal state line: the interpreter has
+	; rejected this command and no OK/ERROR will follow it. Report RES_BUSY
+	; right away so callers can retry instead of burning the whole timeout
+	; (which used to surface as a misleading RES_RS_TIMEOUT / error #4).
+	EX		DE,HL									; HL = current line start
+	LD		DE,MSG_BUSY
+	CALL	@UTIL.STARTSWITH
+	EX		DE,HL									; DE = line start again
+	JR		NZ, UTC_NOMSG
+	LD		A, RES_BUSY
 	JR		UTC_RET
 UTC_NOMSG
 	; no resp message, continue receive
@@ -663,10 +746,40 @@ UTC_NOMSG
 	LD		A, LF
 	LD		(DE),A									; change 0 - EOL to LF
 	INC		DE
+	; The LF slot is not covered by the counted stores. Charge it here and,
+	; once the buffer is spent, restart at the base: a long multi-line
+	; response (stale +IPD backlog, repeated status lines) used to walk DE
+	; past the response buffer into the BSS chain. Only the newest tail is
+	; kept, which is all the terminal-line scan above needs.
+	LD		A,B
+	OR		C
+	JR		Z, UTC_BUF_RESET
+	DEC		BC
+	LD		A,B
+	OR		C
+	JR		NZ, UTC_SET_LINE
+UTC_BUF_RESET
+	LD		DE,(RESBUF)
+	LD		BC,(BSIZE)
+UTC_SET_LINE
 	LD		IXH,D									; store new start line ptr
 	LD		IXL,E
-	JR		UTC_RCV_NXT
+	JP		UTC_RCV_NXT
 UTC_RET
+	; A terminal OK is not trustworthy if the 16550 reported an overrun or
+	; framing/parity error while collecting it. Surface this as a receive
+	; timeout so command-specific retry logic can safely resend the command.
+	PUSH	AF
+	LD		HL,CMD_LSR_ACCUM
+	LD		A,(HL)
+	AND		LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+	JR		NZ,.CORRUPT
+	POP		AF
+	JR		.CLOSE_OK
+.CORRUPT
+	POP		AF
+	LD		A,RES_RS_TIMEOUT
+.CLOSE_OK
 	CALL	ISA.ISA_CLOSE
 UTC_RET_NO_CLOSE
 	POP		HL, DE, BC
@@ -688,11 +801,17 @@ MSG_RCV_EMPTY
 ; Receive block size
 BSIZE		DW 0
 
+; Response buffer base for the wrap-around restart in UART_TX_CMD
+RESBUF		DW 0
+
 ; UART_TX_BUFFER FIFO refill counter
 TX_BURST_LEFT	DB 0
 
 ; Periodic cancel-poll counter for UART wait loops
 CANCEL_TICK	DW 0
+
+; Sticky LSR errors for the current AT command response.
+CMD_LSR_ACCUM	DB 0
 
 UART_DIVISOR	DB DEFAULT_DIVISOR
 
@@ -700,6 +819,8 @@ UART_DIVISOR	DB DEFAULT_DIVISOR
 ; it from NET_ESP_FW before their own UART_INIT; NETUP replaces it immediately
 ; after its one-time firmware probe.
 UART_RX_PROFILE	DB UART_RX_PROFILE_222
+; Safe default for NETUP/NETRESET. Network clients replace it from the
+; NET_ESP_FLOW value published by NETUP before their own UART_INIT.
 UART_FLOW_MODE	DB 0
 
 ; Received message for OK result
@@ -710,6 +831,9 @@ MSG_ERROR	DB "ERROR", 0
 
 ; Received message for Failure
 MSG_FAIL	DB "FAIL", 0
+
+; Prefix of the ESP "busy p..."/"busy s..." state line
+MSG_BUSY	DB "busy", 0
 
 ; Buffer to receive response from ESP
 RS_BUFF	

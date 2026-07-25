@@ -109,8 +109,7 @@ START
 	JP	C,NO_WIFI
 	CALL	WCOMMON.REQUIRE_NET_UP
 
-	CALL	NETCFG.LOAD
-	CALL	NETCFG.APPLY_UART_BAUD
+	CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 	CALL	WIFI.UART_INIT
 	PRINTLN MSG_UART_READY
 
@@ -120,10 +119,8 @@ START
 	LD	HL,CMD_ECHO_OFF
 	CALL	SEND_CMD
 
-	; Force ESP-AT to enable hardware RTS/CTS flow control. Without this,
-	; ESP keeps streaming bytes during slow DSS_WRITE/file ops and the Z80
-	; UART FIFO overruns (OE in LSR), causing +IPD parser desync and the
-	; body-on-screen / Network error #0 / #4 symptoms.
+	; NETUP owns the ESP UART configuration. Apply its published values only
+	; to the local 16550 and verify that ESP remains in command mode.
 	CALL	WCOMMON.SETUP_UART_FLOW
 	AND	A
 	JP	NZ,TCP_ERROR_EXIT
@@ -2847,15 +2844,23 @@ U32_POW10_TABLE
 
 	ENDMODULE
 
+	; WGET consumes NET_BAUD/NET_ESP_* from NETUP and never loads NET.CFG.
+	DEFINE	NETCFG_SESSION_ONLY
 	INCLUDE "netcfg_lib.asm"
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"
+	; DNS resolution plus an external ESP8266 TCP connect can legitimately
+	; exceed the shared 20-second local-service timeout.
+	DEFINE	TCP_LONG_OPEN_TIMEOUT
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "tput_lib.asm"
 	; esplib.asm MUST be last: it ends with the RS_BUFF label that anchors the
 	; runtime receive buffer and all BSS. Any include placed after it would have
 	; its code/data overlaid by the ESP receive buffer.
+	IFNDEF	ESP_AT_FORCE_222
+	DEFINE	WIFI_STABLE_ACTIVE_RX
+	ENDIF
 	INCLUDE "esplib.asm"
 
 	MODULE MAIN

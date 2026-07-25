@@ -25,6 +25,25 @@ OPEN
 	RET
 
 ; ------------------------------------------------------
+; Open a fixed-remote UDP endpoint using the minimal syntax shared by old
+; NONOS-AT and ESP-AT. This is the correct mode for request/reply protocols
+; such as NTP: replies must come from the configured peer, and no explicit
+; local port or mutable-remote mode is required.
+; In: HL - host ASCIIZ, DE - remote port ASCIIZ.
+; Out: CF=0/A=0 on success, CF=1/A=ESP result code on failure.
+; ------------------------------------------------------
+OPEN_FIXED
+	PUSH	IX
+	LD	(PTR_HOST),HL
+	LD	(PTR_REMOTE_PORT),DE
+	CALL	BUILD_OPEN_PREFIX
+	LD	DE,CMD_CRLF
+	CALL	APPEND_STR
+	CALL	SEND_OPEN
+	POP	IX
+	RET
+
+; ------------------------------------------------------
 ; Open a single UDP endpoint with explicit local port.
 ; In: HL - host ASCIIZ, DE - remote port ASCIIZ, IX - local port ASCIIZ.
 ; Out: CF=0/A=0 on success, CF=1/A=ESP result code on failure.
@@ -34,6 +53,18 @@ OPEN_LOCAL
 	LD	(PTR_REMOTE_PORT),DE
 	LD	(PTR_LOCAL_PORT),IX
 
+	CALL	BUILD_OPEN_PREFIX
+	LD	DE,CMD_COMMA
+	CALL	APPEND_STR
+	LD	IX,(PTR_LOCAL_PORT)
+	CALL	APPEND_IX_STR
+	LD	DE,CMD_CIPSTART_SUFFIX
+	CALL	APPEND_STR
+	JR	SEND_OPEN
+
+; Build AT+CIPSTART="UDP","<host>",<remote-port> in CMD_BUFFER.
+; Out: HL points at the terminating zero, ready for optional arguments/CRLF.
+BUILD_OPEN_PREFIX
 	LD	HL,CMD_BUFFER
 	LD	DE,CMD_CIPSTART_PREFIX
 	CALL	APPEND_STR
@@ -43,21 +74,14 @@ OPEN_LOCAL
 	CALL	APPEND_STR
 	LD	IX,(PTR_REMOTE_PORT)
 	CALL	APPEND_IX_STR
-	LD	DE,CMD_COMMA
-	CALL	APPEND_STR
-	LD	IX,(PTR_LOCAL_PORT)
-	CALL	APPEND_IX_STR
-	LD	DE,CMD_CIPSTART_SUFFIX
-	CALL	APPEND_STR
-
-	LD	HL,CMD_BUFFER
-	LD	DE,WIFI.RS_BUFF
-	LD	BC,UDP_DEFAULT_TIMEOUT
-	CALL	WIFI.UART_TX_CMD
-	AND	A
-	RET	Z
-	SCF
 	RET
+
+SEND_OPEN
+	; Retry while the ESP still answers "busy p..." right after NETUP's join;
+	; see TCP.TX_CMD_BUSY_RETRY in esp_tcp.asm.
+	LD	HL,CMD_BUFFER
+	LD	BC,UDP_DEFAULT_TIMEOUT
+	JP	TCP.TX_CMD_BUSY_RETRY
 
 ; ------------------------------------------------------
 ; Send one UDP payload through the currently opened endpoint.
@@ -65,6 +89,12 @@ OPEN_LOCAL
 ; ------------------------------------------------------
 SEND_BUFFER
 	JP	TCP.SEND_BUFFER
+
+; Send a datagram payload and immediately hand UART parsing to RECEIVE.
+; Required for fast request/reply protocols: a peer response may arrive before
+; ESP prints SEND OK, and WAIT_SEND_OK cannot retain an unsolicited +IPD frame.
+SEND_BUFFER_NO_WAIT
+	JP	TCP.SEND_BUFFER_NO_WAIT
 
 ; ------------------------------------------------------
 ; Receive one UDP datagram/payload chunk.
@@ -110,6 +140,8 @@ CMD_COMMA
 	DB	",",0
 CMD_CIPSTART_SUFFIX
 	DB	",2",13,10,0
+CMD_CRLF
+	DB	13,10,0
 
 DEFAULT_LOCAL_PORT
 	DB	"1069",0

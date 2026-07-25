@@ -71,15 +71,35 @@ START
     PRINTLN MSG_START
 
 	CALL	@WCOMMON.FIND_SWF
+	; WTERM is a client of the active NETUP session. Load its published
+	; firmware/flow profile before touching the local 16550, exactly as PING
+	; and the transfer utilities do. This is essential at 230400: ESP flow=3
+	; needs MCR_AFE|RTS, not the standalone terminal's old manual default.
+	CALL	WCOMMON.REQUIRE_NET_UP
 
 	PRINTLN WCOMMON.MSG_UART_INIT
-	CALL	NETCFG.LOAD
+	; Attach to the live NETUP session. AT+UART_CUR is session state on the
+	; module: resetting ESP here while NET_BAUD is 230400 leaves the terminal
+	; and ESP at different rates. With no NET_BAUD we intentionally use the
+	; safe power-up default is deliberately not used: run NETUP after NETRESET
+	; to publish the actual session parameters first.
+	CALL	WCOMMON.APPLY_NET_BAUD
 	CALL	WIFI.UART_INIT
-
-	PRINTLN WCOMMON.MSG_ESP_RESET
-	CALL	WIFI.ESP_RESET
-
-	CALL	WCOMMON.INIT_ESP
+	CALL	WCOMMON.SYNC_ESP_COMMAND
+	AND	A
+	JR	Z,.ATTACHED
+	ADD	A,'0'
+	LD	(MSG_ATTACH_ERROR_NO),A
+	PRINTLN	MSG_ATTACH_ERROR
+	LD	B,3
+	JP	WCOMMON.EXIT
+.ATTACHED
+	; The console already echoes typed characters locally; disable ESP echo
+	; without touching its network or UART configuration.
+	LD	HL,CMD_ECHO_OFF
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	WIFI.UART_TX_CMD
 
 	PRINTLN MSG_HLP
 
@@ -196,9 +216,12 @@ PUT_A_CHAR
 	RET
 
 PUT_RX_CHAR
-	CALL	WIFI.UART_RX_PAUSE
-	CALL	PUT_A_CHAR
-	JP		WIFI.UART_RX_RESUME
+	; WTERM is a live terminal, not a buffered protocol receiver.  Do not
+	; toggle RTS for every displayed byte: at 230400 that creates a stop/go
+	; gap between each character and corrupts short diagnostic replies such as
+	; AT+GMR.  The UART has been put in the NETUP-negotiated flow mode once at
+	; startup; drain the FIFO continuously here.
+	JP		PUT_A_CHAR
 
 ; ------------------------------------------------------
 ; Do Some
@@ -218,6 +241,10 @@ MSG_START
 	PACKAGE_VERSION_TAG
 	DB " - Terminal for Sprinter-WiFi by Sprinter Team. v1.0 beta3, ", __DATE__
 	DB 0
+MSG_ATTACH_ERROR
+	DB "Cannot attach to ESP at NET_BAUD (error #"
+MSG_ATTACH_ERROR_NO
+	DB "0). Run NETUP or NETRESET.",0
 MSG_HLP
 	DB 13,10,"Enter ESP AT command or Alt+x to close terminal.",0
 MSG_EXIT
@@ -246,6 +273,8 @@ MSG_ALT_KEY
 ; ------------------------------------------------------
 CMD_QUIT 
     DB "QUIT",13,0
+CMD_ECHO_OFF
+	DB "ATE0",13,10,0
 
 RX_ERR
 	DB 0

@@ -161,16 +161,35 @@ with no runtime fallback; its banner must show the selected profile. Do not
 change the 2.2.1 path merely to share code with 2.2.2. Validate any 2.2.1
 change using sustained real-hardware `+IPD` traffic, including FTP/WGET/Telnet.
 
+`NETUP` is the sole owner of ESP-side UART negotiation. It publishes the
+result as `NET_BAUD` and `NET_ESP_FLOW=3/0`; clients must configure only their
+local 16550 from those values and must not resend `AT+UART_CUR` or toggle AFE
+while reusing the live session. Keep the complete 2.2.1 receive path, including
+short AT-command replies, on its proven trigger-8 FIFO setup. Use trigger 4 for
+the complete 2.2.2 receive path: a command such as `AT+CIPSTART` can be followed
+immediately by peer data, so there is no reliable boundary at which a client
+can switch from a trigger-8 command response to trigger-4 `+IPD` receive.
+Changing a FIFO trigger with queued bytes must never reset or flush them.
+
 ## Testing Guidelines
 
 No broad automated test suite is present. For Telnet/Zmodem changes, run
 `tools/test-zmodem.sh`; it uses `sjasmplus` plus `z88dk-ticks` to execute the
 actual Z80 CRC/header/subpacket routines against lrzsz-compatible vectors. For
-DSS assembly, also assemble every touched entry program and smoke-test on
-Sprinter DSS, emulator, or hardware. For DOS utilities, compile the changed
-program and verify behavior against an ESP8266 running ESP-AT firmware. For
-hardware edits, run EasyEDA ERC/DRC, inspect ISA/UART signal names, and verify
-regenerated PDFs, BOMs, and Gerbers before publishing.
+NETUP command sequencing or `busy p...` retry changes, run
+`tools/test-netup-busy.sh`; it executes the same Z80 retry loop used by NETUP
+against deterministic busy/OK/error response vectors and verifies that dynamic
+AT-command builders terminate dirty runtime buffers correctly. `make test`
+runs all host-side harnesses. For UART FIFO/profile changes, also run
+`tools/test-uart-profiles.sh`; it assembles universal FTP/WGET plus forced
+2.2.1 and 2.2.2 variants. It checks the universal/2.2.1 trigger-8 compatibility
+path, the forced-2.2.2 trigger-4 path, and verifies that client executables do
+not contain `AT+UART_CUR` (ESP-side UART negotiation belongs only to NETUP).
+For DSS assembly, also assemble every touched entry program and
+smoke-test on Sprinter DSS, emulator, or hardware. For DOS utilities, compile
+the changed program and verify behavior against an ESP8266 running ESP-AT
+firmware. For hardware edits, run EasyEDA ERC/DRC, inspect ISA/UART signal
+names, and verify regenerated PDFs, BOMs, and Gerbers before publishing.
 
 ## Exit Status Guidelines
 

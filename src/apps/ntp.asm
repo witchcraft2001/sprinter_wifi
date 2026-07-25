@@ -15,6 +15,7 @@
 EXE_VERSION		EQU 1
 DEFAULT_TIMEOUT		EQU 2000
 NTP_TIMEOUT		EQU 8000
+NTP_ABORT_SETTLE	EQU 20
 RECV_BUFFER_SIZE	EQU 96
 
 	DEVICE NOSLOT64K
@@ -55,8 +56,7 @@ START
 	JP	C,NO_WIFI
 	CALL	WCOMMON.REQUIRE_NET_UP
 
-	CALL	NETCFG.LOAD
-	CALL	NETCFG.APPLY_UART_BAUD
+	CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 	CALL	WIFI.UART_INIT
 	PRINTLN MSG_UART_READY
 
@@ -80,6 +80,10 @@ START
 	LD	HL,CMD_CIPMUX_0
 	CALL	SEND_CMD
 
+	; Server and timezone come from env NET_NTP/NET_TZ published by NETUP,
+	; not from a NET.CFG read.
+	CALL	SEED_NTP_ENV
+
 	PRINT	MSG_QUERY
 	PRINT	NETCFG.CFG_NTP
 	PRINT	WCOMMON.LINE_END
@@ -87,7 +91,9 @@ START
 	; --- Open UDP socket to <server>:123 -------------------
 	LD	HL,NETCFG.CFG_NTP
 	LD	DE,PORT_123
-	CALL	UDP.OPEN
+	; NTP has one fixed peer. Use the minimal UDP CIPSTART form supported by
+	; both AT generations instead of requesting a local port plus mode 2.
+	CALL	UDP.OPEN_FIXED
 	JP	C,NET_ERROR_A
 	LD	A,1
 	LD	(SOCKET_OPEN),A
@@ -96,7 +102,10 @@ START
 	CALL	BUILD_NTP_REQUEST
 	LD	HL,NTP_REQUEST
 	LD	BC,48
-	CALL	UDP.SEND_BUFFER
+	; NTP replies can arrive before ESP prints SEND OK. Do not let the generic
+	; SEND-OK waiter consume that early +IPD frame; RECEIVE below scans past
+	; the remaining command text and captures the complete datagram.
+	CALL	UDP.SEND_BUFFER_NO_WAIT
 	JP	C,NET_ERROR_A
 
 	; --- Receive the reply ---------------------------------
@@ -107,10 +116,6 @@ START
 	JP	C,NET_ERROR_A
 	LD	(RECV_LEN),BC
 
-	CALL	UDP.CLOSE
-	XOR	A
-	LD	(SOCKET_OPEN),A
-
 	; A valid reply carries the transmit timestamp at bytes 40..43,
 	; so we need at least 44 bytes of payload.
 	LD	HL,(RECV_LEN)
@@ -118,6 +123,14 @@ START
 	AND	A
 	SBC	HL,DE
 	JP	C,BAD_REPLY
+
+	; Only issue CIPCLOSE after the complete binary +IPD payload has been
+	; consumed. Sending an AT command over the remaining payload wedges the
+	; ESP command stream and leaves the UDP socket open for the next utility.
+	CALL	UDP.CLOSE
+	JP	C,NET_ERROR_A
+	XOR	A
+	LD	(SOCKET_OPEN),A
 
 	; Capture transmit timestamp (NTP bytes 40..43, big-endian).
 	LD	HL,RECV_BUFFER + 40
@@ -160,24 +173,76 @@ NO_WIFI
 	JP	WCOMMON.EXIT
 
 BAD_REPLY
-	PRINTLN MSG_BAD_REPLY
+	PRINT	MSG_BAD_REPLY
+	LD	HL,(RECV_LEN)
+	CALL	PRINT_HL_DEC
+	PRINT	MSG_BAD_ANNOUNCED
+	LD	HL,(TCP.LAST_IPD_LEN)
+	CALL	PRINT_HL_DEC
+	PRINTLN MSG_BYTES
+	CALL	ABORT_UDP_SESSION
 	LD	B,3
 	JP	WCOMMON.EXIT
 
 ; CF=1 entry with A = ESP/UDP result code. Closes the socket if open.
 NET_ERROR_A
 	PUSH	AF
-	LD	A,(SOCKET_OPEN)
-	AND	A
-	CALL	NZ,UDP.CLOSE
-	XOR	A
-	LD	(SOCKET_OPEN),A
+	CALL	PRINT_ESP_FAILURE
+	POP	AF
+	PUSH	AF
+	CALL	ABORT_UDP_SESSION
 	POP	AF
 	ADD	A,'0'
 	LD	(MSG_ERROR_NO),A
 	PRINTLN MSG_COMM_ERROR
 	LD	B,3
 	JP	WCOMMON.EXIT
+
+; Drop an incomplete binary +IPD frame before sending cleanup commands. The
+; receive routine deliberately leaves TCP.PAYLOAD_LEFT non-zero after a
+; partial read; issuing CIPCLOSE at that point mixes AT text with the remaining
+; datagram and can make ESP inaccessible to every following program.
+ABORT_UDP_SESSION
+	LD	A,(SOCKET_OPEN)
+	AND	A
+	RET	Z
+	CALL	WIFI.UART_RX_PAUSE
+	LD	HL,NTP_ABORT_SETTLE
+	CALL	UTIL.DELAY
+	CALL	WIFI.UART_EMPTY_RS
+	LD	HL,0
+	LD	(TCP.PAYLOAD_LEFT),HL
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	CALL	WIFI.UART_RX_RESUME
+	CALL	WCOMMON.CLEAN_ESP_LINKS
+	XOR	A
+	LD	(SOCKET_OPEN),A
+	RET
+
+; Print the complete command response before a cleanup command can overwrite
+; WIFI.RS_BUFF. On ESP-AT this preserves useful details such as "DNS Fail".
+PRINT_ESP_FAILURE
+	PRINTLN MSG_ESP_RESPONSE
+	LD	HL,WIFI.RS_BUFF
+.NEXT
+	LD	A,(HL)
+	AND	A
+	JR	Z,.DONE
+	CP	10
+	JR	NZ,.PUT
+	LD	A,13
+	CALL	PUT_CHAR
+	LD	A,10
+.PUT
+	CALL	PUT_CHAR
+	INC	HL
+	JR	.NEXT
+.DONE
+	LD	A,13
+	CALL	PUT_CHAR
+	LD	A,10
+	JP	PUT_CHAR
 
 ; ------------------------------------------------------
 ; Send command in HL, treat any non-zero result as fatal.
@@ -202,6 +267,56 @@ SEND_CMD_RECOVER
 	CALL	WCOMMON.SYNC_ESP_COMMAND
 	POP	HL
 	JP	SEND_CMD
+
+; ------------------------------------------------------
+; Fill NETCFG.CFG_NTP / NETCFG.CFG_TZ (plain BSS, garbage without a seed)
+; with the library defaults, then override each from env NET_NTP / NET_TZ
+; published by NETUP. NTP never reads NET.CFG. NETCFG.CFG_BUFF is the env
+; read scratch (a host name may exceed WCOMMON's 32-byte env buffer), so
+; call only while no AT+UART_CUR command is being built there.
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+SEED_NTP_ENV
+	LD	HL,NETCFG.DEFAULT_NTP
+	LD	DE,NETCFG.CFG_NTP
+	LD	B,NETCFG.CFG_NTP_SIZE
+	CALL	NETCFG.COPY_ASCIIZ
+	LD	HL,NETCFG.DEFAULT_TZ
+	LD	DE,NETCFG.CFG_TZ
+	LD	B,NETCFG.CFG_TZ_SIZE
+	CALL	NETCFG.COPY_ASCIIZ
+	LD	HL,ENV_NTP_KEY
+	LD	DE,NETCFG.CFG_BUFF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	JR	Z,.TZ
+	LD	A,(NETCFG.CFG_BUFF)
+	OR	A
+	JR	Z,.TZ
+	LD	HL,NETCFG.CFG_BUFF
+	LD	DE,NETCFG.CFG_NTP
+	LD	B,NETCFG.CFG_NTP_SIZE
+	CALL	NETCFG.COPY_ASCIIZ
+.TZ
+	LD	HL,ENV_TZ_KEY
+	LD	DE,NETCFG.CFG_BUFF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	RET	Z
+	LD	A,(NETCFG.CFG_BUFF)
+	OR	A
+	RET	Z
+	LD	HL,NETCFG.CFG_BUFF
+	LD	DE,NETCFG.CFG_TZ
+	LD	B,NETCFG.CFG_TZ_SIZE
+	JP	NETCFG.COPY_ASCIIZ
+
+ENV_NTP_KEY	DB "NET_NTP",0
+ENV_TZ_KEY	DB "NET_TZ",0
 
 ; ------------------------------------------------------
 ; Build the 48-byte NTPv3 client request in BSS.
@@ -729,13 +844,19 @@ MSG_TZ_POST
 MSG_DONE
 	DB "DSS clock updated.",0
 MSG_BAD_REPLY
-	DB "Short or invalid NTP reply.",0
+	DB "Short or invalid NTP reply: received ",0
+MSG_BAD_ANNOUNCED
+	DB ", announced ",0
+MSG_BYTES
+	DB " bytes.",0
 MSG_SET_ERROR
 	DB "Failed to set DSS time.",0
 MSG_COMM_ERROR
 	DB "ESP communication error #"
 MSG_ERROR_NO
 	DB "0!",0
+MSG_ESP_RESPONSE
+	DB "ESP response:",0
 
 CMD_AT
 	DB "AT",13,10,0
@@ -774,6 +895,11 @@ ESP_TCP_BSS_BASE	EQU 0xB000
 	INCLUDE "isa.asm"
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "esp_udp.asm"
+	; The universal image uses the field-proven trigger-8 active receive path.
+	; A forced 2.2.2 diagnostic build retains the separate trigger-4 profile.
+	IFNDEF	ESP_AT_FORCE_222
+	DEFINE	WIFI_STABLE_ACTIVE_RX
+	ENDIF
 	INCLUDE "esplib.asm"
 
 	MODULE MAIN

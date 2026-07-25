@@ -1,4 +1,4 @@
-.PHONY: build package image clean
+.PHONY: build package image test test-netup-busy test-uart-profiles clean
 
 build:
 	tools/build.sh
@@ -8,6 +8,15 @@ package:
 
 image:
 	tools/image.sh
+
+test: test-netup-busy test-uart-profiles
+	tools/test-zmodem.sh
+
+test-netup-busy:
+	tools/test-netup-busy.sh
+
+test-uart-profiles:
+	tools/test-uart-profiles.sh
 
 clean:
 	rm -rf build

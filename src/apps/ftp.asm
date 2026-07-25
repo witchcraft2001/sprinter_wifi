@@ -116,8 +116,7 @@ START
 		LD	(MSG_SLOT_NO),A
 		PRINTLN	MSG_WIFI_FOUND
 
-		CALL	NETCFG.LOAD
-		CALL	NETCFG.APPLY_UART_BAUD
+		CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 		CALL	WIFI.UART_INIT
 		PRINTLN MSG_UART_READY
 
@@ -1036,6 +1035,8 @@ ESP_PRELUDE
 		CALL	SEND_CMD_RECOVER
 		LD	HL,CMD_ECHO_OFF
 		CALL	SEND_CMD
+		; NETUP owns the ESP UART configuration. This utility only applies
+		; NET_BAUD/NET_ESP_FLOW to its local 16550 and verifies the AT link.
 		CALL	WCOMMON.SETUP_UART_FLOW
 		AND	A
 		JP	NZ,NET_ERROR_EXIT
@@ -1357,7 +1358,7 @@ RECV_CONTROL_REPLY_TIMEOUT
 
 .UART_ERROR
 		CALL	WIFI.UART_RX_RESUME
-		PRINTLN MSG_UART_OVERRUN
+		CALL	PRINT_UART_OVERRUN
 		LD	A,RES_RS_TIMEOUT
 		SCF
 		RET
@@ -1921,7 +1922,7 @@ RECV_DATA_TRANSFER
 			CALL	WIFI.UART_RX_RESUME
 			XOR	A
 			LD	(TRANSFER_ACTIVE),A
-			PRINTLN MSG_UART_OVERRUN
+			CALL	PRINT_UART_OVERRUN
 			LD	A,RES_RS_TIMEOUT
 			SCF
 			RET
@@ -2790,6 +2791,34 @@ PUT_CHAR
 		POP	HL,BC
 		RET
 
+; Print the exact UART error latch as well as the friendly explanation. This
+; distinguishes a real OE (bit 1) from PE/FE/BI or FIFO error (bit 7) on the
+; next real-hardware report instead of collapsing every condition to "overrun".
+PRINT_UART_OVERRUN
+		LD	A,(TCP.LSR_ACCUM)
+		LD	C,A
+		LD	DE,MSG_UART_LSR_ACC_HEX
+		CALL	UTIL.HEXB
+		LD	A,(TCP.LAST_LSR)
+		LD	C,A
+		LD	DE,MSG_UART_LSR_LAST_HEX
+		CALL	UTIL.HEXB
+		PRINTLN MSG_UART_LSR
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_OE
+		JR	NZ,.OVERRUN
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_PE | LSR_FE | LSR_BI
+		JR	NZ,.FRAMING
+		PRINTLN MSG_UART_RX_ERROR
+		RET
+.OVERRUN
+		PRINTLN MSG_UART_OVERRUN
+		RET
+.FRAMING
+		PRINTLN MSG_UART_FRAMING
+		RET
+
 CLEAR_BSS
 		LD	HL,FTP_BSS_BASE
 		LD	DE,FTP_BSS_BASE+1
@@ -2944,6 +2973,16 @@ MSG_FTP_ERROR
 		DB "FTP server returned error: ",0
 MSG_UART_OVERRUN
 		DB "UART overrun. Try lower BAUD or check RTS/CTS flow control.",0
+MSG_UART_FRAMING
+		DB "UART framing/parity/break error. Check baud and UART session state.",0
+MSG_UART_RX_ERROR
+		DB "UART receiver FIFO error. Received block was discarded.",0
+MSG_UART_LSR
+		DB "UART LSR accumulated=0x"
+MSG_UART_LSR_ACC_HEX
+		DB "xx, last=0x"
+MSG_UART_LSR_LAST_HEX
+		DB "xx",0
 MSG_FILE_ERROR
 			DB "File create/read/write/close error.",0
 MSG_ABORTED
@@ -3177,10 +3216,9 @@ PASV_P2
 
 		ENDMODULE
 
-		; The universal image includes the 2.2.2 passive backend and selects it
-		; at runtime. Reserve a small amount of NET.CFG slack so all profiles
-		; retain their mandatory WIN1 stack margin.
-		DEFINE	NETCFG_COMPACT_BUFFER
+		; FTP reads NET_BAUD/NET_ESP_* from the NETUP environment and never
+		; loads NET.CFG. Do not reserve a dead 1.5 KiB parser buffer in WIN1.
+		DEFINE	NETCFG_SESSION_ONLY
 		INCLUDE "netcfg_lib.asm"
 		DEFINE WCOMMON_USE_NETCFG
 		INCLUDE "wcommon.asm"
@@ -3192,6 +3230,11 @@ PASV_P2
 		; esplib.asm MUST be last: it ends with the RS_BUFF label that anchors
 		; the runtime receive buffer and all BSS. Any include after it would be
 		; overlaid by the ESP receive buffer.
+		; Universal/2.2.1 FTP uses the field-proven active trigger-8 transport.
+		; A forced 2.2.2 build retains its trigger-4/passive receive backend.
+		IFNDEF	ESP_AT_FORCE_222
+		DEFINE	WIFI_STABLE_ACTIVE_RX
+		ENDIF
 		INCLUDE "esplib.asm"
 
 		MODULE MAIN

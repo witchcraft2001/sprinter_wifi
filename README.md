@@ -79,7 +79,7 @@ FTP.EXE host[:port] [path] -l|-n [-u user] [-p pass]
 PING.EXE host    test host reachability using ESP-AT AT+PING
 WGET.EXE url [-o output] [-y|-f] [-r]
                  download an http:// URL to a local file (-y/-f overwrite, -r resume)
-NTP.EXE          set DSS time using NET.CFG TZ/NTP values
+NTP.EXE          set DSS time using NET_TZ/NET_NTP published by NETUP.EXE
 TELNET.EXE host[:port] | host [port]
                  ANSI Telnet client with Zmodem and Ymodem download/upload
 ```
@@ -99,9 +99,11 @@ probes `AT+SYSSTORE?` once: `ERROR` selects the 2.2.1 `_CUR` profile, while
 `OK` selects 2.2.2 and first sends `AT+SYSSTORE=0`. Therefore Wi-Fi settings
 remain session-only on both profiles. It prints and publishes the result as
 `NET_ESP_FW=2.2.1` or `NET_ESP_FW=2.2.2`; software that needs
-`AT+CIPRECVMODE=1` must require the 2.2.2 profile.
-`BAUD` in `NET.CFG` may be set to `115200`, `57600`, `38400`, `19200` or
-`9600`; automated tools use it after `NETUP.EXE` configures the ESP with
+`AT+CIPRECVMODE=1` must require the 2.2.2 profile. NETUP also publishes the
+actually negotiated UART flow-control mode as `NET_ESP_FLOW=3` or `0`;
+clients reproduce that local 16550 mode without sending `AT+UART_CUR` again.
+`BAUD` in `NET.CFG` may be set to `230400`, `115200`, `57600`, `38400`,
+`19200` or `9600`; automated tools use it after `NETUP.EXE` configures the ESP with
 `AT+UART_CUR`.
 
 ## ESP-AT Firmware Baseline

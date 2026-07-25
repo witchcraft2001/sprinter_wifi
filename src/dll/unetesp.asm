@@ -133,6 +133,10 @@ F_NETINIT
 	; locate UART
 	CALL	WIFI.UART_FIND
 	JP	C,.nohw
+	; Reproduce the ESP UART flow mode negotiated by NETUP before initializing
+	; the local 16550. Never issue AT+UART_CUR from a client DLL.
+	CALL	SELECT_ENV_FLOW
+	JP	C,.nonet
 	; apply configured baud and init UART
 	CALL	APPLY_ENV_BAUD
 	CALL	WIFI.UART_INIT
@@ -144,9 +148,6 @@ F_NETINIT
 	LD	HL,CMD_ATE0
 	LD	BC,DEFAULT_TIMEOUT
 	CALL	SEND_AT			; ignore
-	; flow control on both sides; SETUP_FLOW re-syncs local baud and verifies AT
-	CALL	SETUP_FLOW
-	JP	C,.nohw
 	; drop leftover sockets before CIPMUX (else ERROR)
 	LD	HL,CMD_CIPCLOSE_ALL
 	LD	BC,DEFAULT_TIMEOUT
@@ -1042,11 +1043,29 @@ SELECT_ENV_RX_PROFILE
 	ENDIF
 	ENDIF
 
+; Select the local MCR mode from NET_ESP_FLOW published by NETUP.
+; Out: CF=1 when the value is absent/invalid.
+SELECT_ENV_FLOW
+	LD	HL,ENVN_ESP_FLOW
+	CALL	ENV_GET_STAGE
+	JR	Z,.bad
+	LD	A,(ENV_STAGE)
+	CP	'3'
+	JR	Z,.flow3
+	CP	'0'
+	JR	NZ,.bad
+	CALL	WIFI.UART_FLOW_OFF
+	OR	A
+	RET
+.flow3
+	CALL	WIFI.UART_FLOW_ON
+	OR	A
+	RET
+.bad
+	SCF
+	RET
+
 ; Read NET_BAUD and program the local UART divisor (default 8 = 115200).
-; Also latch the MATCHED baud literal in BAUD_TXT for SETUP_FLOW: the AT
-; command must always quote the same speed the divisor was set to (an
-; unknown NET_BAUD falls back to 115200 on BOTH sides), and appending an
-; in-image literal instead of the raw env value keeps CMDBUILD bounded.
 APPLY_ENV_BAUD
 	LD	HL,ENVN_BAUD
 	CALL	ENV_GET_STAGE
@@ -1077,34 +1096,10 @@ APPLY_ENV_BAUD
 	LD	A,96
 	JR	Z,.set
 .default
-	LD	DE,DEF_BAUD_TXT
 	LD	A,8
 .set
-	LD	(BAUD_TXT),DE		; STRMATCH preserved DE = matched literal
 	CALL	WIFI.UART_SET_DIVISOR
 	RET
-
-; Configure ESP-side flow control: AT+UART_CUR=<baud>,8,1,0,3. The command's
-; final reply may be sent at the new baud, so ignore that first result, restore
-; the configured local divisor/MCR/FCR, then verify with a fresh AT.
-; Uses the literal latched by APPLY_ENV_BAUD, never the raw env value.
-; Out: A=RES_* / CF=1 on failed post-switch AT verification.
-SETUP_FLOW
-	LD	HL,CMDBUILD
-	LD	DE,PFX_UART_CUR
-	CALL	APPEND_DE
-	LD	DE,(BAUD_TXT)
-	CALL	APPEND_DE
-	LD	DE,SFX_UART_CUR
-	CALL	APPEND_DE
-	LD	HL,CMDBUILD
-	LD	BC,DEFAULT_TIMEOUT
-	CALL	SEND_AT			; reply can be lost during the baud switch
-	CALL	APPLY_ENV_BAUD
-	CALL	WIFI.UART_INIT
-	LD	HL,CMD_AT
-	LD	BC,DEFAULT_TIMEOUT
-	JP	SEND_AT
 
 ; Compare ASCIIZ (HL) and (DE). Out: ZF=1 if equal. Preserves HL,DE.
 STRMATCH
@@ -1333,13 +1328,9 @@ CMD_ATE0		DB "ATE0",13,10,0
 CMD_CIPMUX0		DB "AT+CIPMUX=0",13,10,0
 CMD_CIPCLOSE_ALL	DB "AT+CIPCLOSE=5",13,10,0
 CMD_CIPCLOSE_ONE	DB "AT+CIPCLOSE",13,10,0
-PFX_UART_CUR		DB "AT+UART_CUR=",0
-SFX_UART_CUR		DB ",8,1,0,3",13,10,0
 PFX_PING		DB "AT+PING=",34,0
 PFX_CIPDOMAIN		DB "AT+CIPDOMAIN=",34,0
 SFX_QUOTE_CRLF		DB 34,13,10,0
-DEF_BAUD_TXT		DB "115200",0
-
 BAUD_230400		DB "230400",0
 BAUD_57600		DB "57600",0
 BAUD_38400		DB "38400",0
@@ -1355,6 +1346,7 @@ NEEDLE_CIPDOMAIN	DB "+CIPDOMAIN:",0
 ENVN_NET		DB "NET",0
 ENVN_ESP_HW		DB "NET_ESP_HW",0
 ENVN_ESP_FW		DB "NET_ESP_FW",0
+ENVN_ESP_FLOW	DB "NET_ESP_FLOW",0
 ENVN_BAUD		DB "NET_BAUD",0
 VAL_WIFI		DB "WIFI",0
 VAL_ESP_FW_221	DB "2.2.1",0
@@ -1398,8 +1390,6 @@ ARG_IY			DW 0
 SEND_DONE		DW 0
 CHUNK_LEN		DW 0
 RECV_GOT		DW 0
-BAUD_TXT		DW DEF_BAUD_TXT	; baud literal for AT+UART_CUR (relocated)
-
 	ENDMODULE
 
 ; ======================================================

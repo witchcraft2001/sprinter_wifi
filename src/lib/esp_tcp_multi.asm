@@ -40,14 +40,11 @@ OPEN_LINK
 	LD	DE,CMD_CRLF
 	CALL	APPEND_STR
 
+	; Retry while the ESP still answers "busy p..." right after NETUP's join;
+	; see TCP.TX_CMD_BUSY_RETRY in esp_tcp.asm.
 	LD	HL,CMD_BUFFER
-	LD	DE,WIFI.RS_BUFF
 	LD	BC,TCP_OPEN_TIMEOUT
-	CALL	WIFI.UART_TX_CMD
-	AND	A
-	RET	Z
-	SCF
-	RET
+	JP	TX_CMD_BUSY_RETRY
 
 ; ------------------------------------------------------
 ; Close a TCP link in ESP-AT multi-connection mode.
@@ -148,6 +145,9 @@ START_SEND_BUFFER_LINK
 ;   dispatches by LAST_IPD_LINK.
 ; ------------------------------------------------------
 RECEIVE_ANY_LINK
+	; Reassert the profile-specific streaming trigger without flushing bytes
+	; that may already have followed the command response.
+	CALL	WIFI.UART_SET_DATA_RX_MODE
 	; Passive receive is retained for an explicitly forced 2.2.2 diagnostic
 	; image. The universal executable uses the field-proven active path for
 	; both profiles until the control-channel passive parser is hardware-tested.

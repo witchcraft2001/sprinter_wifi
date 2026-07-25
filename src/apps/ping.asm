@@ -10,6 +10,8 @@ PING_BUSY_RETRIES	EQU 8			; AT+PING retries while the ESP answers "busy"
 PING_BUSY_DELAY		EQU 400			; ms between busy retries
 PING_WARMUP_RETRIES	EQU 3			; AT+PING retries while the route is still warming up ("+timeout")
 PING_WARMUP_DELAY	EQU 600			; ms between warmup retries
+PING_FORMAT_RETRIES	EQU 3			; retry a terminal OK with a damaged/missing +PING line
+PING_FORMAT_DELAY	EQU 150
 HOST_SIZE		EQU 96
 CMD_SIZE		EQU 128
 
@@ -54,8 +56,7 @@ START
 	JP	C,NO_WIFI
 	CALL	WCOMMON.REQUIRE_NET_UP
 
-	CALL	NETCFG.LOAD
-	CALL	NETCFG.APPLY_UART_BAUD
+	CALL	WCOMMON.APPLY_NET_BAUD		; baud from env NET_BAUD (NETUP session); utilities never read NET.CFG
 	CALL	WIFI.UART_INIT
 	PRINTLN MSG_UART_READY
 
@@ -69,8 +70,8 @@ START
 	LD	HL,CMD_ECHO_OFF
 	CALL	SEND_CMD
 
-	; Every executable owns the 16550 state. Mirror its AFE+RTS configuration
-	; on the ESP before network traffic, including the default 115200 baud.
+	; Confirm the local UART mode selected from NET_ESP_FLOW; this does not
+	; reconfigure the ESP or toggle AFE.
 	CALL	WCOMMON.SETUP_UART_FLOW
 	AND	A
 	JR	Z,.UART_FLOW_OK
@@ -90,11 +91,18 @@ START
 	LD	(PING_RETRY),A
 	LD	A,PING_WARMUP_RETRIES
 	LD	(PING_WRETRY),A
+	LD	A,PING_FORMAT_RETRIES
+	LD	(PING_FRETRY),A
 .PING_TRY
 	LD	HL,CMD_BUFF
 	LD	DE,WIFI.RS_BUFF
 	LD	BC,PING_TIMEOUT
 	CALL	WIFI.UART_TX_CMD
+	IFDEF	PING_HEXDUMP
+	PUSH	AF
+	CALL	DUMP_RS_HEX
+	POP	AF
+	ENDIF
 	AND	A
 	JP	Z,.PING_OK
 	LD	(PING_STATUS),A
@@ -109,7 +117,7 @@ START
 	LD	(PING_RETRY),A
 	LD	HL,PING_BUSY_DELAY
 	CALL	UTIL.DELAY
-	JR	.PING_TRY
+	JP	.PING_TRY
 .CHK_WARMUP
 	; Right after NETUP the route/ARP may not be ready yet, so the first pings
 	; come back "+timeout" (or no reply at all). Retry a few times before
@@ -156,6 +164,24 @@ START
 	JP	WCOMMON.EXIT
 
 .PING_OK
+	; A valid final OK can still follow a UART-corrupted informational line.
+	; Never accept or print a truncated result such as "G:109"; retry the
+	; idempotent ping command after restoring command-response FIFO mode.
+	CALL	FIND_PING_RESULT
+	JR	NC,.PING_VALID
+	LD	A,(PING_FRETRY)
+	AND	A
+	JR	Z,.PING_MALFORMED
+	DEC	A
+	LD	(PING_FRETRY),A
+	LD	HL,PING_FORMAT_DELAY
+	CALL	UTIL.DELAY
+	JP	.PING_TRY
+.PING_MALFORMED
+	CALL	PRINT_PING_RESULT
+	LD	B,3
+	JP	WCOMMON.EXIT
+.PING_VALID
 	CALL	PRINT_PING_RESULT
 	JR	NC,.SUCCESS
 	LD	B,3
@@ -274,27 +300,7 @@ BUILD_PING_CMD
 ; Out: CF=0 - valid ping response found, CF=1 - no ping result.
 ; ------------------------------------------------------
 PRINT_PING_RESULT
-	LD	HL,WIFI.RS_BUFF
-.NEXT
-	LD	A,(HL)
-	AND	A
-	JR	Z,.RAW
-	LD	DE,RESP_PING_PREFIX
-	CALL	UTIL.STARTSWITH
-	JR	Z,.FOUND_PING
-	LD	A,(HL)
-	CP	'+'
-	JR	Z,.FOUND_SHORT
-	CALL	SKIP_LINE
-	JR	.NEXT
-.FOUND_PING
-	LD	BC,6
-	ADD	HL,BC
-	JR	.FOUND_DECIMAL
-.FOUND_SHORT
-	INC	HL
-.FOUND_DECIMAL
-	CALL	FIND_DECIMAL_FIELD
+	CALL	FIND_PING_RESULT
 	JR	C,.RAW
 	PUSH	HL
 	PRINT MSG_REPLY
@@ -312,6 +318,35 @@ PRINT_PING_RESULT
 	PRINTLN MSG_NO_PING_RESULT
 	LD	HL,WIFI.RS_BUFF
 	CALL	PRINT_ESP_RESPONSE
+	SCF
+	RET
+
+; Locate the decimal result without producing output.
+; Out: CF=0/HL -> first digit, CF=1 when no valid +PING/+<ms> line exists.
+FIND_PING_RESULT
+	LD	HL,WIFI.RS_BUFF
+.NEXT
+	LD	A,(HL)
+	AND	A
+	JR	Z,.NOT_FOUND
+	LD	DE,RESP_PING_PREFIX
+	CALL	UTIL.STARTSWITH
+	JR	Z,.FOUND_PING
+	LD	A,(HL)
+	CP	'+'
+	JR	Z,.FOUND_SHORT
+	CALL	SKIP_LINE
+	JR	.NEXT
+.FOUND_PING
+	LD	BC,6
+	ADD	HL,BC
+	JR	.FOUND_DECIMAL
+.FOUND_SHORT
+	INC	HL
+.FOUND_DECIMAL
+	CALL	FIND_DECIMAL_FIELD
+	RET
+.NOT_FOUND
 	SCF
 	RET
 
@@ -397,29 +432,47 @@ PUT_CHAR
 	POP	HL
 	RET
 
-; ------------------------------------------------------
-; Append ASCIIZ from DE to buffer at HL.
-; ------------------------------------------------------
-APPEND_STR
-	LD	A,(DE)
-	AND	A
-	RET	Z
-	LD	(HL),A
-	INC	HL
-	INC	DE
-	JR	APPEND_STR
+; Keep the dynamically assembled AT+PING command terminated even though
+; CMD_BUFF is runtime BSS and can contain bytes left by a previous program.
+; Without the copied zero UART_TX_STRING continued past CR/LF and fed ESP a
+; second garbage line, commonly producing ERR CODE:0x010b0000 / "busy p...".
+	INCLUDE "asciiz_append.asm"
 
+	IFDEF	PING_HEXDUMP
 ; ------------------------------------------------------
-; Append ASCIIZ from IX to buffer at HL.
+; Debug: dump the first 32 bytes of WIFI.RS_BUFF as hex + result code, so the
+; exact bytes the UART stored (incl. any leading control/framing artefacts)
+; are visible. A=UART_TX_CMD result on entry.
 ; ------------------------------------------------------
-APPEND_IX_STR
-	LD	A,(IX+0)
-	AND	A
-	RET	Z
-	LD	(HL),A
+DUMP_RS_HEX
+	PUSH	AF
+	LD	C,A
+	LD	DE,HEXD_RES
+	CALL	UTIL.HEXB
+	LD	B,32
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,HEXD_BYTES
+.NEXT
+	LD	A,(HL)
+	LD	C,A
+	CALL	UTIL.HEXB			; writes 2 hex chars, advances DE by 2
+	LD	A,' '
+	LD	(DE),A
+	INC	DE
 	INC	HL
-	INC	IX
-	JR	APPEND_IX_STR
+	DJNZ	.NEXT
+	XOR	A
+	LD	(DE),A
+	PRINTLN	HEXD_HDR
+	POP	AF
+	RET
+HEXD_HDR
+	DB "DUMP res="
+HEXD_RES
+	DB "xx bytes="
+HEXD_BYTES
+	DS 32*3+1,0
+	ENDIF
 
 MSG_START
 	DB "PING "
@@ -475,6 +528,8 @@ PING_STATUS
 PING_RETRY
 	DB 0
 PING_WRETRY
+	DB 0
+PING_FRETRY
 	DB 0
 CMDLINE_PTR
 	DW 0			; arg buffer ptr captured from IX at entry

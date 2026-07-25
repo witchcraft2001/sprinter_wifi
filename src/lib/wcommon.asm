@@ -16,7 +16,8 @@
 	ENDIF
 
 ENABLE_RTS_CTR	EQU 1
-ESP_SYNC_RETRIES	EQU 4
+ESP_SYNC_RETRIES	EQU 6
+ESP_SYNC_DELAY		EQU 300
 ESP_CLEAN_DELAY		EQU 150
 
 ; NETCFG is often included after this common source. Such programs define
@@ -301,129 +302,19 @@ INIT_ESP
 	POP		DE,BC
 	RET
 	;;ENDIF
-; ------------------------------------------------------
-; Build "AT+UART_CUR=<baud>,8,1,0,3\r\n" using current NET.CFG baud
-; into the now-unused raw NET.CFG read buffer. Out: HL = command pointer.
-; Hardcoding the baud (e.g. 115200) breaks utilities when NET.CFG selects a
-; non-default speed: UART_INIT has already switched the local 16550 to that
-; speed, so a static "AT+UART_CUR=115200,..." would arrive at ESP at the
-; wrong baud and brick the UART link.
-; Emitted when NETCFG is already included, or when the consumer defines
-; WCOMMON_USE_NETCFG before including this file. The latter supports the common
-; include order (WCOMMON before NETCFG) through forward label resolution.
-; ------------------------------------------------------
 	IFDEF	_WCOMMON_NETCFG
-BUILD_UART_FLOW_CMD
-	PUSH	BC,DE
-	LD		HL,@NETCFG.CFG_BUFF
-	LD		DE,UART_FLOW_PREFIX
-	CALL	BUILD_UART_APPEND
-	; NETCFG.GET_UART_BAUD_TEXT: out HL = ASCIIZ baud text (e.g. "38400").
-	; Move HL→DE to use as source, restore destination from saved.
-	PUSH	HL								; save dest
-	CALL	@NETCFG.GET_UART_BAUD_TEXT
-	EX		DE,HL							; DE = baud text source
-	POP		HL								; HL = dest
-	CALL	BUILD_UART_APPEND
-	LD		DE,UART_FLOW_SUFFIX
-	CALL	BUILD_UART_APPEND
-	LD		HL,@NETCFG.CFG_BUFF
-	POP		DE,BC
-	RET
-
-; Append ASCIIZ string at DE to buffer at HL. Out: HL = terminator pos.
-BUILD_UART_APPEND
-	LD		A,(DE)
-	AND		A
-	JR		Z,.TERMINATE
-	LD		(HL),A
-	INC		HL
-	INC		DE
-	JR		BUILD_UART_APPEND
-.TERMINATE
-	; BUILD_UART_FLOW_CMD reuses NETCFG.CFG_BUFF, which still contains the
-	; loaded NET.CFG text.  Always terminate the current result explicitly;
-	; otherwise UART_TX_STRING continues into that stale text after CR/LF and
-	; ESP receives a malformed AT+UART_CUR command.
-	LD		(HL),A								; A=0
-	RET
-
-UART_FLOW_PREFIX
-	DB	"AT+UART_CUR=",0
-UART_FLOW_SUFFIX
-	DB	",8,1,0,3",13,10,0
 UART_FLOW_VERIFY_CMD
 	DB	"AT",13,10,0
 
 ; ------------------------------------------------------
-; Send AT+UART_CUR with NET.CFG baud + flow=3, then re-apply local 16550
-; baud divisor and verify the link with AT. If the ESP flow pins are not
-; usable, negotiate the same baud with flow=0 and disable local AFE too.
-; ESP-AT may emit the trailing OK at the *new* baud (not the old one), so
-; the first send is best-effort: we don't trust its success status. After
-; the send we switch local UART to the configured baud and use a fresh AT
-; round-trip to confirm both sides agreed on the new framing.
-; Out: A=0 on success, A=non-zero ESP result on failure.
+; Verify the UART contract NETUP published in NET_ESP_FLOW. REQUIRE_NET_UP has
+; already selected the matching local MCR mode before UART_INIT. Do not resend
+; AT+UART_CUR or toggle AFE here: doing so in a live session caused the next
+; delayed response burst to lose its prefix ("+PING:109" became "G:109").
+; Out: A=0 on success, A=non-zero ESP result on communication failure.
 ; ------------------------------------------------------
 SETUP_UART_FLOW
-	; ESP-AT 2.2.1 keeps its field-proven manual-RTS/flow=0 path unchanged.
-	; 2.2.2 alone is eligible for the AFE probe below.
-	IFDEF	ESP_AT_FORCE_221
-	JP		SETUP_UART_NO_FLOW
-	ELSE
-	IFNDEF	ESP_AT_FORCE_222
-	LD		A,(UART_ESP_PROFILE)
-	CP		UART_RX_PROFILE_221
-	JR		Z,SETUP_UART_NO_FLOW
-	ENDIF
-	ENDIF
 	PUSH	BC,DE,HL
-	; Start manually. AFE must not gate host TX until the ESP CTS path has
-	; been verified at the requested baud.
-	CALL	@WIFI.UART_FLOW_OFF
-	CALL	BUILD_UART_FLOW_CMD					; HL=cmd buffer
-	LD		DE,@WIFI.RS_BUFF
-	LD		BC,DEFAULT_TIMEOUT
-	CALL	@WIFI.UART_TX_CMD					; ignore status
-
-	CALL	@NETCFG.APPLY_UART_BAUD				; switch local divisor
-	CALL	@WIFI.UART_INIT						; re-init in manual RTS mode
-	CALL	UART_FLOW_VERIFY
-	AND		A
-	JR		NZ,.FALLBACK
-
-	; flow=3 was accepted; now prove that AFE/CTS itself is usable.
-	CALL	@WIFI.UART_FLOW_ON
-	CALL	UART_FLOW_VERIFY
-	AND		A
-	JR		Z,.DONE
-
-.FALLBACK
-	; Some ESP-AT builds accept flow=3 but do not mux RTS/CTS.  Negotiate
-	; flow=0 at the current baud and retain the manual RTS data path.
-	CALL	@WIFI.UART_FLOW_OFF
-	CALL	BUILD_UART_FLOW_CMD
-	CALL	UART_FLOW_CMD_TO_NO_FLOW
-	LD		DE,@WIFI.RS_BUFF
-	LD		BC,DEFAULT_TIMEOUT
-	CALL	@WIFI.UART_TX_CMD					; command result may straddle UART mode
-	CALL	UART_FLOW_VERIFY
-.DONE
-	POP		HL,DE,BC
-	RET
-
-; Legacy 2.2.1 (and the 2.2.2 compatibility fallback) uses software-managed
-; RTS. Do not send flow=3 first: old modules were qualified with flow=0.
-SETUP_UART_NO_FLOW
-	PUSH	BC,DE,HL
-	CALL	@WIFI.UART_FLOW_OFF
-	CALL	BUILD_UART_FLOW_CMD
-	CALL	UART_FLOW_CMD_TO_NO_FLOW
-	LD		DE,@WIFI.RS_BUFF
-	LD		BC,DEFAULT_TIMEOUT
-	CALL	@WIFI.UART_TX_CMD					; result may straddle reconfiguration
-	CALL	@NETCFG.APPLY_UART_BAUD
-	CALL	@WIFI.UART_INIT
 	CALL	UART_FLOW_VERIFY
 	POP		HL,DE,BC
 	RET
@@ -434,24 +325,41 @@ UART_FLOW_VERIFY
 	LD		BC,DEFAULT_TIMEOUT
 	JP		@WIFI.UART_TX_CMD
 
-; Reuse the generated ",8,1,0,3<CR><LF>" command for the compatibility
-; fallback by changing its final flow digit. This avoids a duplicate formatter
-; in memory-tight ORG 0x4100 applications such as TELNET.
-UART_FLOW_CMD_TO_NO_FLOW
-	LD		HL,@NETCFG.CFG_BUFF
-.FIND_END
-	LD		A,(HL)
-	AND		A
-	JR		Z,.FOUND_END
-	INC		HL
-	JR		.FIND_END
-.FOUND_END
-	DEC		HL							; LF
-	DEC		HL							; CR
-	DEC		HL							; flow digit
-	LD		(HL),'0'
-	LD		HL,@NETCFG.CFG_BUFF
-	RET
+; ------------------------------------------------------
+; Session UART baud for client utilities. NET.CFG belongs to NETUP/NETCFG
+; (beside NETUP.EXE); utilities never read the file and take the baud from
+; env NET_BAUD, published by NETUP - the authoritative record of what the ESP
+; UART is actually running. Without a NET_BAUD (fresh boot, NETUP not run)
+; the ESP is at its power-up 115200, so the default matches.
+; SEED_NET_BAUD fills NETCFG.CFG_BAUD (plain BSS, garbage until seeded);
+; APPLY_NET_BAUD additionally switches the local divisor.
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+APPLY_NET_BAUD
+	CALL	SEED_NET_BAUD
+	JP	@NETCFG.APPLY_UART_BAUD
+
+SEED_NET_BAUD
+	LD	HL,@NETCFG.DEFAULT_BAUD
+	LD	DE,@NETCFG.CFG_BAUD
+	LD	B,NETCFG.CFG_BAUD_SIZE
+	CALL	@NETCFG.COPY_ASCIIZ
+	LD	HL,N_BAUD_KEY
+	LD	DE,ENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	RET	Z				; NET_BAUD not set -> 115200 default
+	LD	A,(ENV_VAL_BUF)
+	OR	A
+	RET	Z				; empty value -> 115200 default
+	LD	HL,ENV_VAL_BUF
+	LD	DE,@NETCFG.CFG_BAUD
+	LD	B,NETCFG.CFG_BAUD_SIZE
+	JP	@NETCFG.COPY_ASCIIZ
+
+N_BAUD_KEY	DB "NET_BAUD",0
 	ENDIF
 
 ; ------------------------------------------------------
@@ -479,6 +387,13 @@ SYNC_ESP_COMMAND
 	POP		BC
 	AND		A
 	RET		Z
+	; Right after NETUP's join the ESP can answer "busy p..." while its IP
+	; stack finishes coming up; those probes now fail fast (RES_BUSY), so a
+	; settle interval is what actually lets the retries bridge that window.
+	PUSH	BC
+	LD		HL,ESP_SYNC_DELAY
+	CALL	@UTIL.DELAY
+	POP		BC
 	DJNZ	.TRY
 	SCF
 	RET
@@ -561,7 +476,7 @@ REQUIRE_NET_UP
 	LD	A,(ENV_VAL_BUF)
 	OR	A
 	JR	Z,.FAIL				; NET_ESP_HW empty
-	; The universal executable selects its UART receive/RTS implementation from
+	; The universal executable selects its UART receive implementation from
 	; NET_ESP_FW published by the successful NETUP run. Do not issue a second
 	; ESP firmware probe here: it would make the active connection state part of
 	; a local UART choice. A forced image has only one algorithm compiled.
@@ -569,13 +484,13 @@ REQUIRE_NET_UP
 	LD	A,UART_RX_PROFILE_221
 	LD	(UART_ESP_PROFILE),A
 	CALL	@WIFI.UART_SET_RX_PROFILE
-	RET
+	JR	.READ_FLOW
 	ELSE
 	IFDEF	ESP_AT_FORCE_222
 	LD	A,UART_RX_PROFILE_222
 	LD	(UART_ESP_PROFILE),A
 	CALL	@WIFI.UART_SET_RX_PROFILE
-	RET
+	JR	.READ_FLOW
 	ELSE
 	LD	HL,N_ESP_FW_KEY
 	LD	DE,ENV_VAL_BUF
@@ -599,9 +514,29 @@ REQUIRE_NET_UP
 .SET_PROFILE
 	LD		(UART_ESP_PROFILE),A
 	CALL	@WIFI.UART_SET_RX_PROFILE
+	ENDIF
+	ENDIF
+.READ_FLOW
+	; NETUP may have fallen back to ESP flow=0 when CTS/RTS is unavailable.
+	; Reproduce its actual mode before the caller initializes its local 16550;
+	; guessing here is what made consecutive utilities intermittently disagree.
+	LD	HL,N_ESP_FLOW_KEY
+	LD	DE,ENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	JR	Z,.PROFILE_FAIL
+	LD	A,(ENV_VAL_BUF)
+	CP	'3'
+	JR	Z,.FLOW3
+	CP	'0'
+	JR	NZ,.PROFILE_FAIL
+	CALL	@WIFI.UART_FLOW_OFF
 	RET
-	ENDIF
-	ENDIF
+.FLOW3
+	CALL	@WIFI.UART_FLOW_ON
+	RET
 .FAIL
 	PRINTLN MSG_NET_NOT_UP
 	LD	B,4
@@ -626,6 +561,7 @@ REQUIRE_NET_UP
 N_NET_KEY	DB "NET",0
 N_ESP_HW_KEY	DB "NET_ESP_HW",0
 N_ESP_FW_KEY	DB "NET_ESP_FW",0
+N_ESP_FLOW_KEY	DB "NET_ESP_FLOW",0
 V_WIFI		DB "WIFI",0
 V_ESP_FW_221	DB "2.2.1",0
 V_ESP_FW_222	DB "2.2.2",0

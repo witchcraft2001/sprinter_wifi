@@ -54,8 +54,8 @@ Everyday commands (run after NETUP)
   FTP  host file [-u user -p pass]   download over FTP
   TFTP host GET file -o FILE          download over TFTP
   NTP                       set the DSS clock from the network
-                            NTP server and timezone are taken from NET.CFG
-                            (NTP=, TZ=).
+                            NTP server and timezone are taken from the
+                            NET_NTP/NET_TZ variables published by NETUP.
   WTERM                     open a manual ESP-AT terminal for hand-typed
                             commands.
 
