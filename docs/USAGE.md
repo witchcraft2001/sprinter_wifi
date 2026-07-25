@@ -3,6 +3,19 @@
 This package provides small Sprinter DSS utilities for the SprinterESP /
 Sprinter-WiFi card with ESP8266 ESP-AT firmware.
 
+## Recommended firmware
+
+Use ESP-AT **V2.2.2.0**:
+[`firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin`](../firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin).
+The same image is available from the
+[GitHub repository](https://github.com/witchcraft2001/sprinter_wifi/blob/main/firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin);
+see [`firmware/FLASHING.md`](../firmware/FLASHING.md) before flashing.
+
+ESP-AT V2.2.1 remains supported for a transition period, but V2.2.2.0 is more
+stable with this package. On V2.2.1, corrupt downloads, missing bytes, and
+slow transfers are known firmware limitations; update the ESP module before
+diagnosing those symptoms as an application problem.
+
 Normal builds automatically use the ESP-AT 2.2.1/2.2.2 command subset. After
 `NETUP`, transfer utilities select their profile-specific UART FIFO setup from
 published `NET_ESP_FW`; both profiles use explicit RTS pauses during slow
@@ -179,8 +192,10 @@ after an ESP reset. If `NETPROBE.EXE` fails after `NETUP.EXE` and `PING.EXE`
 have already succeeded, the network path may still be fine; run `NETRESET.EXE`
 and repeat `NETPROBE.EXE` for a clean firmware diagnostic.
 
-`WTERM.EXE` is useful for manual ESP-AT checks. After using the terminal, run
-`NETRESET.EXE` before automated tools if the ESP stream looks confused.
+`WTERM.EXE` is useful for manual ESP-AT checks. It attaches to the active
+NETUP session and uses the published `NET_BAUD`/`NET_ESP_FLOW` values; it never
+resets ESP or sends `AT+UART_CUR`. After a manual command changes module state
+or leaves the stream confused, run `NETRESET.EXE` and then `NETUP.EXE`.
 
 `PING.EXE` does not reset an ESP that was already brought up by `NETUP.EXE`.
 When its initial `AT` check fails, it retries and then uses the ESP-AT `+++`
@@ -188,14 +203,13 @@ transparent-mode escape before checking `AT` again. This preserves the current
 Wi-Fi association; a remaining failure prints the actual ESP response and
 returns status `3`.
 
-`NETRESET.EXE` and `WTERM.EXE` are recovery/manual tools and use the default
-115200 startup speed after ESP reset. Client utilities never read `NET.CFG`
-themselves (the file belongs to `NETUP.EXE`/`NETCFG.EXE`): they take the UART
-speed from the `NET_BAUD` environment variable published by a successful
-`NETUP.EXE` run, falling back to 115200 when it is not set. This makes the
-tools independent of the current directory they are started from. They also
-use `NET_ESP_FLOW=3` or `0` to reproduce NETUP's negotiated local UART mode;
-clients do not resend `AT+UART_CUR` or toggle AFE during the live session.
+`NETRESET.EXE` uses the default 115200 startup speed after an ESP reset.
+All other clients, including WTERM, never read `NET.CFG` themselves (the file
+belongs to `NETUP.EXE`/`NETCFG.EXE`): they take the UART speed from the
+`NET_BAUD` environment variable published by a successful `NETUP.EXE` run.
+They also use `NET_ESP_FLOW=3` or `0` to reproduce NETUP's negotiated local
+UART mode; clients do not resend `AT+UART_CUR` or toggle AFE during the live
+session.
 
 ## Exit Codes
 

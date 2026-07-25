@@ -7,7 +7,7 @@
 ================================================================
   Sprinter ESP Network Kit
   Network utility package for Sprinter DSS and the SprinterESP
-  Wi-Fi card (ESP12-F / ESP8266, ESP-AT firmware). Version 0.1.1
+  Wi-Fi card (ESP12-F / ESP8266, ESP-AT firmware). Version 0.2.1
 ================================================================
 
 Utilities that put Sprinter on the network through the
@@ -15,10 +15,13 @@ SprinterESP Wi-Fi card: configure and bring up the connection,
 diagnostics, file download (HTTP / FTP / TFTP), network time,
 and an ESP-AT terminal.
 
-IMPORTANT: this package targets ESP-AT firmware version 2.2.1 - only
-that version is tested; other versions are not guaranteed to work.
-To check the firmware version run NETPROBE (the AT+GMR line) or type
-AT+GMR in WTERM.
+IMPORTANT: the recommended firmware is ESP-AT version 2.2.2.0. Download the
+full 2 MB image and the host-side flashing guide from the project GitHub:
+https://github.com/witchcraft2001/sprinter_wifi/tree/main/firmware
+The package is backwards compatible with ESP-AT 2.2.1, but upgrading is
+strongly recommended. Corrupt files, missing bytes and slow transfers are
+known limitations of 2.2.1. To check the firmware version run NETPROBE (the
+AT+GMR line) or type AT+GMR in WTERM.
 
 
 GETTING STARTED

@@ -3,8 +3,12 @@ Sprinter ESP Network Kit - Quick Start (HOWTO)
 
 What you need
   - Sprinter DSS with the SprinterESP / Sprinter-Wi-Fi card (ESP8266, ESP-AT).
-  - ESP-AT firmware version 2.2.1. This is the only tested version; other
-    versions are not guaranteed. Check it with NETPROBE.
+  - ESP-AT firmware version 2.2.2.0 (recommended). Download the firmware image
+    and host-side flashing instructions from:
+    https://github.com/witchcraft2001/sprinter_wifi/tree/main/firmware
+    ESP-AT 2.2.1 remains compatible, but corrupted files, missing bytes and
+    slow downloads are known 2.2.1 limits. Check the installed version with
+    NETPROBE.
   - The name and password of your Wi-Fi network.
 
 1. Install

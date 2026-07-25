@@ -13,15 +13,18 @@ Controls
 
 Typical use
   WTERM is useful for commands that are not available as separate utilities.
+  Run NETUP.EXE first. WTERM attaches to the active NETUP session, using its
+  published baud rate and flow-control mode; it does not reset ESP or send
+  AT+UART_CUR.
 
 After use
   Run NETRESET.EXE before automated utilities if the ESP stream looks confused
   or if manual commands changed module state.
 
 Baud rate
-  WTERM resets and initializes ESP for manual work at the default startup speed
-  115200. Run NETUP again afterwards to apply BAUD from NET.CFG for automated
-  tools.
+  WTERM uses NET_BAUD and NET_ESP_FLOW published by NETUP. Do not change the
+  ESP UART speed manually in WTERM unless you are prepared to recover with
+  NETRESET.EXE followed by NETUP.EXE.
 
 Exit status
   0  Terminal exited normally.

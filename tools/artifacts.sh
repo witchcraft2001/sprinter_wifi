@@ -27,11 +27,10 @@ BUILD_APPS=(
   unettest
 )
 
-# libman 1.3 / L1 DLL libraries. Each item maps to src/dll/<name>.asm and
-# build/<UPPERCASE_NAME>.DLL, built with sprinter-mkdll (see tools/build.sh).
-BUILD_DLLS=(
-  unetesp
-)
+# The experimental libman DLL is deliberately not part of the 0.2.1 package.
+# Keep its source in src/dll/ for development, but neither build nor ship it
+# until the DLL release is explicitly enabled again.
+BUILD_DLLS=()
 
 # Applications that are built from source but intentionally omitted from the
 # ZIP package.
@@ -57,7 +56,6 @@ DIST_DOC_FILES=(
   docs/FTP.TXT
   docs/WTERM.TXT
   docs/TELNET.TXT
-  docs/UNETAPI.md
   LICENSE
 )
 

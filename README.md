@@ -3,7 +3,7 @@
 Network utility package for Sprinter DSS and the SprinterESP Wi-Fi card
 (ESP12-F/ESP8266 with ESP-AT firmware).
 
-Package version: 0.1.1
+Package version: 0.2.1
 
 ## Attribution
 
@@ -107,6 +107,18 @@ clients reproduce that local 16550 mode without sending `AT+UART_CUR` again.
 `AT+UART_CUR`.
 
 ## ESP-AT Firmware Baseline
+
+The recommended firmware is ESP8266 ESP-AT `V2.2.2.0`, image
+[`firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin`](firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin).
+It is also available from the
+[Sprinter ESP Network Kit GitHub repository](https://github.com/witchcraft2001/sprinter_wifi/blob/main/firmware/SprinterESP-AT-v2.2.2.0-runtime-flow-fix-full-2MB.bin).
+Use [the flashing guide](firmware/FLASHING.md) to install it.
+
+V2.2.2.0 is the stable, supported baseline for this release. The package still
+has a compatibility path for ESP-AT `V2.2.1`, but upgrading is strongly
+recommended. Reports of corrupt downloads, missing bytes, slow transfers, or
+similar transfer instability on an otherwise correct setup should be treated as
+a V2.2.1 limitation first.
 
 The supported transition profiles are ESP8266 ESP-AT `V2.2.1` and `V2.2.2`.
 The 2.2.1 firmware contains command tokens for the project-critical command
