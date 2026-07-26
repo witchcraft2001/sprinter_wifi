@@ -9,15 +9,40 @@ Purpose
   UNETTEST is a diagnostic tool. It is shipped on the floppy image but not in
   the ZIP package.
 
+  Note: the shipped UNETESP.DLL is built for ESP-AT 2.2.2 only (trigger-8
+  receive, no 2.2.1 fallback). Its library name reads "UNET ESP 2.2.2", and
+  NETINIT fails with status 4 if NETUP brought the link up on 2.2.1 firmware.
+  A UNETRTL.DLL (RTL8019A) would be firmware-independent.
+
 Usage
   UNETTEST [-d FILE.DLL] [host [port]]
 
-  -d FILE.DLL   Load this DLL instead of the default UNETESP.DLL.
+  -d FILE.DLL   Load this DLL instead of the default UNETESP.DLL. The name is
+                used exactly as typed and may include a path
+                (e.g. -d C:\WIFI\UNETESP.DLL).
   host          Host name or IP address to test (default example.com).
   port          TCP port for the connect/send/receive step (default 80).
 
   An unknown flag, or -d without a file name, prints this usage line and
   exits with status 1.
+
+DLL search order
+  Without -d, UNETTEST first looks for UNETESP.DLL in the directory that holds
+  UNETTEST.EXE (via DSS APPINFO), then falls back to the current directory. So
+  it works whether you run it from the install directory or through PATH from
+  elsewhere. With -d the given name/path is used as-is, with no directory
+  search.
+
+  If the DLL cannot be loaded, UNETTEST prints the reason on the line after
+  "Cannot load DLL:", for example:
+    DLL file not found (code 3)         - not in the EXE dir nor current dir
+    out of DSS memory (code 30)         - no free page for the DLL
+    DLL read/seek error (code nn)       - I/O error reading the file
+    not an L0/L1 DLL (bad file format)  - the file is not a libman DLL
+    DLL refused to start (wrong window?)- the DLL's INIT hook rejected the load
+    DSS could not map the DLL page      - SETWIN failed before INIT was called
+  The "code" value is the raw DSS error (3 = file not found, 4 = path not
+  found, 16 = invalid filename, 30 = no free memory).
 
 Examples
   UNETTEST example.com
@@ -31,6 +56,9 @@ Behavior
   resolve (may report "unsupported" on firmware/emulator without CIPDOMAIN),
   ping, TCP connect, an HTTP HEAD request and a short reply read, then close
   and unload. It prints each result so a failing step is easy to spot.
+  Before SETOPT it also verifies ABI 0x0100 and the mandatory TCP capability.
+  If these are invalid, it prints the loaded L1 image sizes plus the relocated
+  GETCAPS bytes and exits instead of jumping farther through a damaged DLL.
 
 Exit status
   0  The full sequence completed.

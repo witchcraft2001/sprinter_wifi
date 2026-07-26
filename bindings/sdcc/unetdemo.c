@@ -10,6 +10,9 @@
 #include <sprinter.h>
 #include "unet.h"
 
+/* Resolved against the current directory (DSS does not search PATH or the
+   EXE's own directory). Run UNETDEMO from the directory that holds the DLL,
+   or change this to a full path such as "C:\\WIFI\\UNETESP.DLL". */
 #define DLL_NAME "UNETESP.DLL"
 #define HOST     "example.com"
 #define PORT     "80"

@@ -65,6 +65,25 @@ is_zip_excluded_app() {
   return 1
 }
 
+is_zip_excluded_dll() {
+  local dll="$1"
+  local excluded
+
+  # Length guard: an empty array expansion is an error under `set -u` on
+  # macOS bash 3.2, so bail out before iterating an empty exclusion list.
+  if [ "${#ZIP_EXCLUDE_DLLS[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  for excluded in "${ZIP_EXCLUDE_DLLS[@]}"; do
+    if [ "$dll" = "$excluded" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 for app in "${BUILD_APPS[@]}"; do
   if is_zip_excluded_app "$app"; then
     continue
@@ -80,6 +99,10 @@ for app in "${BUILD_APPS[@]}"; do
 done
 
 for dll in "${BUILD_DLLS[@]}"; do
+  if is_zip_excluded_dll "$dll"; then
+    continue
+  fi
+
   upper="$(printf '%s' "$dll" | tr '[:lower:]' '[:upper:]')"
   dll_path="$repo_root/build/$upper.DLL"
   if [ -f "$dll_path" ]; then

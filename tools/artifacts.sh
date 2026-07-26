@@ -27,10 +27,12 @@ BUILD_APPS=(
   unettest
 )
 
-# The experimental libman DLL is deliberately not part of the 0.2.1 package.
-# Keep its source in src/dll/ for development, but neither build nor ship it
-# until the DLL release is explicitly enabled again.
-BUILD_DLLS=()
+# The experimental libman DLL. It is built and shipped on the diagnostic
+# floppy image next to UNETTEST.EXE, but kept out of the release ZIP (see
+# ZIP_EXCLUDE_DLLS) while the DLL API is still experimental.
+BUILD_DLLS=(
+  unetesp
+)
 
 # Applications that are built from source but intentionally omitted from the
 # ZIP package.
@@ -38,6 +40,12 @@ ZIP_EXCLUDE_APPS=(
   tcptest
   udptest
   unettest
+)
+
+# DLLs that are built and copied to the floppy image but omitted from the ZIP
+# package (experimental; ship on the diagnostic floppy only).
+ZIP_EXCLUDE_DLLS=(
+  unetesp
 )
 
 # Text/documentation files copied to the distribution root.

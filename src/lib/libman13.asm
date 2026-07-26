@@ -3,10 +3,11 @@
 ;
 ; Source: sources/libman/docs/libman13/LIBMAN13.ASM
 ;   (Module LIBMAN v1.3, last revision 30.04.2004).
-; Faithful port: the loader body is byte-for-byte the original; it is only
-; wrapped in MODULE LIBMAN with an include guard so a consumer utility (e.g.
-; UNETTEST) can embed it without symbol clashes. Original in-line comments are
-; preserved (UTF-8, Russian). Understands both L0 and L1 DLL containers.
+; Derived from the original loader and wrapped in MODULE LIBMAN with an include
+; guard so a consumer utility (e.g. UNETTEST) can embed it without symbol
+; clashes. This copy also contains DSS error diagnostics, Estex-DSS register
+; preservation fixes, and deterministic LDIR page copies. Original in-line
+; comments are preserved (UTF-8, Russian). Understands L0 and L1 containers.
 ;
 ; Public entry points (module-qualified):
 ;   LIBMAN.l_load  HL=filename ASCIIZ, A=window(1/2/3) -> HL=handle, CF=1 err
@@ -30,6 +31,24 @@
 
 true	equ	1
 false	equ	0
+
+; NET: why the last l_load failed. Valid only when l_load returned CF=1.
+; This is a Sprinter-ESP-Kit extension to the upstream libman 1.3 loader so a
+; consumer (UNETTEST) can report the concrete reason instead of a bare error.
+LR_NONE		equ	0
+LR_MEMORY	equ	1	; GETMEM/SETWIN/FREEMEM failed (out of DSS pages)
+LR_OPEN		equ	2	; DSS open failed (file not found in search dir)
+LR_IO		equ	3	; seek/read failed mid-load
+LR_FORMAT	equ	4	; not an L0/L1 container, or file > 64K
+LR_INIT		equ	5	; DLL INIT hook refused (l_dsserr = the DLL's code)
+LR_LIMIT	equ	6	; lib_table full (64 libraries already loaded)
+LR_CALL		equ	7	; libman could not dispatch INIT (l_dsserr = LCERR_*)
+
+LCERR_NONE	equ	0
+LCERR_HANDLE	equ	1	; handle points at a free lib_table entry
+LCERR_WINDOW	equ	2	; lib_table contains an invalid target window
+LCERR_INIT	equ	3	; DLL INIT itself returned CF=1
+LCERR_SETWIN	equ	4	; DSS_SETWIN failed before entering the DLL
 
 
 ; КОД ДОЛЖЕН БЫТЬ В ПРЕДЕЛАХ 4000h..0BFFFh !.
@@ -76,9 +95,15 @@ _L_LOAD:
 	push	de
 	push    af
 	push    hl
+	ld	a,LR_MEMORY		; NET: first stage is the 2-page GETMEM below
+	ld	(l_reason),a
+	xor	a
+	ld	(l_dsserr),a
 	ld	a,true
 	ld	(ll_fr+1),a		; флаг релокации
 	ld	(ll_fc+1),a		; флаг компрессии
+	xor	a			; NET: clear the zero-run decoder flag so a prior
+	ld	(llzero+1),a		; l_load that failed mid-decode can't corrupt this one
 	in      a,(0E2h)
 	ld      (lloldw+1),a		; сохр. начальную Page3
 	; выделить блок в 2 страницы
@@ -92,22 +117,29 @@ _L_LOAD:
 	rst     10h
 	jp      c,llerr1		; ошибка подключения
 	pop     hl
+	ld	a,LR_OPEN		; NET: stage = opening the DLL file (HL=name)
+	ld	(l_reason),a
 	; открыть файл
 	ld      a,1			; на чтение
 	ld      c,11h
 	rst     10h
 	jp      c,llerr2
 	ld      (llhand),a		; дескр. открытой библы
+	ld	a,LR_IO			; NET: from here failures are seek/read I/O
+	ld	(l_reason),a
 	; указатель в конец файла
 	ld      hl,0
 	push	hl
 	pop	ix
+	ld      a,(llhand)		; NET: reload handle - the LR_IO store above
+					; clobbered A, which the original relied on
+					; holding the open handle for this MOVE_FP
 	ld      bc,0215h		; MOVE_FP
 	rst     10h
 	jp      c,llerr0		; ошибка перемещения указателя
 	ld      a,h
 	or      l
-	jp      nz,llerr0		; слишком большой файл
+	jp      nz,llfmt0		; NET: слишком большой файл (LR_FORMAT)
 	push    ix			; размер файла, мл.разряд
 	; вернуть указатель в начало файла
 	ld      hl,0
@@ -138,13 +170,13 @@ _L_LOAD:
 	ld	ix,llbuf		; буфер первых 16-ти байт заголовка
 	ld	a,(ix+0)
 	cp	"L"
-	jp	nz,llerr0		; не знакомый формат библы
+	jp	nz,llfmt0		; NET: не знакомый формат библы (LR_FORMAT)
 	ld	e,true
 	ld	a,(ix+1)
 	cp	"1"
 	jr	z,ll0s
 	cp	"0"
-	jp	nz,llerr0		; не верный формат библы
+	jp	nz,llfmt0		; NET: не верный формат библы (LR_FORMAT)
 	dec	e
 ll0s:	ld	a,e
 	ld	(l1_form+1),a		; true/false  уст. формат библы
@@ -186,26 +218,19 @@ ll0:	ld      c,13h
 loop:	ld      bc,16			; размер "порции"
 	push    de
 	ld      de,llbuf		; исп. буфер первых 16-ти байт заголовка
-	; аксель
-	di
-	ld      d,d			; вкл. аксель на уст. размера блока
-	ld      a,16			; размер буфера
-	ld      b,b			; выкл. аксель
-	ld      l,l			; копир. блока
-	ld      a,(hl)			;
-	ld      (de),a			;
-	ld      b,b			; выкл. аксель
-	ei
-	add     hl,bc
+	; NET: use an ordinary Z80 copy here. The original accelerator sequence is
+	; sensitive to the exact Sprinter accelerator state and can leave a valid
+	; L1 header with a damaged code body. Sixteen-byte LDIR chunks are fast
+	; enough for a <16 KB DLL and deterministic on DSS/emulators/hardware.
+	ldir
 	push    hl
-	push    bc
 	ld      a,(llid)		; дескр. выдел. блока из 2-х страниц
 	ld      bc,013Bh		; подкл. 2-ю страницу блока в 3-е окно
 	rst     10h
-	pop     bc
 	pop     hl
 	pop     de
-	jp      c,llerr0		; ошибка подкл.
+	jp      c,llmem0		; NET: ошибка подкл. страницы (LR_MEMORY)
+	ld      bc,16			; decoder chunk size (DSS may clobber BC)
 	push    hl
 	ld      hl,llbuf		; буфер первых 16-ти байт заголовка
 ll_fc:	ld	a,true			; флаг компрессии
@@ -220,17 +245,9 @@ ll_fc:	ld	a,true			; флаг компрессии
 	jr      nc,ll2
 	; аксель
 ll1z:	di
-	ld      d,d			; вкл. аксель на уст. размера блока
-	ld      a,16			; размер буфера
-	ld      b,b			; выкл. аксель
-	ld      l,l			; копир. блока
-	ld      a,(hl)			;
-	ld      (de),a			;
-	ld      b,b			; выкл. аксель
+	ld      bc,16
+	ldir
 	ei
-	ex      de,hl
-	add     hl,bc			; de+ for simple copy
-	ex      de,hl
 	jr      ll3
 ;-
 ll2:	ld	b,c			; b=16
@@ -305,16 +322,13 @@ ll4a:	ld      (llsize),hl		; размер библы (код)
 	ld      a,(llid)		; дескр. выдел. блока из 2-х страниц
 	ld      bc,003Bh		; подкл. 1-ю страницу в 3-е окно
 	rst     10h
-	; аксель
+	; Clear the 256-byte page-occupancy table without relying on accelerator
+	; pseudo-instructions (see the transfer loop above).
 	ld      hl,0C000h
-	di
-	ld      d,d			; вкл. аксель на уст. размера блока
-	ld      a,0			; блок 256 байт
-	ld      b,b			; выкл. аксель
-	ld      c,c			; заполнение блока
-	ld      (hl),a			;
-	ld      b,b			; выкл. аксель
-	ei
+	ld      de,0C001h
+	ld      bc,255
+	ld      (hl),0
+	ldir
 	ld      hl,lib_table		; 256 байт, таблица библ
 	ld      b,max_count		; 64 макс. число загр. библиотек
 ll5:	ld      a,(hl)
@@ -347,7 +361,7 @@ ll5b:	ld      a,(hl)
 	inc     hl
 	inc     hl
 	djnz	ll5b
-	jp      llerr0			; ошибка
+	jp      lltbl0			; NET: таблица библ заполнена (LR_LIMIT)
 	;
 ll6:	push    hl
 	pop     ix			; адрес в таблице
@@ -365,7 +379,7 @@ ll7a:	inc     hl
 	; выделить блок в 1-ну страницу
 	ld      bc,013Dh
 	rst     10h
-	jp      c,llerr4		; ошибка выделения
+	jp      c,llmem0		; NET: ошибка выделения (LR_MEMORY; was llerr4)
 	ld      l,a
 	ld      d,0
 	ld      a,(llsize+1)		; ст.байт размера библы
@@ -423,16 +437,8 @@ nofix:	ld      de,(llsize)		; длина кода (размер библы)
 	ld      e,0
 ll10:	push    de
 	ld      de,llbuf		; буфер первых 16-ти байт заголовка
-	; аксель
-	di
-	ld      d,d			; вкл. аксель на уст. размера блока
-	ld      a,16			; размер буфера
-	ld      b,b			; выкл. аксель
-	ld      l,l			; копир. блока
-	ld      a,(hl)			;
-	ld      (de),a			;
-	ld      b,b			; выкл. аксель
-	ei
+	ld      bc,16
+	ldir
 	pop     de
 	push    hl
 	push	de
@@ -441,27 +447,14 @@ ll10:	push    de
 	rst     10h
 	pop	de
 	ld      hl,llbuf		; буфер первых 16-ти байт заголовка
-	; аксель
-	di
-	ld      d,d			; вкл. аксель на уст. размера блока
-	ld      a,16			; размер буфера
-	ld      b,b			; выкл. аксель
-	ld      l,l			; копир. блока
-	ld      a,(hl)			;
-	ld      (de),a			;
-	ld      b,b			; выкл. аксель
-	ei
+	ld      bc,16
+	ldir
 	push	de
 	ld      a,(llid)		; дескр. выдел. блока из 2-х страниц
 	ld      bc,013Bh		; подкл. 2-ю страницу в 3-е окно
 	rst     10h
 	pop	de
 	pop     hl
-	ld      bc,16			; размер буфера
-	add     hl,bc
-	ex      de,hl
-	add     hl,bc
-	ex      de,hl
 	ld      a,(ix+3)
 	or      0C0h
 	cp      d
@@ -473,7 +466,7 @@ ll10:	push    de
 	ld      a,(llid)		; дескр. выдел. блока из 2-х страниц
 	ld      c,3Eh			; освободить блок памяти
 	rst     10h
-	jr      c,llerr5		; ошибка освобождения
+	jp      c,llmem0		; NET: ошибка освобождения (LR_MEMORY; was llerr5)
 	pop     hl
 	ld      bc,lib_table		; 256 байт таблица библ
 	sbc     hl,bc
@@ -498,24 +491,68 @@ lloldw:	ld      a,-1			; сохр. начальная Page3
 	pop	iy
 	pop	ix
 	ret	nc
+	push	af			; INIT/dispatcher refused: preserve returned A/CF
+	ld	a,(l_call_error)
+	cp	LCERR_INIT
+	jr	z,.init_refused
+	cp	LCERR_SETWIN
+	jr	z,.call_setwin
+	ld	(l_dsserr),a		; NET: internal l_call stage, not DLL's A
+	ld	a,LR_CALL
+	ld	(l_reason),a
+	jr	.release_failed
+.call_setwin
+	ld	a,(l_call_dsserr)
+	ld	(l_dsserr),a		; raw DSS_SETWIN error
+	ld	a,LR_CALL
+	ld	(l_reason),a
+	jr	.release_failed
+.init_refused
+	pop	af
 	push	af
+	ld	(l_dsserr),a		; NET: record the DLL INIT refusal code
+	ld	a,LR_INIT
+	ld	(l_reason),a
+.release_failed
 	call	l_free			; выгрузить библу
 	pop	af
 	ret
 	;
-llerr5:	ld      a,(llhand)		; дескр. библы
-	ld      c,12h			; закрыть файл
-	rst     10h
-	jr	llerr3
+	; NET: failure-reason ladder. Each entry records LIBMAN.l_reason (stage)
+	; and LIBMAN.l_dsserr (the raw DSS/INIT code) so a consumer can report WHY
+	; the load failed, then returns the original contract (CF=1, A=-1).
+	; The upstream llerr4 (`pop hl` -> one pop too many) and llerr5 (no pop)
+	; unwinds were stack-unbalanced and jumped through garbage on rare DSS
+	; failures; their sites now enter via llmem0 -> llerr0c, which closes the
+	; file and pops exactly the four saved register words.
+llfmt0:	ld	a,LR_FORMAT		; NET: not an L0/L1 container / file > 64K
+	ld	(l_reason),a
+	xor	a
+	ld	(l_dsserr),a		; no DSS code - the bytes were wrong
+	jr	llerr0c
 	;
-llerr4:	pop	hl
-llerr0:	ld      a,(llhand)		; дескр. библы
+lltbl0:	ld	a,LR_LIMIT		; NET: lib_table full (64 libraries)
+	ld	(l_reason),a
+	xor	a
+	ld	(l_dsserr),a		; A is not an error code here
+	jr	llerr0c
+	;
+llmem0:	ld	(l_dsserr),a		; NET: DSS error from GETMEM/SETWIN/FREEMEM
+	ld	a,LR_MEMORY
+	ld	(l_reason),a
+	jr	llerr0c
+	;
+llerr0:	ld	(l_dsserr),a		; NET: DSS error from seek/read (A still live)
+llerr0c:
+	ld      a,(llhand)		; дескр. библы
 	ld      c,12h			; закрыть файл
 	rst     10h
-	jr      llerr2
+	jr      llerr2c			; NET: keep the recorded error (skip re-store)
 	;
 llerr1:	pop     hl
-llerr2:	pop     af
+llerr2:	ld	(l_dsserr),a		; NET: DSS error from alloc/open (A still live)
+llerr2c:
+	pop     af
 	pop	de
 	pop	iy
 	pop	ix
@@ -527,6 +564,8 @@ llbuf:	ds	16			; буфер первых 16-ти байт заголовка
 llsize:	dw	0			; размер библы
 llid:	db	0			; дескр. выдел. блока из 2-х страниц
 llhand:	db	0			; дескр. открытой библы
+l_reason:	db	0		; NET: LR_* stage of the last failed l_load
+l_dsserr:	db	0		; NET: raw DSS/INIT code at that failure
 
 
 
@@ -645,6 +684,8 @@ _L_CALL:
 	push    af
 	xor	a
 	ld	(lcflag),a
+	ld	(l_call_error),a
+	ld	(l_call_dsserr),a
 	ld	a,b			; номер функции
 	ld	(lc_fun),a
 	ld      a,l			; дескр. библы
@@ -681,8 +722,32 @@ lc2:	cp      0C0h
 	in      a,(0E2h)
 lc3:	ld      (lc4_+1),a
 	pop     af			; дескр. блока памяти (из +1)
-	ld      bc,0038h		; подкл. окно
+	; IX/IY are public DLL argument registers. Estex-DSS/BIOS does not promise
+	; to preserve them while SETWIN resolves the physical page, so keep the
+	; caller's values until immediately before entering the export function.
+	push	ix
+	push	iy
+	; Do not use generic DSS_SETWIN (#38) here. Current Estex-DSS derives the
+	; slot port with OR %100'0010 (0x42 instead of 0x82), so WIN1 is written
+	; through port 0x62 instead of SLOT1/0xA2. l_call already knows the target
+	; window from H; select the explicit, working API entry point.
+	ld      b,0			; first page of the allocated DLL block
+	bit     7,h
+	jr      z,lc_map_win1
+	bit     6,h
+	jr      z,lc_map_win2
+	ld      c,3Bh			; DSS_SETWIN3
+	jr      lc_map
+lc_map_win1:
+	ld      c,39h			; DSS_SETWIN1
+	jr      lc_map
+lc_map_win2:
+	ld      c,3Ah			; DSS_SETWIN2
+lc_map:
 	rst     10h
+	jr	c,lc_setwin_error	; Estex-DSS defines CF=1 as a real mapping error
+	pop	iy
+	pop	ix
 	pop     af
 	pop     bc
 	pop     de
@@ -705,6 +770,8 @@ lc_:	pop     hl			; восст. вход. дескриптор (и баланс 
 	ld	a,(lc_fun)
 	or	a			; тест на 0-ю функцию
 	jr	nz,lc4_
+	ld	a,LCERR_INIT
+	ld	(l_call_error),a
 	dec	a			; a=0FFh
 	ld	(lcflag),a
 lc4_:	ld      a,-1
@@ -731,8 +798,21 @@ lc3_:	ld	a,(lcflag)
 	ld	a,c			; восст."a"
 	ret
 	;
-lc_er3:	pop     af
-lc_er2:	pop     af
+lc_er3:ld	a,LCERR_WINDOW
+	ld	(l_call_error),a
+	pop     af			; discard saved block descriptor
+	jr	lc_er2_unwind
+lc_setwin_error:
+	ld	(l_call_dsserr),a	; preserve DSS error before restoring caller AF
+	pop	iy			; discard SETWIN-protected public arguments
+	pop	ix
+	ld	a,LCERR_SETWIN
+	ld	(l_call_error),a
+	jr	lc_er2_unwind
+lc_er2:ld	a,LCERR_HANDLE
+	ld	(l_call_error),a
+lc_er2_unwind:
+	pop     af
 	pop     bc
 	pop     de
 lc_er1:	pop     hl
@@ -744,6 +824,10 @@ lcstart:dw	0
 lcoldp:	db	0
 lc_fun:	db	0
 lcflag:	db	0
+l_call_error:
+	db	0
+l_call_dsserr:
+	db	0
 
 
 
@@ -764,8 +848,8 @@ _L_INFO:
 	push    de
 	push    bc
 	ld      a,l
-	rla
-	rla
+	add	a,a			; handle * 4; do not depend on caller CF
+	add	a,a
 	ld	l,a
 	ld      bc,lib_table		; 256 байт таблица библ
 	add     hl,bc
@@ -782,16 +866,24 @@ _L_INFO:
 	ld      l,0
 	in      a,(0E2h)
 	ld      (lioldw+1),a
-	push	de
+	push	hl			; Estex-DSS SETWIN clobbers HL while deriving SLOT
+	push	de			; and does not promise to preserve DE either
 	ld      a,b			; дескр. страницы библы
 	ld      bc,003Bh		; подкл. в 3-е окно
 	rst     10h
 	pop	de
+	pop	hl
+	jr	c,li_map_error
 	ld      bc,32			; длина info
 	ldir
 lioldw:	ld	a,-1			; восст. порт
 	out	(0E2h),a
 	xor	a
+	jr	li_er
+li_map_error:
+	ld	a,(lioldw+1)		; restore WIN3 without destroying the failure path
+	out	(0E2h),a
+	scf
 li_er:	pop	bc
 	pop	de
 	pop	hl

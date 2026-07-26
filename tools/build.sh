@@ -88,26 +88,21 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       fi
 
       case "$dll" in
-        unetesp) dll_name="UNET ESP" ;;
+        unetesp) dll_name="UNET ESP 2.2.2" ;;
         unetrtl) dll_name="UNET RTL" ;;
         *)       dll_name="$upper" ;;
       esac
 
-      # sprinter-mkdll owns the sjasmplus command line. Give it a custom
-      # template for forced builds so DLL consumers get the same one-profile
-      # receive algorithm as the EXE utilities.
+      # The UNET DLL pins its own firmware profile in-source (unetesp.asm
+      # DEFINEs ESP_AT_FORCE_222 + WIFI_STABLE_ACTIVE_RX for a 2.2.2-only,
+      # trigger-8 build). Do NOT forward the EXE ESP_AT_PROFILE flag to the
+      # DLL: a -DESP_AT_FORCE_221 would collide with the in-source 2.2.2 pin.
       dll_assembler=(--assembler sjasmplus)
-      if [ "${#asm_profile[@]}" -gt 0 ]; then
-        dll_assembler=(
-          --assembler-command
-          "sjasmplus ${asm_profile[0]} --raw={output} -I $repo_root/src/include -I $repo_root/src/lib {source}"
-        )
-      fi
 
       "${mkdll_cmd[@]}" build "$src" \
         --format l1 --target 1.3 "${dll_assembler[@]}" \
         -I "$repo_root/src/include" -I "$repo_root/src/lib" \
-        --name "$dll_name" --version "$dll_version" -o "$out"
+        --name "$dll_name" --version "$dll_version" --no-compress -o "$out"
       "${mkdll_cmd[@]}" verify "$out" --target 1.3
       echo "Built $out"
     done

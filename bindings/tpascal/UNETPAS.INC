@@ -141,7 +141,11 @@ begin
   UNetErr := LibRegA
 end;
 
-{ Load a UNET DLL into window 1 or 2. Returns true on success. }
+{ Load a UNET DLL into window 1 or 2. Returns true on success.
+  NOTE: `name` is resolved against the DSS current directory (libman/DSS do
+  not search PATH or the program's own directory). Run the program from the
+  directory that holds the DLL, or pass a full path such as
+  'C:\WIFI\UNETESP.DLL'. }
 function UNetLoad(name : DssStr; win : integer) : boolean;
 begin
   UNetLoad := false;

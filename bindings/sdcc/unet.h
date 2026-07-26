@@ -92,6 +92,7 @@
 #define UNET_LOAD_EFORMAT   -3   /* bad header / not an L1 DLL */
 #define UNET_LOAD_ETOOBIG   -4   /* relocation bitmap larger than 1 KB */
 #define UNET_LOAD_EINIT     -5   /* DLL INIT hook refused (e.g. wrong window) */
+#define UNET_LOAD_EWINDOW   -6   /* window argument was not 1 or 2 */
 
 /*
  * Load a UNET DLL into the given window (1 = 0x4000 or 2 = 0x8000; never 3).

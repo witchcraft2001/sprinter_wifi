@@ -13,6 +13,12 @@ Common rule for every consumer: **the DLL must own a full 16 KB window, and
 never window 3** (the ESP UART is mapped there during calls). Load buffers you
 pass to the DLL must live below `0xC000` and outside the DLL's window.
 
+DLL name resolution: libman opens the DLL by name through DSS, which searches
+only the **current directory** - not `PATH`, not the program's own directory.
+Run a consumer from the directory that holds the DLL, or pass a full path.
+`UNETTEST.EXE` additionally tries its own EXE directory first (via DSS
+`APPINFO`); the C and Pascal demos do not, so run them from the DLL's folder.
+
 ## asm
 
 No binding needed - include the libman loader and call the numbered functions

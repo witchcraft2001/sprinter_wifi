@@ -1,4 +1,4 @@
-.PHONY: build package image test test-netup-busy test-uart-profiles clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles clean
 
 build:
 	tools/build.sh
@@ -9,8 +9,11 @@ package:
 image:
 	tools/image.sh
 
-test: test-netup-busy test-uart-profiles
+test: test-libman test-netup-busy test-uart-profiles
 	tools/test-zmodem.sh
+
+test-libman:
+	tools/test-libman.sh
 
 test-netup-busy:
 	tools/test-netup-busy.sh

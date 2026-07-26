@@ -54,23 +54,32 @@ START
 
 	CALL	PARSE_ARGS
 
-	; --- load the DLL into window 1 ---
-	LD	HL,MSG_LOADING
-	CALL	PUTS
-	LD	HL,DLL_NAME
-	CALL	PUTS_LN
-
-	LD	HL,DLL_NAME
+	; --- resolve + load the DLL into window 1 ---
+	CALL	RESOLVE_DLL_PATH		; HL -> first candidate
+	CALL	SAY_LOADING			; "Loading <HL>" (preserves HL)
 	LD	A,1				; window 1
 	CALL	LIBMAN.l_load
+	JR	NC,.LOADED
+	; EXE-dir candidate could not be OPENED? Retry the bare name in cwd.
+	LD	A,(USED_EXEDIR)
+	OR	A
+	JP	Z,ERR_LOAD			; bare name already tried
+	LD	A,(LIBMAN.l_reason)
+	CP	LIBMAN.LR_OPEN
+	JP	NZ,ERR_LOAD			; real load error - report it as-is
+	LD	HL,DLL_NAME
+	CALL	SAY_LOADING
+	LD	A,1
+	CALL	LIBMAN.l_load
 	JP	C,ERR_LOAD
+.LOADED
 	LD	(HANDLE),HL
 
 	; --- l_info: print name + version ---
 	LD	HL,(HANDLE)
 	LD	DE,INFO_BUF
 	CALL	LIBMAN.l_info
-	JP	C,ERR_LOAD
+	JP	C,ERR_INFO
 	LD	HL,MSG_DLL
 	CALL	PUTS
 	LD	HL,INFO_BUF + 16		; header name field
@@ -85,15 +94,41 @@ START
 	CALL	PUT_DEC_A
 	CALL	CRLF
 
+	; Take a read-only snapshot of the relocated image before the first public
+	; call.  Apart from making loader failures diagnosable on real DSS, this
+	; avoids blindly jumping through a damaged export table.
+	CALL	SNAPSHOT_DLL
+	JP	C,ERR_SNAPSHOT
+
 	; --- GETCAPS ---
 	LD	B,UNET_FN_GETCAPS
 	CALL	DO_CALL				; -> DE=caps, IX=abi
 	LD	(CAPS),DE
+	PUSH	IX
+	POP	HL
+	LD	(ABI_VERSION),HL
 	LD	HL,MSG_CAPS
 	CALL	PUTS
 	LD	DE,(CAPS)
 	CALL	PUT_HEX16
 	CALL	CRLF
+	LD	HL,MSG_ABI
+	CALL	PUTS
+	LD	DE,(ABI_VERSION)
+	CALL	PUT_HEX16
+	CALL	CRLF
+
+	; ABI 1.x requires TCP support.  A different ABI or a capability mask
+	; without TCP means GETCAPS did not execute the loaded UNET entry point.
+	; Stop here: calling SETOPT through the same damaged table can hang DSS.
+	LD	HL,(ABI_VERSION)
+	LD	DE,UNET_ABI_VERSION
+	OR	A
+	SBC	HL,DE
+	JP	NZ,ERR_BAD_IMAGE
+	LD	A,(CAPS)
+	AND	UNET_CAP_TCP
+	JP	Z,ERR_BAD_IMAGE
 
 	; --- SETOPT CANCELKEYS=1 (allow Esc/Ctrl+Z to abort blocking calls) ---
 	LD	A,UNET_OPT_CANCELKEYS
@@ -119,19 +154,32 @@ START
 	CALL	PUTS_LN
 
 	; --- GETINFO: station IP ---
+	XOR	A
+	LD	(STR_BUF),A			; never print stale DSS RAM on an API error
 	LD	A,UNET_IF_IP
 	LD	DE,STR_BUF
 	LD	IX,STR_BUF_SIZE
 	LD	B,UNET_FN_GETINFO
 	CALL	DO_CALL
+	LD	(API_STATUS),A
 	LD	HL,MSG_IP
 	CALL	PUTS
+	LD	A,(API_STATUS)
+	OR	A
+	JR	NZ,.ip_failed
 	LD	HL,STR_BUF
 	CALL	PUTS_LN
+	JR	.after_ip
+.ip_failed
+	LD	HL,MSG_FAILED
+	CALL	PUTS_LN
+.after_ip
 
 	; --- RESOLVE host (optional; degrades to unsupported) ---
 	LD	HL,MSG_RESOLVE
 	CALL	PUTS
+	XOR	A
+	LD	(STR_BUF),A
 	LD	DE,HOST_BUFF
 	LD	IX,STR_BUF
 	LD	B,UNET_FN_RESOLVE
@@ -262,11 +310,96 @@ START
 ; ======================================================
 ; Error exits
 ; ======================================================
+; DLL load failed: print WHY from LIBMAN.l_reason / LIBMAN.l_dsserr, exit 2.
 ERR_LOAD
 	LD	HL,MSG_ERR_LOAD
 	CALL	PUTS_LN
+	LD	A,(LIBMAN.l_reason)
+	CP	LIBMAN.LR_OPEN
+	JR	Z,.OPEN
+	CP	LIBMAN.LR_FORMAT
+	JR	Z,.FMT
+	CP	LIBMAN.LR_INIT
+	JR	Z,.INIT
+	CP	LIBMAN.LR_MEMORY
+	JR	Z,.MEM
+	CP	LIBMAN.LR_LIMIT
+	JR	Z,.LIMIT
+	CP	LIBMAN.LR_CALL
+	JR	Z,.CALL
+	LD	HL,MSG_LOAD_IO			; LR_IO or anything unexpected
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.CALL
+	LD	A,(LIBMAN.l_call_error)
+	CP	LIBMAN.LCERR_HANDLE
+	JR	Z,.CALL_HANDLE
+	CP	LIBMAN.LCERR_WINDOW
+	JR	Z,.CALL_WINDOW
+	CP	LIBMAN.LCERR_SETWIN
+	JR	Z,.CALL_SETWIN
+	LD	HL,MSG_LOAD_CALL
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.CALL_HANDLE
+	LD	HL,MSG_LOAD_CALL_HANDLE
+	CALL	PUTS_LN
+	JR	.OUT
+.CALL_WINDOW
+	LD	HL,MSG_LOAD_CALL_WINDOW
+	CALL	PUTS_LN
+	JR	.OUT
+.CALL_SETWIN
+	LD	HL,MSG_LOAD_CALL_SETWIN
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.LIMIT
+	LD	HL,MSG_LOAD_LIMIT		; lib_table full - no DSS code to show
+	CALL	PUTS_LN
+	JR	.OUT
+.OPEN
+	LD	HL,MSG_LOAD_OPEN
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	LD	HL,MSG_LOAD_HINT
+	CALL	PUTS_LN
+	JR	.OUT
+.MEM
+	LD	HL,MSG_LOAD_MEM
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.FMT
+	LD	HL,MSG_LOAD_FMT
+	CALL	PUTS_LN
+	JR	.OUT
+.INIT
+	LD	HL,MSG_LOAD_INIT
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+.OUT
 	LD	B,2
 	JP	EXIT
+
+; l_info failed after a successful load (bad handle): its own message, exit 2.
+ERR_INFO
+	LD	HL,MSG_ERR_INFO
+	CALL	PUTS_LN
+	LD	B,2
+	JP	EXIT
+
+; Print " (code <n>)" + CRLF from LIBMAN.l_dsserr.
+PRINT_LOAD_CODE
+	LD	HL,MSG_LOAD_CODE
+	CALL	PUTS
+	LD	A,(LIBMAN.l_dsserr)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	JP	CRLF
 ERR_NETINIT
 	; map A (NERR_*) to an exit code and message
 	CP	NERR_NONET
@@ -322,11 +455,19 @@ FREE_AND_DONE
 DUMP_LASTERR
 	LD	HL,MSG_LASTERR
 	CALL	PUTS
+	XOR	A
+	LD	(STR_BUF),A
 	LD	DE,STR_BUF
 	LD	IX,STR_BUF_SIZE
 	LD	B,UNET_FN_LASTERR
 	CALL	DO_CALL
+	OR	A
+	JR	NZ,.failed
 	LD	HL,STR_BUF
+	CALL	PUTS_LN
+	RET
+.failed
+	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 	RET
 
@@ -340,7 +481,122 @@ EXIT
 DO_CALL
 	LD	HL,(HANDLE)
 	CALL	LIBMAN.l_call
+	RET	NC
+	LD	HL,MSG_ERR_CALL
+	CALL	PUTS
+	LD	A,(LIBMAN.l_call_error)
+	CALL	PUT_DEC_A
+	LD	HL,MSG_LOAD_CODE
+	CALL	PUTS
+	LD	A,(LIBMAN.l_call_dsserr)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+; ======================================================
+; Snapshot the first 256 bytes of the relocated DLL image.
+; This deliberately mirrors l_info's page lookup but copies enough bytes to
+; include the export table and UNETESP's GETCAPS body.  Estex-DSS SETWIN3
+; clobbers HL, so the source address is saved across RST #10.
+; Out: CF=0 copied, CF=1 invalid handle or DSS_SETWIN3 failure.
+; ======================================================
+SNAPSHOT_DLL
+	XOR	A
+	LD	(SNAPSHOT_DSS_ERROR),A
+	LD	HL,(HANDLE)
+	LD	A,L
+	ADD	A,A
+	ADD	A,A
+	LD	L,A
+	LD	H,0
+	LD	DE,LIBMAN.lib_table
+	ADD	HL,DE
+	LD	A,(HL)
+	OR	A
+	SCF
+	RET	Z
+	INC	HL
+	LD	B,(HL)				; DSS memory-block descriptor
+	INC	HL
+	LD	A,(HL)				; logical image-base high byte
+	LD	(DLL_BASE_H),A
+	OR	0xC0
+	LD	H,A
+	LD	L,0
+	IN	A,(0xE2)
+	LD	(SNAPSHOT_OLD_WIN),A
+	PUSH	HL
+	LD	A,B
+	LD	BC,0x003B			; DSS_SETWIN3, page 0
+	RST	DSS
+	POP	HL
+	JR	C,.map_error
+	LD	DE,DLL_PROBE
+	LD	BC,DLL_PROBE_SIZE
+	LDIR
+	LD	A,(SNAPSHOT_OLD_WIN)
+	OUT	(0xE2),A
+	OR	A
 	RET
+.map_error
+	LD	(SNAPSHOT_DSS_ERROR),A
+	LD	A,(SNAPSHOT_OLD_WIN)
+	OUT	(0xE2),A
+	SCF
+	RET
+
+ERR_SNAPSHOT
+	LD	HL,MSG_ERR_SNAPSHOT
+	CALL	PUTS
+	LD	A,(SNAPSHOT_DSS_ERROR)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+ERR_BAD_IMAGE
+	LD	HL,MSG_ERR_BAD_IMAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_IMAGE_SIZE
+	CALL	PUTS
+	LD	DE,(INFO_BUF + 2)
+	CALL	PUT_HEX16
+	LD	HL,MSG_CODE_SIZE
+	CALL	PUTS
+	LD	DE,(INFO_BUF + 4)
+	CALL	PUT_HEX16
+	CALL	CRLF
+	LD	HL,MSG_ENTRY2
+	CALL	PUTS
+	LD	HL,DLL_PROBE + 0x26
+	LD	B,3
+	CALL	PRINT_HEX_BYTES
+	CALL	CRLF
+	LD	HL,MSG_GETCAPS_CODE
+	CALL	PUTS
+	LD	HL,DLL_PROBE + 0x81
+	LD	B,9
+	CALL	PRINT_HEX_BYTES
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+; Print B bytes from HL as two hex digits separated by spaces.
+PRINT_HEX_BYTES
+	LD	A,(HL)
+	CALL	PUT_HEX8
+	INC	HL
+	DJNZ	.more
+	RET
+.more
+	LD	A,' '
+	CALL	PUT_CHAR
+	JR	PRINT_HEX_BYTES
 
 ; ======================================================
 ; Build "HEAD / HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n"
@@ -386,6 +642,8 @@ PARSE_ARGS
 	LD	HL,DEF_PORT
 	LD	DE,PORT_BUFF
 	CALL	STRCPY
+	XOR	A
+	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
@@ -407,6 +665,8 @@ PARSE_ARGS
 	LD	C,DLL_NAME_SIZE
 	CALL	NEXT_TOKEN
 	JP	C,USAGE_EXIT			; -d without a file name
+	LD	A,1
+	LD	(DLL_ARG_FLAG),A		; use DLL_NAME verbatim (may hold a path)
 	; host = next token
 	LD	DE,HOST_BUFF
 	LD	C,HOST_BUFF_SIZE
@@ -424,6 +684,73 @@ PARSE_ARGS
 	LD	DE,PORT_BUFF
 	LD	C,PORT_BUFF_SIZE
 	CALL	NEXT_TOKEN			; optional; ignore CF
+	RET
+
+; ======================================================
+; Choose the file name passed to LIBMAN.l_load.
+;   -d given : the user's string verbatim (may carry its own path).
+;   default  : "<exe_home>\UNETESP.DLL" via DSS APPINFO; on any APPINFO
+;              problem fall back to the bare name (then cwd IS the EXE dir,
+;              same tolerance NETUP applies to NET.CFG).
+; Out: HL -> ASCIIZ candidate; (USED_EXEDIR)=1 when HL = DLL_PATH.
+; ======================================================
+RESOLVE_DLL_PATH
+	XOR	A
+	LD	(USED_EXEDIR),A
+	LD	A,(DLL_ARG_FLAG)
+	OR	A
+	JR	NZ,.BARE			; -d: use DLL_NAME as typed
+	LD	HL,DLL_PATH
+	LD	B,APPINFO_EXE_HOMEDIR
+	LD	C,DSS_APPINFO
+	RST	DSS
+	JR	C,.BARE				; APPINFO unsupported -> cwd
+	LD	HL,DLL_PATH
+	LD	BC,DLL_PATH_SIZE - DLL_DEF_RESERVE
+.FIND_END
+	LD	A,(HL)
+	OR	A
+	JR	Z,.HAVE_END
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.FIND_END
+	JR	.BARE				; overlong/malformed result
+.HAVE_END
+	LD	A,(DLL_PATH)
+	OR	A
+	JR	Z,.BARE				; empty result
+	DEC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	92				; '\'
+	JR	Z,.APPEND
+	CP	'/'
+	JR	Z,.APPEND
+	LD	(HL),92				; add path separator
+	INC	HL
+.APPEND
+	EX	DE,HL				; DE -> append point
+	LD	HL,DLL_NAME			; default name placed there by PARSE_ARGS
+	CALL	STRCPY
+	LD	A,1
+	LD	(USED_EXEDIR),A
+	LD	HL,DLL_PATH
+	RET
+.BARE
+	LD	HL,DLL_NAME
+	RET
+
+; Print "Loading <HL>" + CRLF, preserving HL.
+SAY_LOADING
+	PUSH	HL
+	LD	HL,MSG_LOADING
+	CALL	PUTS
+	POP	HL
+	PUSH	HL
+	CALL	PUTS_LN
+	POP	HL
 	RET
 
 ; Copy next whitespace-delimited token from the parse state to (DE),
@@ -647,6 +974,7 @@ MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
 MSG_CAPS	DB "caps=0x",0
+MSG_ABI		DB "abi=0x",0
 MSG_NETSTAT	DB "net: ",0
 MSG_CFG		DB "cfg=",0
 MSG_INIT	DB " init=",0
@@ -664,7 +992,27 @@ MSG_DONE	DB "done.",0
 MSG_FAILED	DB "failed",0
 MSG_RECV_ERR	DB "receive error",0
 MSG_LASTERR	DB "lasterr: ",0
-MSG_ERR_LOAD	DB "Cannot load DLL (check name/window).",0
+MSG_ERR_LOAD	DB "Cannot load DLL:",0
+MSG_LOAD_OPEN	DB "DLL file not found",0
+MSG_LOAD_HINT	DB "Put the DLL next to UNETTEST.EXE or use -d DIR",92,"FILE.DLL",0
+MSG_LOAD_MEM	DB "out of DSS memory",0
+MSG_LOAD_IO	DB "DLL read/seek error",0
+MSG_LOAD_FMT	DB "not an L0/L1 DLL (bad file format)",0
+MSG_LOAD_INIT	DB "DLL refused to start (wrong window?)",0
+MSG_LOAD_LIMIT	DB "too many DLLs loaded (64 max)",0
+MSG_LOAD_CALL	DB "LibMan INIT dispatch failed",0
+MSG_LOAD_CALL_HANDLE	DB "LibMan lost the loaded DLL table entry.",0
+MSG_LOAD_CALL_WINDOW	DB "LibMan produced an invalid DLL window descriptor.",0
+MSG_LOAD_CALL_SETWIN	DB "DSS could not map the DLL page",0
+MSG_ERR_INFO	DB "DLL loaded but info query failed.",0
+MSG_ERR_CALL	DB "LibMan call failed at stage ",0
+MSG_ERR_SNAPSHOT	DB "Cannot inspect loaded DLL (DSS code ",0
+MSG_ERR_BAD_IMAGE	DB "Invalid DLL ABI/capabilities; stopping before SETOPT.",0
+MSG_IMAGE_SIZE	DB "image=0x",0
+MSG_CODE_SIZE	DB " code=0x",0
+MSG_ENTRY2	DB "entry2: ",0
+MSG_GETCAPS_CODE	DB "getcaps@+81: ",0
+MSG_LOAD_CODE	DB " (code ",0
 MSG_ERR_NETINIT	DB "NETINIT failed.",0
 MSG_ERR_NONET	DB "Network not configured - run NETUP first.",0
 MSG_ERR_HW	DB "Network hardware not found.",0
@@ -696,29 +1044,41 @@ RECV_BUF_SIZE	EQU 512
 STR_BUF_SIZE	EQU 96
 REQ_BUF_SIZE	EQU 160
 TOKEN_BUF_SIZE	EQU 64
-DLL_NAME_SIZE	EQU 24
+DLL_NAME_SIZE	EQU 128			; -d value may carry a directory path
+DLL_PATH_SIZE	EQU 272			; APPINFO dir (<=256) + '\' + name + NUL
+DLL_DEF_RESERVE	EQU 16			; '\' + "UNETESP.DLL" + NUL headroom
 HOST_BUFF_SIZE	EQU 64
 PORT_BUFF_SIZE	EQU 16
 
 BSS_BASE	EQU $
 HANDLE		EQU BSS_BASE
 CAPS		EQU HANDLE + 2
-TMP16		EQU CAPS + 2
+ABI_VERSION	EQU CAPS + 2
+API_STATUS	EQU ABI_VERSION + 2
+TMP16		EQU API_STATUS + 1
 REQ_LEN		EQU TMP16 + 2
 RECV_LEFT	EQU REQ_LEN + 2
 CMDLINE_PTR	EQU RECV_LEFT + 1
 PARSE_PTR	EQU CMDLINE_PTR + 2
 PARSE_LEFT	EQU PARSE_PTR + 2
-DEC_BUF		EQU PARSE_LEFT + 1
+DLL_ARG_FLAG	EQU PARSE_LEFT + 1	; 1 = -d given, use DLL_NAME verbatim
+USED_EXEDIR	EQU DLL_ARG_FLAG + 1	; 1 = first candidate was DLL_PATH
+DEC_BUF		EQU USED_EXEDIR + 1
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
-HOST_BUFF	EQU DLL_NAME + DLL_NAME_SIZE
+DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
+HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
 TOKEN_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
-BSS_END		EQU RECV_BUF + RECV_BUF_SIZE
+DLL_BASE_H	EQU RECV_BUF + RECV_BUF_SIZE
+SNAPSHOT_OLD_WIN	EQU DLL_BASE_H + 1
+SNAPSHOT_DSS_ERROR	EQU SNAPSHOT_OLD_WIN + 1
+DLL_PROBE	EQU SNAPSHOT_DSS_ERROR + 1
+DLL_PROBE_SIZE	EQU 256
+BSS_END		EQU DLL_PROBE + DLL_PROBE_SIZE
 
 STACK_BOTTOM	EQU BSS_END
 STACK_TOP	EQU STACK_BOTTOM + 0x600

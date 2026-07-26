@@ -4,7 +4,11 @@ UNET is a backend-agnostic network interface delivered as a libman 1.3 / L1
 DLL. One contract, two interchangeable backends:
 
 - **UNETESP.DLL** - Sprinter-WiFi (ESP8266 running ESP-AT firmware). Shipped
-  and implemented in this package.
+  and implemented in this package. **Firmware: ESP-AT 2.2.2 only.** The DLL is
+  built for the 2.2.2 command set with the field-proven trigger-8 receive path;
+  it does not contain a 2.2.1 fallback. `NETINIT` returns `NERR_NONET` if the
+  active NETUP session is not `NET_ESP_FW=2.2.2`, and its L1 header name reads
+  `UNET ESP 2.2.2` (shown by UNETTEST). Run NETUP with 2.2.2 firmware first.
 - **UNETRTL.DLL** - RTL8019A Ethernet card. Same function numbers and error
   codes; implemented separately in the sprinter-rtl8019a project (see the RTL
   appendix below).
@@ -40,10 +44,46 @@ resident service. The consumer embeds it (asm: `libman13.asm`; Pascal:
     call l_free
 ```
 
+**DLL name resolution.** `l_load` opens the file through the DSS file API,
+which resolves the name against the **current directory** only - it does not
+search `PATH` or the consumer's own program directory. A consumer launched
+through `PATH` from an unrelated directory will therefore fail to find a DLL
+that sits next to its EXE. Two ways to be robust:
+
+- Resolve the DLL beside your EXE first: call DSS `APPINFO`
+  (`B = APPINFO_EXE_HOMEDIR`, `C = DSS_APPINFO`) to get your EXE's directory,
+  append the DLL name, and pass that full path to `l_load`; fall back to the
+  bare name if `APPINFO` is unavailable. `UNETTEST` does exactly this
+  (`RESOLVE_DLL_PATH` in `src/apps/unettest.asm`, mirroring `NETUP`'s NET.CFG
+  lookup).
+- Or simply run the consumer from the directory that holds the DLL, or pass a
+  full path.
+
+**Failure diagnostics (vendored libman extension).** After `l_load` returns
+`CF=1`, the Sprinter-ESP-Kit copy of libman publishes two bytes so a consumer
+can report *why* the load failed (these are not in stock libman 1.3, and are
+valid only when `l_load` returned an error):
+
+- `LIBMAN.l_reason` - the failing stage: `LR_MEMORY`, `LR_OPEN`, `LR_IO`,
+  `LR_FORMAT`, `LR_INIT`, `LR_LIMIT`, `LR_CALL`.
+- `LIBMAN.l_dsserr` - the raw DSS error code at that stage (e.g. 3 = file not
+  found, 4 = path not found, 30 = no free memory), or the DLL's INIT refusal
+  code for `LR_INIT`. `LR_CALL` distinguishes a malformed internal table/window
+  from a DSS `SETWIN` failure instead of misreporting either as an INIT refusal.
+
+The vendored dispatcher intentionally maps calls through the explicit DSS
+`SETWIN1`/`SETWIN2`/`SETWIN3` functions, not generic `SETWIN` (`0x38`).
+Current Estex-DSS computes the generic function's slot port with `0x42` where
+`0x82` is required, so it can report success without mapping the DLL into the
+requested window. The explicit functions use the proper `SLOT1`/`SLOT2`/
+`SLOT3` constants and work on both old and current DSS implementations.
+
 Register discipline for every UNET function:
 
 - Arguments are passed **only in A, DE, IX, IY**. HL and BC are consumed by the
-  libman dispatcher.
+  libman dispatcher. The vendored dispatcher saves IX/IY around its internal
+  DSS `SETWINn` call; stock libman 1.3 does not, although DSS/BIOS is allowed
+  to clobber index registers.
 - Results come back in **A, DE, IX, IY**.
 - **Every function returns its status in A** (0 = `NERR_OK`, else a `NERR_*`
   code). The dispatcher does **not** propagate a user function's carry flag, so

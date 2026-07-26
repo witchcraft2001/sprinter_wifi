@@ -1,13 +1,23 @@
 ; ======================================================
-; UNETESP.DLL - universal network DLL, ESP8266 / ESP-AT backend.
+; UNETESP.DLL - ESP-AT 2.2.2 network DLL, ESP8266 backend.
 ; libman 1.3 / L1 relocatable library. Implements the frozen UNET
 ; contract in src/include/unet.inc on top of the Sprinter-WiFi ESP
 ; library modules (esplib / esp_tcp / esp_udp / isa / util).
 ;
+; FIRMWARE PROFILE: this DLL is deliberately limited to ESP-AT 2.2.2 and the
+; field-proven trigger-8 receive path (like WGET/FTP/NTP/TFTP). The two
+; DEFINEs below pin that at assembly time - the DLL contains only the 2.2.2
+; command set and TR8 receive, with no runtime 2.2.1 fallback. NETINIT refuses
+; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
+; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
+; with the wrong command set. The L1 header name ("UNET ESP 2.2.2") announces
+; the target to consumers such as UNETTEST.
+;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNET ESP" --version 0.1 -o build/UNETESP.DLL
+;     --name "UNET ESP 2.2.2" --version 0.2 --no-compress \
+;     -o build/UNETESP.DLL
 ;
 ; Layout notes:
 ; - Assembled at ORG 0 here; mkdll rewrites the ORG to 0x20/0x120 for the
@@ -16,8 +26,15 @@
 ; - All BSS (the WIFI.RS_BUFF chain + our staging buffers) lives INSIDE the
 ;   image as DS zero bytes: libman packs several DLLs into one 16 KB page,
 ;   so memory past the declared image length may belong to another library.
-;   mkdll zero-RLE-compresses these runs; the loader zero-fills them on load.
+; - The shipped image is deliberately uncompressed. This keeps the on-target
+;   libman 1.3 path deterministic while the DLL remains comfortably below its
+;   16 KB image/input-page limit.
 ; ======================================================
+
+; 2.2.2-only, trigger-8 receive. Must precede the esplib include at the end of
+; this file (that is where both DEFINEs take effect).
+	DEFINE	ESP_AT_FORCE_222
+	DEFINE	WIFI_STABLE_ACTIVE_RX
 
 	INCLUDE "dss.inc"
 	INCLUDE "sprinter.inc"
@@ -872,16 +889,17 @@ CONSUME_CANCEL
 
 ; Validate a caller buffer pointer in HL.
 ; Reject window 0 (system), window 3 (ISA) and the DLL's own window.
-; Out: CF=1 if invalid, CF=0 if usable.
+; Out: CF=1 if invalid, CF=0 if usable. Preserves BC, DE and HL: callers such
+; as CHECK_BUF_RANGE keep their length in BC.
 CHECK_BUF
 	LD	A,H
 	AND	0xC0
 	JR	Z,.bad			; window 0
 	CP	0xC0
 	JR	Z,.bad			; window 3 (ISA)
-	LD	B,A
 	LD	A,(WIN_BASE)
-	CP	B
+	XOR	H
+	AND	0xC0
 	JR	Z,.bad			; DLL's own window
 	OR	A			; CF=0
 	RET
@@ -1015,7 +1033,20 @@ SELECT_ENV_RX_PROFILE
 	RET
 	ELSE
 	IFDEF	ESP_AT_FORCE_222
-	OR	A
+	; 2.2.2-only DLL: refuse a session NETUP did not bring up as 2.2.2 rather
+	; than silently driving 2.2.1 firmware with the 2.2.2 command set. The
+	; compiled receive path is fixed (TR8); this only gates NETINIT.
+	LD	HL,ENVN_ESP_FW
+	CALL	ENV_GET_STAGE
+	JR	Z,.bad222
+	LD	HL,ENV_STAGE
+	LD	DE,VAL_ESP_FW_222
+	CALL	STRMATCH
+	JR	NZ,.bad222
+	OR	A			; NET_ESP_FW == 2.2.2 -> ok (CF=0)
+	RET
+.bad222
+	SCF
 	RET
 	ELSE
 	LD	HL,ENVN_ESP_FW
@@ -1349,7 +1380,11 @@ ENVN_ESP_FW		DB "NET_ESP_FW",0
 ENVN_ESP_FLOW	DB "NET_ESP_FLOW",0
 ENVN_BAUD		DB "NET_BAUD",0
 VAL_WIFI		DB "WIFI",0
+	IFNDEF	ESP_AT_FORCE_221		; only the universal build matches "2.2.1"
+	IFNDEF	ESP_AT_FORCE_222		; (forced 2.2.2 pins the profile at build time)
 VAL_ESP_FW_221	DB "2.2.1",0
+	ENDIF
+	ENDIF
 VAL_ESP_FW_222	DB "2.2.2",0
 LIT_ESP			DB "ESP",0
 LIT_EMPTY		DB 0

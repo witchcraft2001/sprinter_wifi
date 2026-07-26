@@ -127,13 +127,16 @@ i8 unet_load(const char *dll_name, u8 window)
 
     if (window == 1)      g_base = 0x4000;
     else if (window == 2) g_base = 0x8000;
-    else                  return UNET_LOAD_EFORMAT;   /* window 3 forbidden */
+    else                  return UNET_LOAD_EWINDOW;   /* window must be 1 or 2 */
 
     g_block = dss_getmem();
     if (g_block == 0xFF) return UNET_LOAD_ENOMEM;
     dss_setwin(window, g_block);
     page = (u8 *)g_base;
 
+    /* dll_name is resolved against the DSS current directory (libman/DSS do
+       not search PATH or the program's own directory). Pass a full path, or
+       run the program from the directory that holds the DLL. */
     s_fd = dss_open(dll_name, O_RDONLY);
     if (s_fd < 0) { dss_freemem(g_block); g_block = 0xFF; return UNET_LOAD_EOPEN; }
 

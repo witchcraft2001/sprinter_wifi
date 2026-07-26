@@ -102,6 +102,36 @@ assemble_wterm()
 
 assemble_wterm
 
+# UNETESP.DLL is a UNET backend client too. It pins ESP-AT 2.2.2 + the stable
+# trigger-8 receive in-source; sprinter-mkdll only wraps these bytes in the L1
+# header/relocation map, so assembling the source straight and grepping the raw
+# image is a faithful check of what ships. NETUP owns ESP UART negotiation, so
+# the DLL must never carry an AT+UART_CUR command.
+assemble_unetesp()
+{
+	sjasmplus --nologo --fullpath \
+		-I "$repo_root/src/include" \
+		-I "$repo_root/src/lib" \
+		--lst="$tmp_dir/unetesp.lst" \
+		--raw="$tmp_dir/unetesp.bin" \
+		"$repo_root/src/dll/unetesp.asm" >/dev/null
+}
+
+assemble_unetesp
+
+if grep -a -q 'AT+UART_CUR=' "$tmp_dir/unetesp.bin"; then
+	echo "UNETESP.DLL unexpectedly contains an ESP UART reconfiguration command" >&2
+	exit 1
+fi
+# The 2.2.2-only DLL keeps the field-proven trigger-8 receive, never trigger 4.
+grep -Eq '1E 83[[:space:]]+LD[[:space:]]+E,FCR_TR8 \| FCR_RESET_RX \| FCR_FIFO' \
+	"$tmp_dir/unetesp.lst"
+if grep -Eq '1E 43[[:space:]]+LD[[:space:]]+E,FCR_TR4 \| FCR_RESET_RX \| FCR_FIFO' \
+	"$tmp_dir/unetesp.lst"; then
+	echo "UNETESP.DLL unexpectedly compiles active trigger 4 (should be 2.2.2 TR8)" >&2
+	exit 1
+fi
+
 # Universal FTP deliberately keeps the field-proven active receive transport:
 # trigger 8 and explicit RTS guards. NETUP alone configures the ESP UART;
 # clients must not contain an AT+UART_CUR command.
@@ -191,4 +221,4 @@ if grep -a -q 'AT+UART_CUR=' "$tmp_dir/wterm.exe"; then
 	exit 1
 fi
 
-echo "UART profiles and FTP/WGET/NTP/TFTP/WTERM compatibility paths: OK"
+echo "UART profiles and FTP/WGET/NTP/TFTP/WTERM/UNETESP compatibility paths: OK"
