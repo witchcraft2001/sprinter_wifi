@@ -121,10 +121,8 @@ START
 	; ABI 1.x requires TCP support.  A different ABI or a capability mask
 	; without TCP means GETCAPS did not execute the loaded UNET entry point.
 	; Stop here: calling SETOPT through the same damaged table can hang DSS.
-	LD	HL,(ABI_VERSION)
-	LD	DE,UNET_ABI_VERSION
-	OR	A
-	SBC	HL,DE
+	LD	A,(ABI_VERSION + 1)		; accept any compatible ABI 1.x
+	CP	HIGH UNET_ABI_VERSION
 	JP	NZ,ERR_BAD_IMAGE
 	LD	A,(CAPS)
 	AND	UNET_CAP_TCP
