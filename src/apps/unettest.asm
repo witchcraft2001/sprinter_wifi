@@ -1,11 +1,13 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT] HOST [PORT]
 ;
 ; Loads a UNET DLL (default UNETESP.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
 ; CONNECT, SEND (HTTP HEAD), a short RECV loop, CLOSE, NETDONE, l_free.
+; -u UDPPORT swaps the TCP half for UDPOPEN / SEND / RECV against a datagram
+; echo server instead (see tools/dev/udp_echo.py in the sibling RTL project).
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETRTL.DLL to exercise the RTL card.
 ;
@@ -219,6 +221,13 @@ START
 	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 .after_ping
+	; -u selects the UDP exercise instead of the TCP one.
+	LD	A,(UDP_MODE)
+	AND	A
+	JR	Z,.tcp_phase
+	CALL	UDP_PHASE
+	JP	.teardown
+.tcp_phase
 
 	; --- CONNECT host:port ---
 	LD	HL,MSG_CONNECT
@@ -290,6 +299,7 @@ START
 	LD	HL,MSG_CLOSED
 	CALL	PUTS_LN
 .recv_done
+.teardown
 
 	; --- CLOSE / NETDONE / free ---
 	XOR	A
@@ -432,6 +442,23 @@ ERR_SEND
 	CALL	DUMP_LASTERR
 	CALL	FREE_AND_DONE
 	LD	B,3
+	JP	EXIT
+ERR_UDPOPEN
+	; NERR_NOTSUP is a legitimate answer from a backend without
+	; CAP_UDP, so report it apart from a genuine failure.
+	CP	NERR_NOTSUP
+	JR	Z,.unsup
+	LD	HL,MSG_ERR_UDPOPEN
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.unsup
+	LD	HL,MSG_UDP_UNSUP
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,0
 	JP	EXIT
 
 USAGE_EXIT
@@ -597,6 +624,122 @@ PRINT_HEX_BYTES
 	JR	PRINT_HEX_BYTES
 
 ; ======================================================
+; UDP exercise (-u PORT): UDPOPEN -> SEND -> RECV -> verify echo.
+; The caller does CLOSE / NETDONE / l_free, exactly as for TCP.
+;
+; A datagram is either echoed intact or not at all, so a mismatch here
+; is a real defect in the UDP path rather than a partial transfer.
+; ======================================================
+UDP_PHASE
+	LD	HL,MSG_UDP
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,UDP_PORT_BUF
+	CALL	PUTS_LN
+
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,UDP_PORT_BUF
+	LD	IY,0				; local port: backend default
+	LD	B,UNET_FN_UDPOPEN
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_UDPOPEN
+
+	; --- SEND the probe payload straight from the image ---
+	XOR	A				; channel 0
+	LD	DE,UDP_PAYLOAD
+	LD	IX,UDP_PAYLOAD_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL				; -> A, DE=sent
+	OR	A
+	JP	NZ,ERR_SEND
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+
+	; --- RECV: one datagram per call; A=0 with DE=0 means "timed out,
+	;     link still alive", so retry rather than give up at once. ---
+	LD	A,UDP_MAX_TRIES
+	LD	(RECV_LEFT),A
+.wait
+	LD	A,(RECV_LEFT)
+	AND	A
+	JR	Z,.no_reply
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,2000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got, IX=flags
+	OR	A
+	JR	NZ,.err
+	LD	A,D
+	OR	E
+	JR	Z,.wait				; nothing this round
+	LD	(UDP_RX_LEN),DE
+	PUSH	IX
+	POP	HL
+	LD	A,L
+	LD	(UDP_RX_FLAGS),A
+	JR	.got
+.err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	JP	DUMP_LASTERR
+.no_reply
+	LD	HL,MSG_UDP_NOREPLY
+	CALL	PUTS_LN
+	JP	DUMP_LASTERR
+.got
+	LD	HL,MSG_UDP_REPLY
+	CALL	PUTS
+	LD	HL,(UDP_RX_LEN)
+	CALL	PUT_DEC_HL
+	LD	HL,MSG_UDP_DATA
+	CALL	PUTS
+	LD	DE,(UDP_RX_LEN)
+	CALL	PRINT_RECV			; terminates the buffer, then prints
+	CALL	CRLF
+	LD	A,(UDP_RX_FLAGS)
+	AND	1				; bit0: datagram was truncated
+	JR	Z,.compare
+	LD	HL,MSG_UDP_TRUNC
+	CALL	PUTS_LN
+.compare
+	CALL	UDP_ECHO_MATCH
+	LD	HL,MSG_UDP_OK
+	JR	Z,.verdict
+	LD	HL,MSG_UDP_BAD
+.verdict
+	JP	PUTS_LN
+
+; Compare the received datagram with the payload we sent.
+; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
+UDP_ECHO_MATCH
+	LD	HL,(UDP_RX_LEN)
+	LD	DE,UDP_PAYLOAD_LEN
+	OR	A
+	SBC	HL,DE
+	RET	NZ				; length differs
+	LD	HL,RECV_BUF
+	LD	DE,UDP_PAYLOAD
+	LD	B,UDP_PAYLOAD_LEN
+.loop
+	LD	A,(DE)
+	CP	(HL)
+	RET	NZ
+	INC	HL
+	INC	DE
+	DJNZ	.loop
+	XOR	A				; ZF=1
+	RET
+
+; ======================================================
 ; Build "HEAD / HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n"
 ; into REQ_BUF. Out: BC = length (no terminator sent).
 ; ======================================================
@@ -627,7 +770,8 @@ APPEND
 	JR	APPEND
 
 ; ======================================================
-; Command-line parsing:  [-d FILE.DLL] HOST [PORT]
+; Command-line parsing:  [-d FILE.DLL] [-u UDPPORT] HOST [PORT]
+; Flags may appear in any order but must precede HOST.
 ; ======================================================
 PARSE_ARGS
 	; defaults
@@ -642,43 +786,50 @@ PARSE_ARGS
 	CALL	STRCPY
 	XOR	A
 	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
+	LD	(UDP_MODE),A			; default: TCP exercise
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
 	LD	(PARSE_LEFT),A
 	INC	HL
 	LD	(PARSE_PTR),HL
-	; first token
+.next_flag
 	LD	DE,TOKEN_BUF
 	LD	C,TOKEN_BUF_SIZE
 	CALL	NEXT_TOKEN
-	RET	C				; no args -> defaults
-	; "-d" ?
+	RET	C				; no more args -> defaults
+	LD	A,(TOKEN_BUF)
+	CP	'-'
+	JR	NZ,.host_is_tok
 	LD	HL,TOKEN_BUF
 	LD	DE,STR_DASH_D
+	CALL	STREQ				; trashes C
+	JR	Z,.flag_d
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_U
 	CALL	STREQ
-	JR	NZ,.host_is_tok
-	; DLL name = next token
+	JR	Z,.flag_u
+	JP	USAGE_EXIT			; unknown flag
+.flag_d
 	LD	DE,DLL_NAME
 	LD	C,DLL_NAME_SIZE
 	CALL	NEXT_TOKEN
 	JP	C,USAGE_EXIT			; -d without a file name
 	LD	A,1
 	LD	(DLL_ARG_FLAG),A		; use DLL_NAME verbatim (may hold a path)
-	; host = next token
-	LD	DE,HOST_BUFF
-	LD	C,HOST_BUFF_SIZE
+	JR	.next_flag
+.flag_u
+	LD	DE,UDP_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
 	CALL	NEXT_TOKEN
-	RET	C
-	JR	.maybe_port
+	JP	C,USAGE_EXIT			; -u without a port
+	LD	A,1
+	LD	(UDP_MODE),A
+	JR	.next_flag
 .host_is_tok
-	LD	A,(TOKEN_BUF)
-	CP	'-'
-	JP	Z,USAGE_EXIT			; unknown flag
 	LD	HL,TOKEN_BUF
 	LD	DE,HOST_BUFF
 	CALL	STRCPY
-.maybe_port
 	LD	DE,PORT_BUFF
 	LD	C,PORT_BUFF_SIZE
 	CALL	NEXT_TOKEN			; optional; ignore CF
@@ -967,7 +1118,7 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [HOST [PORT]]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -1016,15 +1167,29 @@ MSG_ERR_NONET	DB "Network not configured - run NETUP first.",0
 MSG_ERR_HW	DB "Network hardware not found.",0
 MSG_ERR_CONNECT	DB "Connect failed.",0
 MSG_ERR_SEND	DB "Send failed.",0
+MSG_ERR_UDPOPEN	DB "UDPOPEN failed.",0
+MSG_UDP		DB "udp ",0
+MSG_UDP_REPLY	DB "udp reply: len=",0
+MSG_UDP_DATA	DB " data=",0
+MSG_UDP_TRUNC	DB "(datagram truncated to the receive buffer)",0
+MSG_UDP_OK	DB "udp echo ok",0
+MSG_UDP_BAD	DB "udp echo MISMATCH",0
+MSG_UDP_NOREPLY	DB "no udp reply",0
+MSG_UDP_UNSUP	DB "UDP not supported by this backend.",0
 MSG_CRLF	DB 13,10,0
 
 DEF_DLL		DB "UNETESP.DLL",0
 DEF_HOST	DB "example.com",0
 DEF_PORT	DB "80",0
 STR_DASH_D	DB "-d",0
+STR_DASH_U	DB "-u",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
+
+; Echo probe: sent with an explicit length, so no terminator travels.
+UDP_PAYLOAD	DB "SPRINTER UNETTEST UDP"
+UDP_PAYLOAD_LEN	EQU $ - UDP_PAYLOAD
 
 	ENDMODULE
 
@@ -1061,13 +1226,17 @@ PARSE_PTR	EQU CMDLINE_PTR + 2
 PARSE_LEFT	EQU PARSE_PTR + 2
 DLL_ARG_FLAG	EQU PARSE_LEFT + 1	; 1 = -d given, use DLL_NAME verbatim
 USED_EXEDIR	EQU DLL_ARG_FLAG + 1	; 1 = first candidate was DLL_PATH
-DEC_BUF		EQU USED_EXEDIR + 1
+UDP_MODE	EQU USED_EXEDIR + 1	; 1 = -u given, run the UDP exercise
+UDP_RX_LEN	EQU UDP_MODE + 1
+UDP_RX_FLAGS	EQU UDP_RX_LEN + 2
+DEC_BUF		EQU UDP_RX_FLAGS + 1
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
 HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
-TOKEN_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
+UDP_PORT_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
+TOKEN_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
@@ -1082,6 +1251,7 @@ STACK_BOTTOM	EQU BSS_END
 STACK_TOP	EQU STACK_BOTTOM + 0x600
 
 RECV_MAX_BLOCKS	EQU 4
+UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
 
 	ASSERT STACK_TOP <= 0xC000
 

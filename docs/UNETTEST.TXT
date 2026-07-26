@@ -15,16 +15,22 @@ Purpose
   A UNETRTL.DLL (RTL8019A) would be firmware-independent.
 
 Usage
-  UNETTEST [-d FILE.DLL] [host [port]]
+  UNETTEST [-d FILE.DLL] [-u udpport] [host [port]]
 
   -d FILE.DLL   Load this DLL instead of the default UNETESP.DLL. The name is
                 used exactly as typed and may include a path
                 (e.g. -d C:\WIFI\UNETESP.DLL).
+  -u udpport    Run the UDP exercise (UDPOPEN/SEND/RECV against a datagram
+                echo server) instead of the TCP one. Requires a UDP echo
+                service listening at host:udpport (see tools/dev/udp_echo.py
+                in the RTL8019A sibling project).
   host          Host name or IP address to test (default example.com).
-  port          TCP port for the connect/send/receive step (default 80).
+  port          TCP port for the connect/send/receive step (default 80),
+                unused when -u is given.
 
-  An unknown flag, or -d without a file name, prints this usage line and
-  exits with status 1.
+  Flags may appear in any order but must precede host. An unknown flag, or
+  -d/-u without their required argument, prints this usage line and exits
+  with status 1.
 
 DLL search order
   Without -d, UNETTEST first looks for UNETESP.DLL in the directory that holds
@@ -48,23 +54,30 @@ Examples
   UNETTEST example.com
   UNETTEST -d UNETRTL.DLL 192.168.1.10 80
   UNETTEST example.com 80
+  UNETTEST -u 9000 192.168.1.20
 
 Behavior
   Brings up nothing itself - run NETUP (Sprinter-WiFi) or NETCFG -i / IFUP
   (RTL) first. UNETTEST then loads the DLL into window 1 and walks the API:
   library info, capabilities, network status, NETINIT, station IP, host
   resolve (may report "unsupported" on firmware/emulator without CIPDOMAIN),
-  ping, TCP connect, an HTTP HEAD request and a short reply read, then close
-  and unload. It prints each result so a failing step is easy to spot.
+  and ping. From there it either runs the TCP exercise - connect, an HTTP HEAD
+  request and a short reply read - or, with -u, the UDP exercise: UDPOPEN,
+  SEND one probe datagram, then RECV until an echo arrives (or up to 3
+  timeouts). A byte-for-byte mismatch is reported as "udp echo MISMATCH"
+  rather than a truncated/partial transfer, since a datagram is delivered
+  intact or not at all. Either path ends with close and unload. It prints each
+  result so a failing step is easy to spot.
   Before SETOPT it also verifies ABI 0x0100 and the mandatory TCP capability.
   If these are invalid, it prints the loaded L1 image sizes plus the relocated
   GETCAPS bytes and exits instead of jumping farther through a damaged DLL.
 
 Exit status
-  0  The full sequence completed.
+  0  The full sequence completed (including a backend that reports UDP
+     unsupported with -u: this is a capability gap, not a failure).
   1  Invalid command line.
   2  Network hardware not found, or the DLL could not be loaded.
-  3  ESP/driver communication, connect or send error.
+  3  ESP/driver communication, connect, send or UDPOPEN error.
   4  Network not configured - run NETUP (or NETCFG -i / IFUP) first.
 
 Notes
