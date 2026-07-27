@@ -10,14 +10,20 @@
 ; command set and TR8 receive, with no runtime 2.2.1 fallback. NETINIT refuses
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
-; with the wrong command set. The L1 header name ("UNET ESP 2.2.2") announces
-; the target to consumers such as UNETTEST.
+; with the wrong command set. The L1 header name announces the target and full
+; package version (for example, "UNETESP v0.2.1") to consumers such as
+; UNETTEST.
 ;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNET ESP 2.2.2" --version 0.2 --no-compress \
+;     --name "UNETESP v0.2.1" --version 0.2 --no-compress \
 ;     -o build/UNETESP.DLL
+;
+; The L1 header has a compact, encoded major.minor version plus a 15-byte
+; human-readable name field. tools/build.sh puts the full package version into
+; that field as `UNETESP v<version>`, so consumers can identify the exact DLL
+; revision without decoding the numeric header.
 ;
 ; Layout notes:
 ; - Assembled at ORG 0 here; mkdll rewrites the ORG to 0x20/0x120 for the

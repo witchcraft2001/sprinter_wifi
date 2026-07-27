@@ -76,7 +76,15 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
   if [ "${#mkdll_cmd[@]}" -eq 0 ]; then
     echo "Warning: sprinter-mkdll not found (install libman or set UNET_LIBMAN_SRC); skipping DLL build" >&2
   else
-    dll_version="$(cut -d. -f1,2 < "$repo_root/VERSION" 2>/dev/null || echo 0.1)"
+    # The L1 numeric header carries only major.minor. Its 15-byte name field
+    # carries the full human-readable package tag, so consumers can identify
+    # the exact DLL revision without decoding the numeric header.
+    package_version="$(tr -d '\r\n' < "$repo_root/VERSION" 2>/dev/null || true)"
+    if ! [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "Error: VERSION must use major.minor.patch format, got: ${package_version:-<missing>}" >&2
+      exit 1
+    fi
+    dll_version="$(printf '%s' "$package_version" | cut -d. -f1,2)"
     for dll in "${BUILD_DLLS[@]}"; do
       src="$repo_root/src/dll/$dll.asm"
       upper="$(printf '%s' "$dll" | tr '[:lower:]' '[:upper:]')"
@@ -88,10 +96,14 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       fi
 
       case "$dll" in
-        unetesp) dll_name="UNET ESP 2.2.2" ;;
+        unetesp) dll_name="UNETESP v$package_version" ;;
         unetrtl) dll_name="UNET RTL" ;;
         *)       dll_name="$upper" ;;
       esac
+      if [ "${#dll_name}" -gt 15 ]; then
+        echo "Error: L1 text tag '$dll_name' exceeds the 15-byte header field" >&2
+        exit 1
+      fi
 
       # The UNET DLL pins its own firmware profile in-source (unetesp.asm
       # DEFINEs ESP_AT_FORCE_222 + WIFI_STABLE_ACTIVE_RX for a 2.2.2-only,
@@ -105,6 +117,15 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
         --name "$dll_name" --version "$dll_version" --no-compress -o "$out"
       "${mkdll_cmd[@]}" verify "$out" --target 1.3
       echo "Built $out"
+
+      # Keep a ready-to-use runtime DLL at the repository root. Consumers can
+      # take this file directly; publish it only after its L1 container passed
+      # verification above.
+      published="$repo_root/$upper.DLL"
+      if ! cmp -s "$out" "$published" 2>/dev/null; then
+        cp "$out" "$published"
+        echo "Published $published"
+      fi
     done
   fi
 fi
