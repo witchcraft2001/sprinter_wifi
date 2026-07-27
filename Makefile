@@ -1,4 +1,4 @@
-.PHONY: build package image test test-libman test-netup-busy test-uart-profiles clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer racetest clean
 
 build:
 	tools/build.sh
@@ -9,7 +9,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles
+test: test-libman test-netup-busy test-uart-profiles test-send-defer
 	tools/test-zmodem.sh
 
 test-libman:
@@ -20,6 +20,17 @@ test-netup-busy:
 
 test-uart-profiles:
 	tools/test-uart-profiles.sh
+
+test-send-defer:
+	tools/test-send-defer.sh
+
+# Developer-only SEND-race stress tool; NOT part of the distribution.
+# Pair with tools/race_server.py running on the target host.
+racetest:
+	mkdir -p build
+	sjasmplus --nologo --fullpath -I src/include -I src/lib \
+	  --lst=build/RACETEST.lst --raw=build/RACETEST.EXE src/apps/racetest.asm
+	@echo "Built build/RACETEST.EXE (dev tool, not packaged)"
 
 clean:
 	rm -rf build

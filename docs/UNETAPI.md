@@ -201,8 +201,10 @@ Reads up to `max` bytes with an `IY` millisecond timeout. Returns:
   tail.
 
 IX returns status flags: bit1 = more data is immediately pending (the caller
-buffer filled mid-frame; call RECV again), bit2 = a UART overrun (16550 LSR
-overrun error) was observed since the last RECV. bit0 is reserved for backends
+buffer filled mid-frame, or bytes remain in the send-window defer buffer below;
+call RECV again), bit2 = data was lost since the last RECV - either a UART
+overrun (16550 LSR overrun error) or a peer frame too large for the send-window
+defer buffer (see "Data arriving during a SEND"). bit0 is reserved for backends
 that truncate oversized datagrams; UNETESP delivers an oversized UDP datagram
 across successive RECV calls instead (bit1 set) rather than dropping the tail.
 
@@ -327,25 +329,30 @@ loop:
     jr loop
 ```
 
-**Data arriving during a SEND.** The ESP send path is +IPD-aware only in the
-sense that it parses *past* interleaved `+IPD` frames without corrupting the
-protocol state - the payload of a frame that arrives between the `CIPSEND`
-prompt and `SEND OK` is **discarded**, not buffered. In practice the window is
-a few tens of milliseconds per send, and a peer that only speaks when spoken
-to (HTTP, NTP, most protocols) is never inside it. For genuinely full-duplex
-peers (chat, telnet server-push, binkp) follow two rules:
+**Data arriving during a SEND.** A peer frame can arrive between the `CIPSEND`
+prompt and `SEND OK` (a window of a few tens of milliseconds per send). The ESP
+send path parses *past* such interleaved `+IPD` frames without corrupting the
+protocol state, and **UNETESP captures their payload into a 2 KB defer buffer
+and replays it to the next RECV, in arrival order, ahead of any live data** -
+so the race no longer loses bytes. A peer that only speaks when spoken to
+(HTTP, NTP, most protocols) never enters the window; genuinely full-duplex peers
+(chat, telnet server-push, binkp) are now handled losslessly without special
+care. Notes:
 
-1. **Drain before sending**: call RECV with a short timeout until it returns
-   `DE=0`, then SEND. Anything the peer already said is then safely delivered.
-2. **Keep SENDs short** (one line / one packet), so the vulnerable window
-   stays small.
+- After a RECV that drained the defer buffer, `IX` bit1 is set while more
+  captured (or live-partial) data remains - keep calling RECV, exactly as for a
+  normal multi-frame read.
+- If a single racing frame is larger than the free defer space it is dropped
+  (not partially stored) and `IX` bit2 (data lost) is raised on the next RECV.
+  With one MTU-sized frame per send window this does not occur in practice;
+  **keeping SENDs short** (one line / one packet) keeps it that way.
+- **Draining before sending** is no longer required for correctness, but is
+  still a reasonable habit for latency-sensitive interactive loops.
 
-This matches how the kit's TELNET client behaves at human interaction rates.
-A future revision can close the race entirely by buffering the skipped
-payload (the FTP client's no-wait send + receive-side `SEND OK` parsing); the
-API will not change. (An ESP-only raw transparent pipe could also be added
-behind the reserved `CAP_TRANSPARENT` bit and slots 18-23, but the portable
-path is SEND/RECV.)
+The RTL backend has no such window (the card buffers receive independently), so
+its consumers behave identically. (An ESP-only raw transparent pipe could still
+be added behind the reserved `CAP_TRANSPARENT` bit and slots 18-23, but the
+portable, now-lossless path is SEND/RECV.)
 
 ---
 

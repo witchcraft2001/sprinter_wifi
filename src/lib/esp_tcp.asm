@@ -30,6 +30,20 @@ RX_SPIN_BUDGET		EQU 200
 ; downloads. FTP uses the same burst strategy with 120 ms.
 TCP_CONT_TIMEOUT	EQU 120
 
+; Optional receive-defer window (ESP_TCP_RX_DEFER). When a +IPD frame arrives
+; between the CIPSEND '>' prompt and "SEND OK", the base library discards its
+; payload (SKIP_IPD_FRAME). With ESP_TCP_RX_DEFER defined, that payload is
+; instead captured into a small buffer and handed to the next RECEIVE, closing
+; the full-duplex race documented in docs/UNETAPI.md. One MTU-sized frame fits
+; with headroom; a frame that would overflow is dropped (old behaviour) and the
+; sticky DEFER_LOST flag is raised. Only the UNET DLL enables this; every stock
+; app builds without it and its .EXE stays byte-identical.
+	IFDEF ESP_TCP_RX_DEFER
+	IFNDEF TCP_RX_DEFER_SIZE
+TCP_RX_DEFER_SIZE	EQU 2048
+	ENDIF
+	ENDIF
+
 	MODULE TCP
 
 ; ------------------------------------------------------
@@ -44,6 +58,9 @@ OPEN
 	LD	(PAYLOAD_LEFT),HL
 	XOR	A
 	LD	(LSR_ACCUM),A
+	IFDEF ESP_TCP_RX_DEFER
+	CALL	RX_DEFER_RESET		; a fresh link must not replay old peer data
+	ENDIF
 
 	LD	HL,CMD_BUFFER
 	LD	DE,CMD_CIPSTART_PREFIX
@@ -152,7 +169,14 @@ START_SEND_BUFFER
 	LD	DE,CMD_CRLF
 	CALL	APPEND_STR
 
+	IFDEF ESP_TCP_RX_DEFER
+	; Do NOT flush the RX FIFO: bytes already queued are the start of a +IPD
+	; frame that WAIT_PROMPT will capture. Only rescue a payload the app left
+	; unread so it can't be mistaken for the '>' prompt / SEND OK.
+	CALL	CAPTURE_PENDING_PAYLOAD
+	ELSE
 	CALL	WIFI.UART_EMPTY_RS
+	ENDIF
 	LD	HL,CMD_BUFFER
 	CALL	WIFI.UART_TX_STRING
 	JR	C,.TX_TIMEOUT
@@ -192,6 +216,20 @@ RECEIVE
 	LD	(RECV_FULL_TIMEOUT),DE
 	LD	HL,0
 	LD	(RECV_STORED),HL
+
+	IFDEF ESP_TCP_RX_DEFER
+	; Replay peer data captured during a prior SEND before reading the UART,
+	; so it is delivered ahead of any live +IPD (preserves stream order).
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JP	NZ,RECEIVE_FROM_DEFER
+	LD	HL,(DEFER_R)
+	LD	DE,(DEFER_W)
+	OR	A
+	SBC	HL,DE			; R-W; CF=1 while R<W (frames queued)
+	JP	C,RECEIVE_FROM_DEFER
+	ENDIF
 
 	CALL	ISA.ISA_OPEN
 	LD	HL,(PAYLOAD_LEFT)
@@ -299,7 +337,11 @@ WAIT_PROMPT
 	INC	IX
 	JR	.NEXT
 .IPD_HIT
+	IFDEF ESP_TCP_RX_DEFER
+	CALL	CAPTURE_IPD_FRAME
+	ELSE
 	CALL	SKIP_IPD_FRAME
+	ENDIF
 	JR	C,.TIMEOUT_POP
 	LD	IX,IPD_PREFIX
 	JR	.NEXT
@@ -363,7 +405,11 @@ WAIT_SEND_OK
 	LD	(LINE_REMAIN),A
 	JR	.NEXT_BYTE
 .IPD_LINE_HIT
+	IFDEF ESP_TCP_RX_DEFER
+	CALL	CAPTURE_IPD_FRAME
+	ELSE
 	CALL	SKIP_IPD_FRAME
+	ENDIF
 	JR	C,.TIMEOUT
 	JR	.RESTART
 .END_LINE
@@ -475,6 +521,343 @@ SKIP_IPD_FRAME
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+
+	IFDEF ESP_TCP_RX_DEFER
+; ======================================================
+; Receive-defer window (ESP_TCP_RX_DEFER). Captures +IPD payload that races a
+; SEND (arrives in the CIPSEND '>' / SEND OK window) instead of discarding it,
+; and replays it to the next RECEIVE. Frames are stored back-to-back as
+; {2-byte LE length, payload}. See the note near the top of this file and
+; docs/UNETAPI.md. All UART reads here use READ_BYTE_TIMEOUT (no ISA window is
+; held by the SEND-side callers), matching SKIP_IPD_FRAME.
+; ======================================================
+
+; Clear the whole defer window. Called on a fresh TCP/UDP open.
+RX_DEFER_RESET
+	LD	HL,0
+	LD	(DEFER_W),HL
+	LD	(DEFER_R),HL
+	LD	(DEFER_FRAME_LEFT),HL
+	XOR	A
+	LD	(DEFER_LOST),A
+	RET
+
+; Slide the unread region [R..W) down to offset 0 so W-=R, R=0. Safe while a
+; frame is partially delivered (DEFER_FRAME_LEFT!=0): R points mid-payload and
+; the remaining bytes move down unchanged. Regs already saved by the caller.
+DEFER_COMPACT
+	LD	HL,(DEFER_R)
+	LD	A,H
+	OR	L
+	RET	Z			; R==0: nothing to compact
+	LD	DE,(DEFER_R)
+	LD	HL,(DEFER_W)
+	OR	A
+	SBC	HL,DE			; HL = W-R = count
+	LD	B,H
+	LD	C,L
+	LD	A,B
+	OR	C
+	JR	Z,.setw			; empty region, just reset offsets
+	LD	HL,DEFER_BUF
+	LD	DE,(DEFER_R)
+	ADD	HL,DE			; src = DEFER_BUF+R
+	LD	DE,DEFER_BUF		; dst = DEFER_BUF
+	LDIR				; forward copy, dst<src -> safe
+.setw
+	LD	HL,(DEFER_W)
+	LD	DE,(DEFER_R)
+	OR	A
+	SBC	HL,DE
+	LD	(DEFER_W),HL		; W -= R
+	LD	HL,0
+	LD	(DEFER_R),HL		; R = 0
+	RET
+
+; Store one frame of DE payload bytes read from the UART into the defer buffer.
+; Compacts first. On overflow the payload is drained and discarded and
+; DEFER_LOST is set. On a UART timeout the partial frame is committed with its
+; actual length, DEFER_LOST is set, and CF=1 is returned. In: DE=len.
+; Out: CF=0 ok / CF=1 UART timeout. Clobbers A,BC,DE,HL (caller saves).
+DEFER_STORE_FRAME
+	LD	A,D
+	OR	E
+	RET	Z			; zero-length frame: nothing to store, CF=0
+	CALL	DEFER_COMPACT
+	PUSH	DE
+	LD	HL,TCP_RX_DEFER_SIZE
+	LD	BC,(DEFER_W)
+	OR	A
+	SBC	HL,BC			; HL = free bytes at end
+	POP	DE
+	PUSH	DE
+	INC	DE
+	INC	DE			; DE = len+2 (header+payload)
+	OR	A
+	SBC	HL,DE			; CF=1 if free < len+2
+	POP	DE			; DE = len
+	JR	C,.overflow
+	LD	HL,DEFER_BUF
+	LD	BC,(DEFER_W)
+	ADD	HL,BC			; HL = &DEFER_BUF[W] (header)
+	LD	(DEFER_FHDR),HL
+	LD	(HL),E			; length lo
+	INC	HL
+	LD	(HL),D			; length hi
+	INC	HL
+	LD	(DEFER_WPTR),HL		; payload write pointer
+	LD	(DEFER_NEED),DE		; bytes still to read
+.loop
+	LD	HL,(DEFER_NEED)
+	LD	A,H
+	OR	L
+	JR	Z,.done
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	CALL	READ_BYTE_TIMEOUT
+	JR	C,.timeout
+	LD	HL,(DEFER_WPTR)
+	LD	(HL),A
+	INC	HL
+	LD	(DEFER_WPTR),HL
+	LD	HL,(DEFER_NEED)
+	DEC	HL
+	LD	(DEFER_NEED),HL
+	JR	.loop
+.done
+	LD	HL,(DEFER_WPTR)
+	LD	DE,DEFER_BUF
+	OR	A
+	SBC	HL,DE
+	LD	(DEFER_W),HL		; W = WPTR - base
+	XOR	A			; CF=0
+	RET
+.timeout
+	LD	HL,(DEFER_WPTR)
+	LD	DE,DEFER_BUF
+	OR	A
+	SBC	HL,DE
+	LD	(DEFER_W),HL		; commit partial frame
+	LD	HL,(DEFER_WPTR)
+	LD	DE,(DEFER_FHDR)
+	OR	A
+	SBC	HL,DE
+	DEC	HL
+	DEC	HL			; HL = actual bytes captured
+	EX	DE,HL
+	LD	HL,(DEFER_FHDR)
+	LD	(HL),E			; patch header length lo
+	INC	HL
+	LD	(HL),D			; patch header length hi
+	LD	A,1
+	LD	(DEFER_LOST),A
+	SCF
+	RET
+.overflow
+	LD	A,1
+	LD	(DEFER_LOST),A
+	LD	(DEFER_NEED),DE		; drain and discard len bytes
+.ovf_loop
+	LD	HL,(DEFER_NEED)
+	LD	A,H
+	OR	L
+	JR	Z,.ovf_done
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	CALL	READ_BYTE_TIMEOUT
+	JR	C,.ovf_timeout
+	LD	HL,(DEFER_NEED)
+	DEC	HL
+	LD	(DEFER_NEED),HL
+	JR	.ovf_loop
+.ovf_done
+	XOR	A			; CF=0
+	RET
+.ovf_timeout
+	SCF				; timeout while discarding
+	RET
+
+; Capture a +IPD frame whose "+IPD," prefix was already consumed, parsing the
+; "<len>[,ip,port]:" header exactly like SKIP_IPD_FRAME, then storing the
+; payload. Called from the SEND-side prompt/SEND-OK waits.
+; Out: CF=0 ok / CF=1 A=RES_RS_TIMEOUT. Preserves BC,DE,HL (like SKIP_IPD_FRAME).
+CAPTURE_IPD_FRAME
+	PUSH	BC,DE,HL
+	LD	HL,0			; HL = running length accumulator
+	LD	(IPD_REMOTE_LEN),HL
+	XOR	A
+	LD	(IPD_HAVE_REMOTE_LEN),A
+.len_loop
+	; READ_BYTE_TIMEOUT clobbers HL (LD HL,REG_RBR), so save the accumulator
+	; across the call. Flags/A/C from the read survive POP HL.
+	PUSH	HL
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	CALL	READ_BYTE_TIMEOUT
+	POP	HL
+	JR	C,.fail
+	CP	':'
+	JR	Z,.len_done
+	CP	','
+	JR	Z,.next_field
+	CP	'0'
+	JR	C,.remote_info
+	CP	'9'+1
+	JR	NC,.remote_info
+	SUB	'0'
+	LD	E,A
+	LD	D,0
+	LD	B,H
+	LD	C,L
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,BC
+	ADD	HL,HL
+	ADD	HL,DE
+	JR	.len_loop
+.next_field
+	LD	(IPD_REMOTE_LEN),HL
+	LD	A,1
+	LD	(IPD_HAVE_REMOTE_LEN),A
+	LD	HL,0
+	JR	.len_loop
+.remote_info
+	LD	A,(IPD_HAVE_REMOTE_LEN)
+	AND	A
+	JR	Z,.fail
+.skip_remote
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	CALL	READ_BYTE_TIMEOUT
+	JR	C,.fail
+	CP	':'
+	JR	NZ,.skip_remote
+	LD	HL,(IPD_REMOTE_LEN)
+.len_done
+	EX	DE,HL			; DE = payload length
+	CALL	DEFER_STORE_FRAME
+	JR	C,.fail
+	POP	HL,DE,BC
+	XOR	A
+	RET
+.fail
+	POP	HL,DE,BC
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
+
+; If the app left a +IPD payload unread (PAYLOAD_LEFT!=0) when it starts a SEND,
+; pull those bytes into the defer buffer as one frame so the CIPSEND handshake
+; is not corrupted by them (this replaces the old UART_EMPTY_RS FIFO flush,
+; which would have thrown the same bytes away). Clears PAYLOAD_LEFT.
+CAPTURE_PENDING_PAYLOAD
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	RET	Z			; nothing pending
+	PUSH	BC,DE,HL
+	LD	DE,(PAYLOAD_LEFT)
+	CALL	DEFER_STORE_FRAME	; best-effort; CF ignored by caller
+	LD	HL,0
+	LD	(PAYLOAD_LEFT),HL
+	POP	HL,DE,BC
+	RET
+
+; Copy min(DEFER_FRAME_LEFT, RECV_REMAIN) bytes from the current defer read
+; point into the caller buffer, updating all cursors. Pure memory move.
+DEFER_EMIT
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	DE,(RECV_REMAIN)
+	OR	A
+	SBC	HL,DE			; frame - remain
+	JR	C,.use_frame		; frame < remain -> n=frame
+	LD	BC,(RECV_REMAIN)
+	JR	.have_n
+.use_frame
+	LD	BC,(DEFER_FRAME_LEFT)
+.have_n
+	LD	A,B
+	OR	C
+	RET	Z			; n==0
+	LD	HL,DEFER_BUF
+	LD	DE,(DEFER_R)
+	ADD	HL,DE			; src = DEFER_BUF+R
+	LD	DE,(RECV_PTR)		; dst
+	PUSH	BC
+	LDIR
+	LD	(RECV_PTR),DE		; dst advanced by n
+	POP	BC
+	LD	HL,(DEFER_R)
+	ADD	HL,BC
+	LD	(DEFER_R),HL		; R += n
+	LD	HL,(DEFER_FRAME_LEFT)
+	OR	A
+	SBC	HL,BC
+	LD	(DEFER_FRAME_LEFT),HL	; frame -= n
+	LD	HL,(RECV_REMAIN)
+	OR	A
+	SBC	HL,BC
+	LD	(RECV_REMAIN),HL	; remain -= n
+	LD	HL,(RECV_STORED)
+	ADD	HL,BC
+	LD	(RECV_STORED),HL	; stored += n
+	RET
+
+; Deliver buffered defer bytes into the caller's RECV buffer (RECV_PTR /
+; RECV_REMAIN / RECV_STORED already latched by RECEIVE). Greedy fill mirroring
+; the live back-to-back path: finish a partial frame, then whole frames while
+; space remains; a frame larger than the space is delivered partially with the
+; tail kept in DEFER_FRAME_LEFT. Out: A=0, CF=0, BC=stored.
+RECEIVE_FROM_DEFER
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JR	Z,.frames
+	CALL	DEFER_EMIT
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.return		; buffer filled mid-frame
+.frames
+	LD	HL,(RECV_REMAIN)
+	LD	A,H
+	OR	L
+	JR	Z,.return		; caller buffer full
+	LD	HL,(DEFER_R)
+	LD	DE,(DEFER_W)
+	OR	A
+	SBC	HL,DE			; R-W; CF=1 while R<W (frames remain)
+	JR	NC,.return		; R>=W: empty
+	LD	HL,DEFER_BUF
+	LD	DE,(DEFER_R)
+	ADD	HL,DE
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)			; DE = next frame length
+	LD	(DEFER_FRAME_LEFT),DE
+	LD	HL,(DEFER_R)
+	INC	HL
+	INC	HL
+	LD	(DEFER_R),HL		; step past 2-byte header
+	CALL	DEFER_EMIT
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JR	Z,.frames		; frame fully emitted: next frame
+.return
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.keep		; mid-frame: keep cursors
+	LD	HL,(DEFER_R)
+	LD	DE,(DEFER_W)
+	OR	A
+	SBC	HL,DE
+	JR	C,.keep			; R<W: frames still queued
+	LD	HL,0
+	LD	(DEFER_R),HL
+	LD	(DEFER_W),HL		; fully drained: reset to front
+.keep
+	LD	BC,(RECV_STORED)
+	XOR	A
+	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Read one CR/LF-terminated line into LINE_BUFFER.
@@ -851,6 +1234,23 @@ BUSY_LEFT	DB 0
 ; once detection has given up for the current line.
 IPD_STATE_PTR	DW 0
 
+	IFDEF ESP_TCP_RX_DEFER
+; Receive-defer window state (see the ESP_TCP_RX_DEFER note near the top).
+; DEFER_W/DEFER_R are byte offsets into DEFER_BUF; the buffered region holds a
+; sequence of {2-byte LE length, payload} frames. DEFER_FRAME_LEFT is the
+; not-yet-delivered tail of the frame a RECEIVE was in the middle of returning.
+; DEFER_LOST is sticky: a captured frame was dropped on overflow or truncated
+; by a UART timeout, so the peer stream has a gap.
+DEFER_W		DW 0
+DEFER_R		DW 0
+DEFER_FRAME_LEFT	DW 0
+DEFER_LOST	DB 0
+; Scratch used only inside a single capture; not state between calls.
+DEFER_FHDR	DW 0	; address of the length header of the frame being written
+DEFER_WPTR	DW 0	; running payload write pointer
+DEFER_NEED	DW 0	; payload bytes still to read
+	ENDIF
+
 	IFNDEF	ESP_TCP_BSS_BASE_OVERRIDE
 ESP_TCP_BSS_BASE	EQU WIFI.RS_BUFF + RS_BUFF_SIZE
 	ENDIF
@@ -860,7 +1260,12 @@ CMD_BUFFER	EQU TCP_BSS_BASE
 NUM_BUFFER	EQU CMD_BUFFER + TCP_CMD_SIZE
 LINE_BUFFER	EQU NUM_BUFFER + 8
 DEBUG_BUFFER	EQU LINE_BUFFER + TCP_LINE_SIZE
+	IFDEF ESP_TCP_RX_DEFER
+DEFER_BUF	EQU DEBUG_BUFFER + TCP_DEBUG_SIZE
+TCP_BSS_END	EQU DEFER_BUF + TCP_RX_DEFER_SIZE
+	ELSE
 TCP_BSS_END	EQU DEBUG_BUFFER + TCP_DEBUG_SIZE
+	ENDIF
 
 	ENDMODULE
 

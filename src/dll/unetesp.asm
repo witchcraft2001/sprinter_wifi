@@ -35,6 +35,12 @@
 ; this file (that is where both DEFINEs take effect).
 	DEFINE	ESP_AT_FORCE_222
 	DEFINE	WIFI_STABLE_ACTIVE_RX
+; Capture peer +IPD data that races a SEND (arrives in the CIPSEND '>' / SEND OK
+; window) into a 2 KB defer buffer and replay it to the next RECV, instead of
+; discarding it. Closes the full-duplex race in docs/UNETAPI.md; grows the image
+; by ~2 KB (still well under the 16 KB ceiling). Only the DLL enables this — the
+; stock apps build without it and stay byte-identical. See esp_tcp.asm.
+	DEFINE	ESP_TCP_RX_DEFER
 
 	INCLUDE "dss.inc"
 	INCLUDE "sprinter.inc"
@@ -389,26 +395,49 @@ F_RECV
 	RET
 
 ; Build IX = RECV status flags; reset the sticky overrun accumulator.
-; bit1 more data pending (PAYLOAD_LEFT != 0), bit2 UART overrun (LSR OE).
+; bit1 more data pending (live +IPD tail OR buffered defer data),
+; bit2 data lost (UART overrun OR a defer frame dropped on send-window overflow).
 BUILD_RECV_FLAGS
 	LD	L,0
 	LD	H,0
+	; bit1: PAYLOAD_LEFT != 0 (partial live +IPD) ...
 	LD	A,(TCP.PAYLOAD_LEFT)
 	LD	B,A
 	LD	A,(TCP.PAYLOAD_LEFT+1)
 	OR	B
+	JR	NZ,.more
+	; ... or a partially delivered defer frame ...
+	LD	A,(TCP.DEFER_FRAME_LEFT)
+	LD	B,A
+	LD	A,(TCP.DEFER_FRAME_LEFT+1)
+	OR	B
+	JR	NZ,.more
+	; ... or whole defer frames still queued (DEFER_W != DEFER_R).
+	LD	HL,(TCP.DEFER_W)
+	LD	DE,(TCP.DEFER_R)
+	OR	A
+	SBC	HL,DE
+	LD	A,H
+	OR	L
+	LD	HL,0
 	JR	Z,.no_more
+.more
 	SET	1,L
 .no_more
 	LD	A,(TCP.LSR_ACCUM)
 	AND	LSR_OE
+	JR	NZ,.lost
+	LD	A,(TCP.DEFER_LOST)
+	AND	A
 	JR	Z,.no_oe
+.lost
 	SET	2,L
 .no_oe
 	PUSH	HL
 	POP	IX
 	XOR	A
 	LD	(TCP.LSR_ACCUM),A
+	LD	(TCP.DEFER_LOST),A
 	RET
 
 ; ======================================================

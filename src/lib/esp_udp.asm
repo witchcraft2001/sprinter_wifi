@@ -77,6 +77,11 @@ BUILD_OPEN_PREFIX
 	RET
 
 SEND_OPEN
+	IFDEF ESP_TCP_RX_DEFER
+	; UDP open does not pass through TCP.OPEN, so clear the defer window here
+	; too — a new endpoint must not replay data captured on a prior one.
+	CALL	TCP.RX_DEFER_RESET
+	ENDIF
 	; Retry while the ESP still answers "busy p..." right after NETUP's join;
 	; see TCP.TX_CMD_BUSY_RETRY in esp_tcp.asm.
 	LD	HL,CMD_BUFFER
