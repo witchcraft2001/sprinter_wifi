@@ -79,9 +79,15 @@ This is the graphical method described in [ESP-module-flashing.pdf](https://zxgi
 3. Select the firmware image once and set its flash address to `0x000000`.
    Select `DIO`, `40 MHz`, and `2 MB`; choose the COM port of the USB-UART
    adapter.
-4. Click **Start**. Put the Sprinter Wi-Fi board into bootloader mode using J2,
-   SW1, and SW2 as described above.
-5. Wait for **FINISH**, remove jumper J2, power-cycle/reset the board, and run
+
+   ![Flash Download Tool: ERASE (1), then START (2)](flash_download_tool.png)
+
+4. Fit jumper J2, connect the Sprinter Wi-Fi board to the computer through the
+   USB-UART adapter, then enter bootloader mode with **SW1 + SW2** as described
+   above.
+5. Click **ERASE** to erase the flash contents.
+6. Click **Start** to write the firmware image.
+7. Wait for **FINISH**, remove jumper J2, power-cycle/reset the board, and run
    `NETPROBE` or `WTERM` + `AT+GMR` to confirm the new firmware.
 
 Do not interrupt power or disconnect the UART adapter while erasing or writing
