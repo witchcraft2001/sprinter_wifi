@@ -67,6 +67,12 @@ Everyday commands (run after NETUP)
     if the file exists, the tool asks [R]esume / [O]verwrite / [C]ancel.
     -y or -f   overwrite without asking
     -r         resume/append without asking (WGET, FTP; TFTP has no resume)
+
+  Progress display (WGET, FTP):
+    by default the transfer shows an in-place "<KB>KB / <KB>KB" counter.
+    -d         print one dot per write instead, the way it looked before
+               the counter existed. Useful to compare download speed with
+               and without the console work of the counter.
   Handy in batch files, e.g.:  WGET url -o FILE.BIN -y
 
 If something is stuck and tools report "ESP connection error #1"

@@ -319,13 +319,14 @@ CANCEL_EXIT
 
 ; ------------------------------------------------------
 ; Parse command line:
-;   WGET.EXE url [-o output] [-y|-f overwrite] [-r resume]
+;   WGET.EXE url [-o output] [-y|-f overwrite] [-r resume] [-d dots]
 ;   WGET.EXE url FILE              ; legacy compatible alias for -o FILE
 ; ------------------------------------------------------
 PARSE_CMD_LINE
 	XOR	A
 	LD	(HELP_REQUESTED),A
 	LD	(FORCE_OVERWRITE),A
+	LD	(DOTS_FLAG),A
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
 	AND	A
@@ -337,48 +338,54 @@ PARSE_CMD_LINE
 	LD	DE,URL_BUFF
 	LD	C,URL_SIZE-1
 	CALL	COPY_ARG
-	JR	C,.ERR
+	JP	C,.ERR
 
 	PUSH	HL
 	PUSH	BC
 	CALL	IS_HELP_TOKEN_URL
 	POP	BC
 	POP	HL
-	JR	NC,.HELP
+	JP	NC,.HELP
 .NEXT_OPT
 	CALL	SKIP_SPACES
-	JR	C,.DONE
+	JP	C,.DONE
 	LD	DE,HOST_BUFF
 	LD	C,FILE_SIZE-1
 	CALL	COPY_ARG
-	JR	C,.ERR
+	JP	C,.ERR
 	PUSH	HL
 	PUSH	BC
 	CALL	IS_OPT_OUTPUT
 	POP	BC
 	POP	HL
-	JR	NC,.OUTPUT
+	JP	NC,.OUTPUT
 	PUSH	HL
 	PUSH	BC
 	CALL	IS_OPT_YES
 	POP	BC
 	POP	HL
-	JR	NC,.YES
+	JP	NC,.YES
 	PUSH	HL
 	PUSH	BC
 	CALL	IS_OPT_RESUME
 	POP	BC
 	POP	HL
-	JR	NC,.RESUME_OPT
+	JP	NC,.RESUME_OPT
+	PUSH	HL
+	PUSH	BC
+	CALL	IS_OPT_DOTS
+	POP	BC
+	POP	HL
+	JP	NC,.DOTS_OPT
 	PUSH	HL
 	PUSH	BC
 	CALL	IS_HELP_TOKEN_TMP
 	POP	BC
 	POP	HL
-	JR	NC,.HELP
+	JP	NC,.HELP
 	LD	A,(OUT_FILE)
 	AND	A
-	JR	NZ,.ERR
+	JP	NZ,.ERR
 	; COPY_ASCIIZ_LIMIT clobbers HL/BC, which still hold the cmdline cursor and
 	; remaining-length. Preserve them so a flag after a positional output name
 	; (e.g. `WGET url OUT -y`) is not read from garbage and lost.
@@ -390,24 +397,28 @@ PARSE_CMD_LINE
 	CALL	COPY_ASCIIZ_LIMIT
 	POP	BC
 	POP	HL
-	JR	NC,.NEXT_OPT
-	JR	.ERR
+	JP	NC,.NEXT_OPT
+	JP	.ERR
 .OUTPUT
 	CALL	SKIP_SPACES
-	JR	C,.ERR
+	JP	C,.ERR
 	LD	DE,OUT_FILE
 	LD	C,FILE_SIZE-1
 	CALL	COPY_ARG
-	JR	NC,.NEXT_OPT
-	JR	.ERR
+	JP	NC,.NEXT_OPT
+	JP	.ERR
 .YES
 	LD	A,1
 	LD	(FORCE_OVERWRITE),A
-	JR	.NEXT_OPT
+	JP	.NEXT_OPT
 .RESUME_OPT
 	LD	A,1
 	LD	(FORCE_RESUME),A
-	JR	.NEXT_OPT
+	JP	.NEXT_OPT
+.DOTS_OPT
+	LD	A,1
+	LD	(DOTS_FLAG),A
+	JP	.NEXT_OPT
 .HELP
 	LD	A,1
 	LD	(HELP_REQUESTED),A
@@ -472,6 +483,16 @@ IS_OPT_RESUME
 	CALL	UTIL.STRCMP_CI
 	RET	NC
 	LD	HL,SWITCH_RESUME_SLASH
+	LD	DE,HOST_BUFF
+	JP	UTIL.STRCMP_CI
+
+; Dot-progress flag: -d / /d (one dot per write instead of the KB counter).
+IS_OPT_DOTS
+	LD	HL,SWITCH_DOTS_DASH
+	LD	DE,HOST_BUFF
+	CALL	UTIL.STRCMP_CI
+	RET	NC
+	LD	HL,SWITCH_DOTS_SLASH
 	LD	DE,HOST_BUFF
 	JP	UTIL.STRCMP_CI
 
@@ -1756,9 +1777,7 @@ WRITE_BODY
 	POP	BC
 	RET	C
 	CALL	ADD_BODY_BYTES
-	LD	HL,BODY_BYTES
-	LD	DE,CONTENT_LENGTH
-	CALL	TPUT.PROGRESS
+	CALL	PROGRESS_TICK
 	LD	A,1
 	LD	(HAVE_BODY),A
 	RET
@@ -1772,11 +1791,30 @@ WRITE_BODY
 	ADD	HL,BC
 	LD	(HOLD_LEN),HL
 	CALL	ADD_BODY_BYTES
-	LD	HL,BODY_BYTES
-	LD	DE,CONTENT_LENGTH
-	CALL	TPUT.PROGRESS
+	CALL	PROGRESS_TICK
 	LD	A,1
 	LD	(HAVE_BODY),A
+	RET
+
+; ------------------------------------------------------
+; PROGRESS_TICK: per-write progress output for the body loop.
+; Default: repaint the in-place "<KB>KB / <KB>KB" counter.
+; Under -d: one dot and nothing else — the output WGET had before the counter
+; existed. The counter is drawn through the DSS console with RX paused, so -d
+; is what makes its cost measurable against the same download.
+; Must return CF=0: the caller propagates CF as success/fail.
+; ------------------------------------------------------
+PROGRESS_TICK
+	LD	A,(DOTS_FLAG)
+	AND	A
+	JR	NZ,.DOT
+	LD	HL,BODY_BYTES
+	LD	DE,CONTENT_LENGTH
+	JP	TPUT.PROGRESS
+.DOT
+	LD	A,'.'
+	CALL	PUT_CHAR
+	OR	A			; CF=0 (success)
 	RET
 
 ; ------------------------------------------------------
@@ -2563,10 +2601,11 @@ MSG_START
 	DB " - HTTP downloader for SprinterESP"
 	DB 0
 MSG_USAGE
-	DB "Usage: WGET.EXE url [-o output] [-y|-f] [-r]",13,10
+	DB "Usage: WGET.EXE url [-o output] [-y|-f] [-r] [-d]",13,10
 	DB "  -o name   output file (default: name from URL)",13,10
 	DB "  -y, -f    overwrite an existing file",13,10
 	DB "  -r        resume (append to an existing file)",13,10
+	DB "  -d        dot progress instead of the KB counter",13,10
 	DB "  /?        show this help",0
 MSG_WIFI_NOT_FOUND
 	DB "Sprinter-WiFi not found!",0
@@ -2748,6 +2787,10 @@ SWITCH_RESUME_DASH
 	DB "-r",0
 SWITCH_RESUME_SLASH
 	DB "/r",0
+SWITCH_DOTS_DASH
+	DB "-d",0
+SWITCH_DOTS_SLASH
+	DB "/d",0
 SWITCH_HELP_Q_SLASH
 	DB "/?",0
 SWITCH_HELP_Q_DASH
@@ -2784,6 +2827,7 @@ HELP_REQUESTED	DB 0
 CMDLINE_PTR	DW 0		; arg buffer ptr captured from IX at entry
 FORCE_OVERWRITE	DB 0
 FORCE_RESUME	DB 0
+DOTS_FLAG	DB 0		; 1 = -d: one dot per write, no KB counter
 OUTPUT_ABORTED	DB 0
 GOT_RESPONSE	DB 0
 HEADER_DONE	DB 0

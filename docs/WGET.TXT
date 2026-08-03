@@ -4,13 +4,17 @@ Purpose
   Downloads a plain HTTP resource through ESP-AT TCP to a local DSS file.
 
 Usage
-  WGET.EXE url [-o output] [-y|-f] [-r]
+  WGET.EXE url [-o output] [-y|-f] [-r] [-d]
   WGET.EXE /?
 
 Flags
   -o name   write to this local file (default: last component of the URL).
   -y, -f    overwrite an existing local file without asking.
   -r        resume: append to an existing file (HTTP Range request).
+  -d        dot progress: print one dot per write instead of the
+            "<KB>KB / <KB>KB" counter. The counter is drawn through the
+            DSS console while receive is paused, so -d is the way to
+            measure how much console work costs on a given link.
 
 Examples
   WGET.EXE http://example.com/ -o INDEX.HTM -y

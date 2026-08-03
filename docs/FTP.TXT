@@ -8,7 +8,7 @@ Purpose
 
 Usage
 -----
-  FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r]
+  FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r] [-d]
   FTP.EXE host[:port] PUT local [-o remote] [-u user] [-p pass]
   FTP.EXE host[:port] [path] -l [-u user] [-p pass]
   FTP.EXE host[:port] [path] -n [-u user] [-p pass]
@@ -20,6 +20,10 @@ Flags
   -y, -f    overwrite an existing local file without asking.
   -r        resume: append to an existing file (FTP REST).
   -l / -n   directory listing (LIST / NLST).
+  -d        dot progress: print one dot per write instead of the
+            "<KB>KB / <KB>KB" counter. The counter is drawn through the
+            DSS console while receive is paused, so -d is the way to
+            measure how much console work costs on a given link.
   When the local file exists, FTP asks [R]esume / [O]verwrite / [C]ancel;
   -y (or -f) forces overwrite and -r forces resume, with no prompt.
 

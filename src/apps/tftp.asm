@@ -230,16 +230,39 @@ PRINT_HL_DEC
 	RET
 
 ; In-place download progress: "<KB>KB / ?". KB = EXPECTED_BLOCK/2 (block*512/1024).
-; The total is "?" because TFTP does not negotiate tsize here. Leading 0x0A
-; resets the X column (this console) so each block overwrites the same line.
+; The total is "?" because TFTP does not negotiate tsize here. The line starts
+; with 0x0D, which resets the X column (this console) so each block overwrites
+; the same line. Built in one buffer and pushed with a single DSS_PCHARS; a
+; repaint whose KB figure has not moved — every other 512-byte block — is
+; skipped, since it would redraw the very same characters.
 PRINT_PROGRESS_KB
-	PRINT	MSG_CR_ONLY		; 0x0A -> column 0
 	LD	HL,(EXPECTED_BLOCK)
 	SRL	H
 	RR	L			; HL = blocks / 2 = KB
-	CALL	PRINT_HL_DEC
-	PRINT	MSG_KB_UNK		; "KB / ?"
+	LD	A,(LAST_PROGRESS_KB)
+	CP	L
+	JR	NZ,.PAINT
+	LD	A,(LAST_PROGRESS_KB+1)
+	CP	H
+	RET	Z			; same figure: the line on screen is already it
+.PAINT
+	LD	(LAST_PROGRESS_KB),HL
+	LD	A,0x0D			; reset X to column 0 (this console: 0x0D=CR, 0x0A=LF)
+	LD	(PROGRESS_LINE),A
+	LD	DE,PROGRESS_LINE+1
+	CALL	UTIL.UTOA		; digits + NUL; DE ends past the NUL
+	DEC	DE			; overwrite the NUL with the tail
+	LD	HL,MSG_KB_UNK
+	LD	BC,7			; "KB / ?" + NUL
+	LDIR
+	PRINT	PROGRESS_LINE
 	RET
+
+; Last drawn KB figure. Lives in the code segment (not BSS): CLEAR_BSS zeroes
+; BSS and the first block is at 0 KB, which would then be taken for "already
+; drawn" and the opening repaint skipped.
+LAST_PROGRESS_KB
+	DW 0xFFFF
 
 PRINT_A_HEX
 	LD	C,A
@@ -1687,7 +1710,8 @@ HOST_BUFF	EQU URL_BUFF + URL_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_SIZE
 REMOTE_FILE	EQU PORT_BUFF + PORT_SIZE
 OUT_FILE	EQU REMOTE_FILE + REMOTE_FILE_SIZE
-TFTP_BSS_END	EQU OUT_FILE + LOCAL_FILE_SIZE
+PROGRESS_LINE	EQU OUT_FILE + LOCAL_FILE_SIZE
+TFTP_BSS_END	EQU PROGRESS_LINE + 16
 PACKET_BUFFER	EQU WIN2_BASE
 ACK_BUFFER	EQU PACKET_BUFFER + TFTP_PACKET_SIZE
 	; PACKET_BUFFER is the DSS_WRITE source on download and DSS_READ_FILE

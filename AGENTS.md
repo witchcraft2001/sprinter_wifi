@@ -185,7 +185,11 @@ runs all host-side harnesses. For UART FIFO/profile changes, also run
 2.2.1 and 2.2.2 variants. It checks the universal/2.2.1 trigger-8 compatibility
 path, the forced-2.2.2 trigger-4 path, and verifies that client executables do
 not contain `AT+UART_CUR` (ESP-side UART negotiation belongs only to NETUP).
-For DSS assembly, also assemble every touched entry program and
+For transfer-progress changes, run `tools/test-progress.sh`; it executes the
+real `TPUT.PROGRESS` render path against captured console output and checks KB
+conversion, decimal formatting up to seven digits, the cached total tail, the
+unchanged-value repaint skip, and that RTS is paused exactly once per painted
+line. For DSS assembly, also assemble every touched entry program and
 smoke-test on Sprinter DSS, emulator, or hardware. For DOS utilities, compile
 the changed program and verify behavior against an ESP8266 running ESP-AT
 firmware. For hardware edits, run EasyEDA ERC/DRC, inspect ISA/UART signal

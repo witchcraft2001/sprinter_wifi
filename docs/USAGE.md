@@ -38,11 +38,14 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   its alias `-f`) is used. TFTP has no resume.
 - `TFTP.EXE host[:port] PUT local-file [-o remote-name]` uploads one file over
   TFTP.
-- `FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r]`
+- `FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r] [-d]`
   downloads one file over passive FTP using `RETR`. Without `-o`, the local name
   is the basename of the remote file. If the local file exists, FTP asks
   `[R]esume / [O]verwrite / [C]ancel`; `-y` (or `-f`) overwrites without
-  prompting and `-r` resumes (appends, FTP `REST`) without prompting.
+  prompting and `-r` resumes (appends, FTP `REST`) without prompting. `-d`
+  replaces the in-place `<KB>KB / <KB>KB` counter with one dot per write, the
+  output FTP had before the counter existed; use it to measure what the
+  console repaint costs on a given link.
 - `FTP.EXE host[:port] PUT local-file [-o remote-name] [-u user] [-p pass]`
   uploads one file over passive FTP using `STOR`. Without `-o`, the remote name
   is the basename of the local file.
@@ -50,11 +53,13 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   ESP-AT multi-connection mode, enters passive mode and prints a `LIST` or
   `NLST` directory listing.
 - `PING.EXE host` checks host reachability using ESP-AT `AT+PING`.
-- `WGET.EXE url [-o output] [-y|-f] [-r]` downloads an http:// resource to a
+- `WGET.EXE url [-o output] [-y|-f] [-r] [-d]` downloads an http:// resource to a
   local DSS file. Without `-o`, the output name is derived from the URL path. If
   the file exists, WGET asks `[R]esume / [O]verwrite / [C]ancel`; `-y` (or `-f`)
   overwrites without prompting and `-r` resumes (appends, HTTP Range) without
-  prompting.
+  prompting. `-d` replaces the in-place `<KB>KB / <KB>KB` counter with one dot
+  per write, the output WGET had before the counter existed; use it to measure
+  what the console repaint costs on a given link.
 - `NTP.EXE` sets DSS time over UDP NTP using the `NET_TZ`/`NET_NTP` values
   published by `NETUP.EXE`.
 - `NETPROBE.EXE` checks low-level UART and ESP-AT firmware response. It is a

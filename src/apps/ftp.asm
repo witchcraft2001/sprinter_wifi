@@ -532,6 +532,12 @@ PARSE_CMD_LINE
 		JP	NC,.RESUME_ARG
 		PUSH	HL
 		PUSH	BC
+		CALL	IS_ARG_DOTS
+		POP	BC
+		POP	HL
+		JP	NC,.DOTS_ARG
+		PUSH	HL
+		PUSH	BC
 		CALL	IS_ARG_HELP
 		POP	BC
 		POP	HL
@@ -615,6 +621,10 @@ PARSE_CMD_LINE
 .RESUME_ARG
 		LD	A,1
 		LD	(FORCE_RESUME),A
+		JP	.NEXT_ARG
+.DOTS_ARG
+		LD	A,1
+		LD	(DOTS_FLAG),A
 		JP	.NEXT_ARG
 .DONE
 		LD	A,(HOST_BUFF)
@@ -745,6 +755,16 @@ IS_ARG_RESUME
 		CALL	UTIL.STRCMP_CI
 		RET	NC
 		LD	HL,SWITCH_RESUME_SLASH
+		LD	DE,ARG_BUFF
+		JP	UTIL.STRCMP_CI
+
+; Dot-progress flag: -d / /d (one dot per write instead of the KB counter).
+IS_ARG_DOTS
+		LD	HL,SWITCH_DOTS_DASH
+		LD	DE,ARG_BUFF
+		CALL	UTIL.STRCMP_CI
+		RET	NC
+		LD	HL,SWITCH_DOTS_SLASH
 		LD	DE,ARG_BUFF
 		JP	UTIL.STRCMP_CI
 
@@ -2002,13 +2022,32 @@ SEND_DATA_TRANSFER
 		OR	A
 		SBC	HL,BC
 		LD	(DATA_ACCUM_LEN),HL
-		LD	HL,DATA_TOTAL
-		LD	DE,DATA_EXPECTED
-		CALL	TPUT.PROGRESS
+		CALL	PROGRESS_TICK
 		JR	.SEND
 .DONE
 		PRINT	WCOMMON.LINE_END
 		XOR	A
+		RET
+
+; ------------------------------------------------------
+; PROGRESS_TICK: per-write progress output for the data loops.
+; Default: repaint the in-place "<KB>KB / <KB>KB" counter.
+; Under -d: one dot and nothing else — the output FTP had before the counter
+; existed. The counter is drawn through the DSS console with RX paused, so -d
+; is what makes its cost measurable against the same transfer.
+; Must return CF=0: callers propagate CF as success/fail.
+; ------------------------------------------------------
+PROGRESS_TICK
+		LD	A,(DOTS_FLAG)
+		AND	A
+		JR	NZ,.DOT
+		LD	HL,DATA_TOTAL
+		LD	DE,DATA_EXPECTED
+		JP	TPUT.PROGRESS
+.DOT
+		LD	A,'.'
+		CALL	PUT_CHAR
+		OR	A			; CF=0 (success)
 		RET
 
 HANDLE_DATA_BUFFER
@@ -2238,9 +2277,7 @@ WRITE_DATA_BUFFER
 		LD	A,(PROGRESS_SUPPRESS)
 		AND	A
 		JR	NZ,.NO_PROGRESS
-		LD	HL,DATA_TOTAL
-		LD	DE,DATA_EXPECTED
-		CALL	TPUT.PROGRESS
+		CALL	PROGRESS_TICK
 .NO_PROGRESS
 		XOR	A
 		RET
@@ -3086,6 +3123,10 @@ SWITCH_RESUME_DASH
 		DB "-r",0
 SWITCH_RESUME_SLASH
 		DB "/r",0
+SWITCH_DOTS_DASH
+		DB "-d",0
+SWITCH_DOTS_SLASH
+		DB "/d",0
 SWITCH_HELP_Q_SLASH
 		DB "/?",0
 SWITCH_HELP_Q_DASH
@@ -3129,6 +3170,8 @@ FORCE_OVERWRITE
 		DB 0
 FORCE_RESUME
 		DB 0
+DOTS_FLAG
+		DB 0				; 1 = -d: one dot per write, no KB counter
 OUTPUT_ABORTED
 		DB 0
 DATA_EXPECTED_SEEN
@@ -3180,7 +3223,8 @@ CONTROL_PRINT_SUPPRESS
 ; Set while RECV_CONTROL_REPLY writes early data-link bytes (file bytes that
 ; beat the 150 reply). The transfer size is not yet known, so a progress render
 ; here would show a bogus "?KB" total and, lacking a trailing newline, glue the
-; 150 reply onto it. WRITE_DATA_BUFFER skips TPUT.PROGRESS when this is set.
+; 150 reply onto it. WRITE_DATA_BUFFER skips PROGRESS_TICK when this is set,
+; under -d as well: a dot there would land in front of the 150 reply too.
 PROGRESS_SUPPRESS
 		DB 0
 DEFERRED_CONTROL_SEEN
@@ -3259,6 +3303,7 @@ OVL_MSG_USAGE
 		DB "  -y, -f    overwrite",13,10
 		DB "  -r        resume (append)",13,10
 		DB "  -l, -n    list (LIST / NLST)",13,10
+		DB "  -d        dot progress instead of the KB counter",13,10
 		DB "  /?        help",0
 
 ; Quiet recovery after a mid-transfer error, WITHOUT a hardware reset (which

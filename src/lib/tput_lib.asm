@@ -94,6 +94,11 @@ START
 	LD	(T_START),HL
 	LD	A,B
 	LD	(T_START+2),A
+	; A new transfer restarts the progress line: drop the cached "KB / <total>KB"
+	; tail and the last drawn value so the first PROGRESS call always paints.
+	XOR	A
+	LD	(SUF_OK),A
+	LD	(SHOWN),A
 	RET
 
 ; ------------------------------------------------------
@@ -331,68 +336,222 @@ DIV32_BY_DE
 ; Trashes everything.
 ; ------------------------------------------------------
 PROGRESS
-	; Rendering (two 32-bit divides + ~15 chars) is far slower than the old single
-	; dot and, run every chunk, would stall the UART read long enough to overrun
-	; the 16-byte RX FIFO. Keep the common receive guard around it: both current
-	; firmware profiles explicitly lower RTS here, since auto-only AFE proved
-	; insufficient for real 2.2.2 +IPD bursts. UART_RX_PAUSE/RESUME preserve
-	; HL/DE. MUST return CF=0 — callers propagate CF as success/fail.
-	CALL	@WIFI.UART_RX_PAUSE
-	CALL	.RENDER
-	CALL	@WIFI.UART_RX_RESUME
+	PUSH	DE			; total ptr
+	CALL	KB_AT_HL		; B:HL = downloaded KB
+	LD	(CUR_KB),HL
+	LD	A,B
+	LD	(CUR_KB+2),A
+	POP	HL			; total ptr
+	CALL	SYNC_SUFFIX		; CF=1 -> tail rebuilt, repaint is mandatory
+	JR	C,.REPAINT
+	LD	A,(SHOWN)
+	AND	A
+	JR	Z,.REPAINT
+	; Same total and the same KB figure: the line already on screen is
+	; character-for-character what a repaint would produce, so skip it (and
+	; skip the RTS pause with it). This is not decimation — every KB step is
+	; still drawn; only the redundant redraws of an unchanged number are
+	; dropped, which is most of them when ESP delivers sub-KB +IPD chunks.
+	LD	HL,(LAST_KB)
+	LD	DE,(CUR_KB)
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.REPAINT
+	LD	A,(LAST_KB+2)
+	LD	HL,CUR_KB+2
+	CP	(HL)
+	JR	NZ,.REPAINT
 	OR	A			; CF=0 (success)
 	RET
-.RENDER
-	PUSH	DE			; total ptr
-	LD	A,0x0D			; reset X to column 0 (this console: 0x0D=CR, 0x0A=LF)
-	LD	C,DSS_PUTCHAR
+.REPAINT
+	CALL	BUILD_LINE
+	; A console repaint is far slower than the old single dot and would stall
+	; the UART read long enough to overrun the 16-byte RX FIFO. Keep the common
+	; receive guard around it: both current firmware profiles explicitly lower
+	; RTS here, since auto-only AFE proved insufficient for real 2.2.2 +IPD
+	; bursts. The line is formatted BEFORE the pause, so RTS now stays down for
+	; a single DSS_PCHARS instead of a divide-and-putchar sequence.
+	; MUST return CF=0 — callers propagate CF as success/fail.
+	CALL	@WIFI.UART_RX_PAUSE
+	LD	HL,LINE
+	LD	C,DSS_PCHARS
 	RST	DSS
-	CALL	.KB_AT_HL		; downloaded KB
-	LD	HL,S_PROG_MID		; "KB / "
-	CALL	.PUTS
-	POP	HL			; total ptr
-	LD	A,(HL)
-	INC	HL
-	OR	(HL)
-	INC	HL
-	OR	(HL)
-	INC	HL
-	OR	(HL)
-	DEC	HL
-	DEC	HL
-	DEC	HL
-	JR	NZ,.HAVE_TOTAL
-	LD	A,'?'			; total unknown
-	LD	C,DSS_PUTCHAR
-	RST	DSS
-	JR	.TAIL
-.HAVE_TOTAL
-	CALL	.KB_AT_HL		; total KB
-.TAIL
-	LD	HL,S_PROG_KB		; "KB"
-	JP	.PUTS
+	CALL	@WIFI.UART_RX_RESUME
+	LD	HL,(CUR_KB)
+	LD	(LAST_KB),HL
+	LD	A,(CUR_KB+2)
+	LD	(LAST_KB+2),A
+	LD	A,1
+	LD	(SHOWN),A
+	OR	A			; CF=0 (success)
+	RET
 
-; Print the 4-byte LE value at (HL) divided by 1024 (i.e. in KB).
-.KB_AT_HL
-	LD	DE,SCRATCH
+; ------------------------------------------------------
+; SYNC_SUFFIX: keep the cached "KB / <totalKB>KB" tail in step with the total.
+; The total is constant for a whole transfer, so its KB conversion and decimal
+; formatting run once instead of on every repaint. FTP learns the size only from
+; the 150 reply, so the total can still change mid-transfer.
+;   In:  HL = ptr to total byte count (4-byte LE; all-zero -> "?").
+;   Out: CF=1 when the tail was rebuilt (forces a repaint), CF=0 when unchanged.
+; ------------------------------------------------------
+SYNC_SUFFIX
+	PUSH	HL
+	LD	A,(SUF_OK)
+	AND	A
+	JR	Z,.BUILD
+	LD	DE,LAST_TOT
+	LD	B,4
+.CMP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.BUILD
+	INC	HL
+	INC	DE
+	DJNZ	.CMP
+	POP	HL
+	OR	A			; CF=0: cached tail still valid
+	RET
+.BUILD
+	POP	HL			; total ptr
+	LD	DE,LAST_TOT
+	PUSH	HL
 	LD	BC,4
 	LDIR
-	LD	DE,1024
-	CALL	DIV32_BY_DE
-	LD	HL,(SCRATCH)
-	LD	DE,(SCRATCH+2)
-	JP	PRINT_DEC_32
-
-.PUTS
+	POP	HL
+	LD	IX,SUFFIX
+	LD	DE,S_PROG_MID		; "KB / "
+	CALL	APPEND_STR
 	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	JR	NZ,.HAVE_TOTAL
+	LD	(IX+0),'?'		; total unknown
+	INC	IX
+	JR	.TAIL
+.HAVE_TOTAL
+	LD	HL,LAST_TOT
+	CALL	KB_AT_HL		; B:HL = total KB
+	CALL	FORMAT_KB
+.TAIL
+	LD	DE,S_PROG_KB		; "KB"
+	CALL	APPEND_STR
+	LD	(IX+0),0
+	LD	A,1
+	LD	(SUF_OK),A
+	SCF				; tail changed -> repaint
+	RET
+
+; Build "<CR><dlKB>" + cached tail into LINE, ready for one DSS_PCHARS.
+BUILD_LINE
+	LD	IX,LINE
+	LD	(IX+0),0x0D		; reset X to column 0 (this console: 0x0D=CR, 0x0A=LF)
+	INC	IX
+	LD	HL,(CUR_KB)
+	LD	A,(CUR_KB+2)
+	LD	B,A
+	CALL	FORMAT_KB
+	LD	DE,SUFFIX
+	CALL	APPEND_STR
+	LD	(IX+0),0
+	RET
+
+; APPEND_STR: copy the ASCIIZ string at (DE) to (IX), terminator excluded.
+APPEND_STR
+	LD	A,(DE)
 	AND	A
 	RET	Z
-	PUSH	HL
-	LD	C,DSS_PUTCHAR
-	RST	DSS
-	POP	HL
+	LD	(IX+0),A
+	INC	IX
+	INC	DE
+	JR	APPEND_STR
+
+; ------------------------------------------------------
+; KB_AT_HL: 4-byte LE value at (HL) -> B:HL = value / 1024.
+; KB = value >> 10 = drop the low byte, then >> 2 — avoids a 32-iteration long
+; division on every progress repaint.
+; ------------------------------------------------------
+KB_AT_HL
 	INC	HL
-	JR	.PUTS
+	LD	E,(HL)			; byte 1
+	INC	HL
+	LD	D,(HL)			; byte 2
+	INC	HL
+	LD	B,(HL)			; byte 3
+	EX	DE,HL			; HL = bytes 2:1 (= value >> 8)
+	SRL	B
+	RR	H
+	RR	L
+	SRL	B
+	RR	H
+	RR	L
+	RET
+
+; ------------------------------------------------------
+; FORMAT_KB: write B:HL (24-bit, the full range of a 4 GB byte count in KB) as
+; unsigned decimal at (IX). No leading zeros, no terminator. Repeated
+; subtraction of a power of ten per digit: ~2.5k T-states worst case, where the
+; shared PRINT_DEC_32 spends a 32-iteration long division on EVERY digit.
+;   Out: IX past the last digit. Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+FORMAT_KB
+	XOR	A
+	LD	(FMT_STARTED),A
+	LD	DE,0x4240		; 1000000
+	LD	C,0x0F
+	CALL	.DIGIT
+	LD	DE,0x86A0		; 100000
+	LD	C,0x01
+	CALL	.DIGIT
+	LD	C,0
+	LD	DE,10000
+	CALL	.DIGIT
+	LD	DE,1000
+	CALL	.DIGIT
+	LD	DE,100
+	CALL	.DIGIT
+	LD	DE,10
+	CALL	.DIGIT
+	LD	A,L			; remainder < 10: always printed
+	ADD	A,'0'
+	LD	(IX+0),A
+	INC	IX
+	RET
+
+; One digit: subtract C:DE from B:HL while it fits, emit the count.
+.DIGIT
+	XOR	A
+	LD	(FMT_DIG),A
+.SUB
+	OR	A
+	SBC	HL,DE
+	LD	A,B
+	SBC	A,C
+	JR	C,.RESTORE
+	LD	B,A
+	LD	A,(FMT_DIG)
+	INC	A
+	LD	(FMT_DIG),A
+	JR	.SUB
+.RESTORE
+	ADD	HL,DE			; undo the failed subtract (B was not stored)
+	LD	A,(FMT_DIG)
+	AND	A
+	JR	NZ,.EMIT
+	LD	A,(FMT_STARTED)
+	AND	A
+	RET	Z			; leading zero: nothing printed yet
+	XOR	A
+.EMIT
+	ADD	A,'0'
+	LD	(IX+0),A
+	INC	IX
+	LD	A,1
+	LD	(FMT_STARTED),A
+	RET
 
 S_PROG_MID	DB "KB / ",0
 S_PROG_KB	DB "KB",0
@@ -410,6 +569,18 @@ T_START		DS 3,0
 T_ELAPSED	DS 3,0
 HBUF		DS 4,0
 SCRATCH		DS 4,0
+
+; Progress-line state. LINE is at most CR + 7 digits + "KB / " + 7 digits +
+; "KB" + NUL = 23 bytes; SUFFIX holds the cached tail alone.
+CUR_KB		DS 3,0
+LAST_KB		DS 3,0
+LAST_TOT	DS 4,0
+SUF_OK		DB 0
+SHOWN		DB 0
+FMT_DIG		DB 0
+FMT_STARTED	DB 0
+SUFFIX		DS 16,0
+LINE		DS 24,0
 
 	ENDMODULE
 

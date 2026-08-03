@@ -70,15 +70,17 @@ TFTP.EXE host[:port] GET remote [-o local] [-y|-f]
                  download one file over TFTP (-y/-f overwrite; no resume)
 TFTP.EXE host[:port] PUT local [-o remote]
                  upload one file over TFTP
-FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r]
-                 download one file over passive FTP (-y/-f overwrite, -r resume)
+FTP.EXE host[:port] file [-o output] [-u user] [-p pass] [-y|-f] [-r] [-d]
+                 download one file over passive FTP (-y/-f overwrite, -r resume,
+                 -d dot progress instead of the KB counter)
 FTP.EXE host[:port] PUT local [-o remote] [-u user] [-p pass]
                  upload one file over passive FTP
 FTP.EXE host[:port] [path] -l|-n [-u user] [-p pass]
                  login, enter passive mode and print a LIST/NLST listing
 PING.EXE host    test host reachability using ESP-AT AT+PING
-WGET.EXE url [-o output] [-y|-f] [-r]
-                 download an http:// URL to a local file (-y/-f overwrite, -r resume)
+WGET.EXE url [-o output] [-y|-f] [-r] [-d]
+                 download an http:// URL to a local file (-y/-f overwrite, -r resume,
+                 -d dot progress instead of the KB counter)
 NTP.EXE          set DSS time using NET_TZ/NET_NTP published by NETUP.EXE
 TELNET.EXE host[:port] | host [port]
                  ANSI Telnet client with Zmodem and Ymodem download/upload
