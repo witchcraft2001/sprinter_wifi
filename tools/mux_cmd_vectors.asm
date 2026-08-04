@@ -230,6 +230,23 @@ TEST_START
 	LD	A,0xFF
 	LD	(UNET.PEND_CH),A
 
+; ------------------------------------------------------------------
+; Vector 9: compact SEND diagnostics retain the transport reason and last
+; complete response line without the removed byte-trace telemetry.
+; ------------------------------------------------------------------
+	LD	A,9
+	LD	(STAGE),A
+	LD	A,4
+	LD	(UNET.SEND_RES),A
+	LD	HL,LAST_LINE
+	LD	DE,TCP.LINE_BUFFER
+	LD	BC,LAST_LINE_LEN
+	LDIR
+	CALL	UNET.NOTE_SEND_FAILURE
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,EXP_LASTERR
+	CALL	CHECK_ASCIIZ
+
 	JP	PASSED
 
 ; Patch the routine at HL with "XOR A / RET" (success, CF=0).
@@ -289,6 +306,18 @@ CHECK_CMD
 	INC	DE
 	JR	.loop
 
+; Compare ASCIIZ at HL with ASCIIZ at DE.
+CHECK_ASCIIZ
+.loop
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,FAILED
+	AND	A
+	RET	Z
+	INC	HL
+	INC	DE
+	JR	.loop
+
 ; Argument strings, staged into window 2 at startup (see HOST_STR below).
 HOST_SRC	DB "192.168.1.36",0
 	DS 20 - ($ - HOST_SRC),0
@@ -310,5 +339,8 @@ EXP_TCP1	DB "AT+CIPSTART=1,",34,"TCP",34,",",34,"192.168.1.36",34,",9100",13,10,
 EXP_UDP1	DB "AT+CIPSTART=1,",34,"UDP",34,",",34,"192.168.1.36",34,",9099,1070,2",13,10,0
 EXP_UDP0	DB "AT+CIPSTART=0,",34,"UDP",34,",",34,"192.168.1.36",34,",9099,5000,2",13,10,0
 EXP_CLOSE1	DB "AT+CIPCLOSE=1",13,10,0
+LAST_LINE	DB "OK",0
+LAST_LINE_LEN	EQU $-LAST_LINE
+EXP_LASTERR	DB "send failed 4: OK",0
 
 	END TEST_START

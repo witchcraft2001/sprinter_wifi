@@ -458,15 +458,6 @@ F_SEND
 	CALL	CLEAR_PEND		; any real outcome ends the transaction
 	CALL	CONSUME_CANCEL
 	JR	C,.cancelled_de
-	; LASTERR must describe the failed window itself, so snapshot the trace
-	; counters before the recovery ladder reads more bytes through the same
-	; instrumented reader.
-	LD	HL,(TCP.SEND_TRACE_TOTAL)
-	LD	(SEND_GOT),HL
-	LD	A,(TCP.SEND_TRACE_N)
-	LD	(SEND_GOT_N),A
-	LD	A,0xFF
-	LD	(PROBE_RES),A		; "not probed"
 	; Only silence after the complete payload left the host is safe to probe.
 	; Before the '>' prompt, an AT probe can itself become CIPSEND payload if the
 	; prompt was merely late. While a +IPD payload is incomplete, its remaining
@@ -572,89 +563,28 @@ RESOLVE_PENDING
 	SCF
 	RET
 
-; Record WHY a send failed where LASTERR will find it. Every send failure maps
-; to NERR_SEND, and RS_BUFF still holds the response to the last AT command, so
-; without this a caller cannot tell an ESP refusal from a prompt timeout.
-; In: SEND_RES = transport result code. TCP.LINE_BUFFER holds the last response
-; line of this send (cleared when the send started, so it is never stale).
+; Keep LASTERR useful without retaining the old verbose trace/tail telemetry.
+; SEND_RES is a one-digit internal RES_* code and LINE_BUFFER holds the last
+; complete response/probe line (empty when the ESP produced none).
 NOTE_SEND_FAILURE
 	LD	HL,WIFI.RS_BUFF
 	LD	DE,MSG_SEND_FAIL
 	CALL	TCP.APPEND_STR
-	PUSH	HL
 	LD	A,(SEND_RES)
-	LD	L,A
-	LD	H,0
-	LD	DE,TCP.NUM_BUFFER
-	CALL	UTIL.UTOA
-	POP	HL
-	LD	DE,TCP.NUM_BUFFER
-	CALL	TCP.APPEND_STR
-	LD	DE,MSG_SEND_LINE
-	CALL	TCP.APPEND_STR
+	ADD	A,'0'
+	LD	(HL),A
+	INC	HL
+	LD	A,(TCP.LINE_BUFFER)
+	AND	A
+	JR	Z,.done
+	LD	(HL),':'
+	INC	HL
+	LD	(HL),' '
+	INC	HL
 	LD	DE,TCP.LINE_BUFFER
 	CALL	TCP.APPEND_STR
-	; How much the ESP said at all during this window, and its first bytes:
-	; "got=0" is a silent module, a "busy p..." is a refused command, and a
-	; large count with binary bytes is peer data we were still swallowing.
-	LD	DE,MSG_SEND_LSR
-	CALL	TCP.APPEND_STR
-	PUSH	HL
-	LD	A,(WIFI.CMD_LSR_ACCUM)	; 2=overrun, 4=parity, 8=framing, 16=break
-	LD	L,A
-	LD	H,0
-	LD	DE,TCP.NUM_BUFFER
-	CALL	UTIL.UTOA
-	POP	HL
-	LD	DE,TCP.NUM_BUFFER
-	CALL	TCP.APPEND_STR
-	LD	DE,MSG_SEND_GOT
-	CALL	TCP.APPEND_STR
-	PUSH	HL
-	LD	HL,(SEND_GOT)
-	LD	DE,TCP.NUM_BUFFER
-	CALL	UTIL.UTOA
-	POP	HL
-	LD	DE,TCP.NUM_BUFFER
-	CALL	TCP.APPEND_STR
-	LD	DE,MSG_SEND_SEP
-	CALL	TCP.APPEND_STR
-	LD	A,(SEND_GOT_N)
-	LD	DE,TCP.SEND_TRACE
-	CALL	APPEND_PRINTABLE
-	; ... and the last bytes before the silence, oldest first.
-	LD	DE,MSG_SEND_TAIL
-	CALL	TCP.APPEND_STR
-	CALL	APPEND_TAIL
-	; The recovery ladder's verdict on the module itself.
-	LD	DE,MSG_SEND_ESP
-	CALL	TCP.APPEND_STR
-	CALL	VERDICT_STR
-	CALL	TCP.APPEND_STR
+.done
 	LD	(HL),0
-	RET
-
-; Out: DE = short word describing what the post-failure probe learned.
-VERDICT_STR
-	LD	A,(TCP.WSO_FLAGS)
-	BIT	1,A
-	LD	DE,MSG_V_REBOOT
-	RET	NZ
-	LD	A,(PROBE_RES)
-	CP	0xFF
-	LD	DE,MSG_V_NONE
-	RET	Z			; failure was explicit, no probe was run
-	CP	RES_TX_TIMEOUT
-	LD	DE,MSG_V_TXBLOCK
-	RET	Z			; our TX stalled: CTS held low by the module
-	CALL	PROBE_ALIVE
-	LD	DE,MSG_V_ALIVE
-	RET	NC
-	LD	A,(TCP.WSO_FLAGS)
-	BIT	2,A
-	LD	DE,MSG_V_BUSY
-	RET	NZ
-	LD	DE,MSG_V_DEAD
 	RET
 
 ; CF=0 when the probe reached the module's AT parser: a clean OK, or an
@@ -670,69 +600,6 @@ PROBE_ALIVE
 	SCF
 	RET
 
-; Append the rolling tail of the send window at (HL), oldest byte first. Until
-; the window has produced SEND_TAIL_SIZE bytes the buffer is still linear.
-APPEND_TAIL
-	LD	DE,(SEND_GOT)
-	LD	A,D
-	AND	A
-	JR	NZ,.full
-	LD	A,E
-	CP	TCP.SEND_TAIL_SIZE
-	JR	NC,.full
-	LD	DE,TCP.SEND_TAIL	; A = count, buffer not wrapped yet
-	JP	APPEND_PRINTABLE
-.full
-	LD	B,TCP.SEND_TAIL_SIZE
-	LD	A,(TCP.SEND_TAIL_POS)	; oldest byte sits at the write cursor
-	LD	E,A
-	LD	D,0
-	LD	IX,TCP.SEND_TAIL
-	ADD	IX,DE
-	LD	DE,TCP.SEND_TAIL + TCP.SEND_TAIL_SIZE
-.byte
-	LD	A,(IX+0)
-	CP	32
-	JR	C,.dot
-	CP	127
-	JR	C,.store
-.dot
-	LD	A,'.'
-.store
-	LD	(HL),A
-	INC	HL
-	INC	IX
-	PUSH	HL
-	PUSH	IX
-	POP	HL
-	OR	A
-	SBC	HL,DE			; past the end?
-	POP	HL
-	JR	NZ,.next
-	LD	IX,TCP.SEND_TAIL
-.next
-	DJNZ	.byte
-	RET
-
-; Append A bytes from (DE) at (HL), non-printables as '.'. Out: HL past the last.
-APPEND_PRINTABLE
-	AND	A
-	RET	Z
-	LD	B,A
-.byte
-	LD	A,(DE)
-	CP	32
-	JR	C,.dot
-	CP	127
-	JR	C,.store
-.dot
-	LD	A,'.'
-.store
-	LD	(HL),A
-	INC	HL
-	INC	DE
-	DJNZ	.byte
-	RET
 
 ; Probe whether the ESP is responsive after a silent timeout, WITHOUT losing
 ; peer data: the reply is read through TCP.WAIT_SEND_OK, which stashes any +IPD
@@ -801,19 +668,7 @@ REBOOT_EVENT
 ; A bare CRLF is legitimately ignored by ESP-AT, so probe with a command that
 ; always answers when the module is listening at all.
 CMD_PROBE_AT	DB "AT",13,10,0
-MSG_SEND_FAIL	DB "send failed, res=",0
-MSG_SEND_LINE	DB ", last: ",0
-MSG_SEND_LSR	DB ", lsr=",0
-MSG_SEND_GOT	DB ", got=",0
-MSG_SEND_SEP	DB ": ",0
-MSG_SEND_TAIL	DB " end: ",0
-MSG_SEND_ESP	DB " esp=",0
-MSG_V_NONE	DB "-",0
-MSG_V_ALIVE	DB "alive",0
-MSG_V_REBOOT	DB "reboot",0
-MSG_V_BUSY	DB "busy",0
-MSG_V_TXBLOCK	DB "tx-block",0
-MSG_V_DEAD	DB "mute",0	; wedged past the probe's patience - NOT proof of death
+MSG_SEND_FAIL	DB "send failed ",0
 MSG_CONN_SILENT	DB "connect failed: no ESP response",0
 
 ; ======================================================
@@ -1548,8 +1403,6 @@ OPEN_RETRY
 	LD	(BUSY_RETRY),A
 	LD	A,1
 	LD	(CONN_TRY),A		; one ladder retry per call
-	LD	A,0xFF
-	LD	(PROBE_RES),A		; diagnostics belong to this CONNECT only
 	XOR	A
 	LD	(TCP.WSO_FLAGS),A
 .try
@@ -1688,11 +1541,11 @@ MUX_OPEN
 ; In: HL=ASCIIZ command, BC=per-byte timeout. Out: normal RES_*/CF contract.
 MUX_TX_COMMAND
 	LD	(TCP.WSO_TIMEOUT),BC
-	; SEND_TRACE_RESET and the pending-payload rescue both use HL internally.
+	; SEND_STATE_RESET and the pending-payload rescue both use HL internally.
 	; Keep the caller's command pointer until the actual UART transmit; losing
 	; it here makes UART_TX_STRING send from address zero instead of CMD_BUFFER.
 	PUSH	HL
-	CALL	TCP.SEND_TRACE_RESET
+	CALL	TCP.SEND_STATE_RESET
 	XOR	A
 	LD	(WIFI.RS_BUFF),A
 	LD	(TCP.LINE_BUFFER),A
@@ -2299,9 +2152,7 @@ ARG_IX			DW 0
 ARG_IY			DW 0
 SEND_DONE		DW 0
 CHUNK_LEN		DW 0
-SEND_RES		DB 0		; transport result of the failing send (LASTERR)
-SEND_GOT		DW 0		; window byte count, snapshot before the probe
-SEND_GOT_N		DB 0		; captured bytes in that window
+SEND_RES		DB 0		; transport result retained for compact LASTERR
 SEND_TRY		DB 0		; ladder reissue budget of the current F_SEND
 CONN_TRY		DB 0		; ladder retry budget of the current OPEN_RETRY
 ; Suspended-send transaction (CAP_ASYNCSEND).
@@ -2309,7 +2160,7 @@ PEND_CH			DB 0xFF		; channel of the suspended send, 0xFF = none
 PEND_BUF		DW 0		; resume-contract reference: same buffer...
 PEND_LEN		DW 0		; ...and same length must be passed again
 OPT_SLICE		DW 0		; UNET_OPT_SENDSLICE value, 0 = blocking
-PROBE_RES		DB 0xFF		; PROBE_AT outcome, 0xFF = not probed
+PROBE_RES		DB 0		; last PROBE_AT outcome (used by recovery)
 PROBE_LEFT		DB 0
 PROBE_ROUNDS		EQU 5	; x (1.5 s wait + 0.5 s pause) = ~10 s patience
 PROBE_BYTE_TIMEOUT EQU 1500

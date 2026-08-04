@@ -320,29 +320,17 @@ A diagnostic aid, like the ESP debug tail in the fido binkp client.
 After a failed SEND the buffer instead holds
 
 ```
-send failed, res=<n>, last: <line>, lsr=<n>, got=<n>: <first bytes> end: <last bytes> esp=<verdict>
+send failed <n>: <line>
 ```
 
-because every send failure maps to the single status `NERR_SEND` while the raw
-AT buffer still describes the previous command. `res` is the transport code
-(1 = ESP replied `ERROR`, 2 = `FAIL`, 3 = transmit timeout, 4 = no response),
-`last` is the final response line of that send (empty when none arrived),
-`lsr` accumulates 16550 line errors of this window (2 = overrun, 4 = parity,
-8 = framing, 16 = break), `got` counts every byte the window received with its
-first and last bytes shown (non-printables as dots). `esp=` is the verdict of
-the post-failure recovery probe: `alive` (the module answers AT - the command
-itself was lost), `busy` (still answering `busy p...`), `reboot` (its boot
-banner was seen: the session's links are gone), `tx-block` (our transmit
-stalled - CTS held low), `mute` (no reaction within the probe's ~10 s), `-`
-(the failure was an explicit ERROR/FAIL, no probe was run).
-
-`mute` is not proof the module died. ESP-AT serves the AT parser and ALL UART
-output from one task; in `CIPMUX=1` under bidirectional load that task can
-block inside a command for seconds - `+IPD` delivery stops with it - and then
-recover on its own (observed on real 2.2.2 hardware: after such a stall the
-module is still associated and still at its session baud). A consumer that can
-retry at the protocol level should treat `mute` as "try again shortly", not as
-a dead link.
+because every transport failure maps to the single public status `NERR_SEND`.
+`n` is the internal transport result (1 = ESP replied `ERROR`, 2 = `FAIL`,
+3 = transmit timeout, 4 = no response); the optional line is the last complete
+ESP response or recovery-probe line. The recovery probe still detects a late
+`SEND OK` and module reboot exactly as before, but verbose byte counts,
+first/tail capture, LSR formatting and textual probe verdicts are deliberately
+not retained in the DLL image. This keeps `LASTERR` actionable while reserving
+space for transport functionality.
 
 Silent connect timeouts trigger a bounded recovery ladder: the DLL probes with
 `AT` for up to ~10 s through the same +IPD-aware reader, reissues `CIPSTART`
@@ -391,9 +379,8 @@ DLL keeps the transaction alive across calls:
   would duplicate stream bytes. Finish the SEND before CLOSE/NETDONE/free; use
   the explicit `NETRESET` tool if the module never returns to command mode.
 - As long as data keeps flowing the quantum never fires: the slice measures
-  silence, not total duration. A stalled ESP (see LASTERR's `esp=` verdicts)
-  simply yields `NERR_AGAIN` every quantum until the module recovers or the
-  consumer gives up.
+  silence, not total duration. A stalled ESP simply yields `NERR_AGAIN` every
+  quantum until the module recovers or the consumer gives up.
 - Silence that falls **inside** a `+IPD` frame capture still uses the internal
   5 s per-byte timeout. The captured prefix is committed and the exact unread
   payload count remains live; a later RECV/SEND continuation resumes that

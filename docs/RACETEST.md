@@ -123,8 +123,8 @@ A run that stops on a SEND or RECV error prints the numeric status, the DLL's
 `LASTERR` text, and the verdict `ABORT: stopped early - continuity not proven`
 (exit 3). It is deliberately not a PASS: the bytes read before the abort say
 nothing about the bytes that never arrived. For a send failure `LASTERR` names
-the transport reason, the window's byte trace, and the `esp=` verdict of the
-DLL's recovery probe - see "Function 16 - LASTERR" in [UNETAPI.md](UNETAPI.md).
+the compact transport reason and last complete ESP/probe line - see
+"Function 16 - LASTERR" in [UNETAPI.md](UNETAPI.md).
 After the complete payload has left the host, the probe can accept a late
 `SEND OK` or detect a module reboot without duplicating bytes. Before the `>`
 prompt the DLL deliberately does not probe or reissue: a late prompt could make

@@ -236,7 +236,7 @@ START_SEND_BUFFER
 	; arrives, the caller must not be shown a stale one as the reason.
 	XOR	A
 	LD	(LINE_BUFFER),A
-	CALL	SEND_TRACE_RESET
+	CALL	SEND_STATE_RESET
 	CALL	MUX_CAPTURE_PENDING_PAYLOAD
 	RET	C			; partial +IPD still owns the UART stream
 	ELSE
@@ -2234,70 +2234,20 @@ READ_BYTE_TIMEOUT
 	LD	HL,REG_RBR
 	CALL	WIFI.UART_READ
 	LD	C,A
-	IFDEF ESP_TCP_MUX
-	JP	SEND_TRACE_PUT		; preserves A, C and CF=0
-	ELSE
-	RET
-	ENDIF
-
-	IFDEF ESP_TCP_MUX
-; Record the bytes a command/send window actually received. Every reader used
-; outside RECEIVE goes through here, so a send that ends in "no response" can
-; report whether the ESP was silent, said "busy p...", or was still streaming.
-; In: C = byte just read. Preserves A, C and CF.
-SEND_TRACE_PUT
-	PUSH	AF
-	PUSH	DE
-	PUSH	HL
-	LD	HL,(SEND_TRACE_TOTAL)
-	INC	HL
-	LD	(SEND_TRACE_TOTAL),HL
-	LD	A,(SEND_TRACE_N)
-	CP	SEND_TRACE_SIZE
-	JR	NC,.full		; keep the FIRST bytes: they name the reason
-	LD	E,A
-	LD	D,0
-	INC	A
-	LD	(SEND_TRACE_N),A
-	LD	HL,SEND_TRACE
-	ADD	HL,DE
-	LD	(HL),C
-.full
-	; The tail is a rolling window: what the ESP said LAST, right before it
-	; went quiet, is what explains a stall.
-	LD	A,(SEND_TAIL_POS)
-	LD	E,A
-	LD	D,0
-	INC	A
-	CP	SEND_TAIL_SIZE
-	JR	C,.wrapped
-	XOR	A
-.wrapped
-	LD	(SEND_TAIL_POS),A
-	LD	HL,SEND_TAIL
-	ADD	HL,DE
-	LD	(HL),C
-	POP	HL
-	POP	DE
-	POP	AF
 	RET
 
-SEND_TRACE_RESET
+	IFDEF ESP_TCP_MUX
+; Reset parser/transaction state before a new command or SEND. Receive bytes
+; are deliberately not traced here: verbose first/tail capture was a debugging
+; aid and consumed scarce DLL image space without affecting recovery.
+SEND_STATE_RESET
 	XOR	A
-	LD	(SEND_TRACE_N),A
-	LD	(SEND_TAIL_POS),A
 	LD	(SEND_PHASE),A
 	LD	(WSO_FLAGS),A
 	; A fresh transaction must never inherit a stale suspension.
 	LD	(ASYNC_PEND),A
 	LD	(PROMPT_RESUME),A
 	LD	(WSO_RESUME),A
-	; UART_WAIT_RS accumulates 16550 line errors here and only UART_TX_CMD
-	; clears them; zero it per send window so a reported overrun belongs to
-	; THIS send and not to some earlier command.
-	LD	(WIFI.CMD_LSR_ACCUM),A
-	LD	HL,0
-	LD	(SEND_TRACE_TOTAL),HL
 	RET
 	ENDIF
 
@@ -2512,14 +2462,6 @@ MUX_ACCEPT_CLOSED DB 0		; CIPCLOSE terminates on its own <id>,CLOSED
 MUX_CONNECT_PAUSED DB 0		; internal RTS pause between CONNECT and first I/O
 MUX_WINDOW_OPEN DB 0		; command wait currently owns an open ISA window
 LINK_ID		DB 0		; link id used by the command builders
-; Diagnostic capture of the current send window (see SEND_TRACE_PUT).
-SEND_TRACE_SIZE	EQU 20
-SEND_TAIL_SIZE	EQU 20
-SEND_TRACE_N	DB 0		; bytes captured (capped at SEND_TRACE_SIZE)
-SEND_TRACE_TOTAL DW 0		; bytes actually received in this window
-SEND_TRACE	DS SEND_TRACE_SIZE,0
-SEND_TAIL_POS	DB 0		; write cursor of the rolling tail
-SEND_TAIL	DS SEND_TAIL_SIZE,0
 WSO_TIMEOUT	DW TCP_DEFAULT_TIMEOUT	; per-byte timeout of WAIT_SEND_OK/WAIT_PROMPT
 WSO_FLAGS	DB 0		; bit0 SEND OK, bit1 ready, bit2 busy, bit3 CONNECT
 SEND_PHASE	DB 0		; 0 = before payload, 1 = payload handed to the ESP
