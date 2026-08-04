@@ -44,6 +44,24 @@ TCP_RX_DEFER_SIZE	EQU 2048
 	ENDIF
 	ENDIF
 
+; Optional two-channel mode (ESP_TCP_MUX, requires ESP_TCP_RX_DEFER). Adds the
+; AT+CIPMUX=1 dialect: link-aware "+IPD,<link>,<len>:" headers, "<link>,CLOSED"
+; notifications and one receive-defer stash per channel, so a client can hold a
+; control and a data connection at the same time (passive FTP). A frame that
+; arrives for the channel the caller is not reading is stashed for that channel
+; instead of being lost. Only the UNET DLL enables this; every stock app builds
+; without it and its .EXE stays byte-identical.
+	IFDEF ESP_TCP_MUX
+	IFNDEF ESP_TCP_RX_DEFER
+	DISPLAY "ESP_TCP_MUX requires ESP_TCP_RX_DEFER"
+	ASSERT 0
+	ENDIF
+TCP_MUX_CHANNELS	EQU 2	; channels this build demultiplexes (ESP-AT allows 0..4)
+TCP_MUX_MAX_LINK	EQU 4	; highest link id accepted from an ESP-AT header
+RES_AGAIN		EQU 20	; send suspended on link silence (ASYNC_MODE only):
+				; resume with SEND_BUFFER_RESUME, nothing was lost
+	ENDIF
+
 	MODULE TCP
 
 ; ------------------------------------------------------
@@ -136,7 +154,11 @@ CLOSE
 SEND_BUFFER
 	CALL	START_SEND_BUFFER
 	RET	C
+	IFDEF ESP_TCP_MUX
+	JP	MUX_WAIT_SEND_OK
+	ELSE
 	JP	WAIT_SEND_OK
+	ENDIF
 
 ; ------------------------------------------------------
 ; Send a raw TCP payload and return immediately after UART transmit.
@@ -152,6 +174,41 @@ SEND_BUFFER_NO_WAIT
 	CALL	START_SEND_BUFFER
 	RET
 
+	IFDEF ESP_TCP_MUX
+; ------------------------------------------------------
+; Continue a send transaction that suspended with RES_AGAIN (ASYNC_MODE).
+; Same contract as SEND_BUFFER. The CIPSEND command is NOT retransmitted -
+; the ESP already holds it - only the pending wait continues from its saved
+; state, so a resume can never duplicate stream bytes.
+; ------------------------------------------------------
+SEND_BUFFER_RESUME
+	LD	A,(ASYNC_PEND)
+	CP	2
+	JP	Z,MUX_WAIT_SEND_OK	; payload sent: still awaiting SEND OK
+	CALL	MUX_WAIT_PROMPT
+	RET	C
+	LD	HL,(SEND_PTR)
+	LD	BC,(SEND_LEN)
+	CALL	WIFI.UART_TX_BUFFER
+	JR	C,.TX_TIMEOUT
+	LD	A,1
+	LD	(SEND_PHASE),A
+	JP	MUX_WAIT_SEND_OK
+.TX_TIMEOUT
+	LD	A,RES_TX_TIMEOUT
+	SCF
+	RET
+
+; Forget any suspended transaction state (explicit close / session teardown).
+ASYNC_RESET
+	XOR	A
+	LD	(ASYNC_MODE),A
+	LD	(ASYNC_PEND),A
+	LD	(PROMPT_RESUME),A
+	LD	(WSO_RESUME),A
+	RET
+	ENDIF
+
 START_SEND_BUFFER
 	LD	(SEND_PTR),HL
 	LD	(SEND_LEN),BC
@@ -164,24 +221,44 @@ START_SEND_BUFFER
 	LD	HL,CMD_BUFFER
 	LD	DE,CMD_CIPSEND_PREFIX
 	CALL	APPEND_STR
+	IFDEF ESP_TCP_MUX
+	CALL	APPEND_LINK_ID		; AT+CIPSEND=<link>,<len>
+	LD	DE,CMD_COMMA
+	CALL	APPEND_STR
+	ENDIF
 	LD	DE,NUM_BUFFER
 	CALL	APPEND_STR
 	LD	DE,CMD_CRLF
 	CALL	APPEND_STR
 
+	IFDEF ESP_TCP_MUX
+	; Drop the previous response line: if this send fails before any line
+	; arrives, the caller must not be shown a stale one as the reason.
+	XOR	A
+	LD	(LINE_BUFFER),A
+	CALL	SEND_TRACE_RESET
+	CALL	MUX_CAPTURE_PENDING_PAYLOAD
+	RET	C			; partial +IPD still owns the UART stream
+	ELSE
 	IFDEF ESP_TCP_RX_DEFER
 	; Do NOT flush the RX FIFO: bytes already queued are the start of a +IPD
 	; frame that WAIT_PROMPT will capture. Only rescue a payload the app left
 	; unread so it can't be mistaken for the '>' prompt / SEND OK.
 	CALL	CAPTURE_PENDING_PAYLOAD
+	RET	C			; partial +IPD still owns the UART stream
 	ELSE
 	CALL	WIFI.UART_EMPTY_RS
+	ENDIF
 	ENDIF
 	LD	HL,CMD_BUFFER
 	CALL	WIFI.UART_TX_STRING
 	JR	C,.TX_TIMEOUT
 
+	IFDEF ESP_TCP_MUX
+	CALL	MUX_WAIT_PROMPT
+	ELSE
 	CALL	WAIT_PROMPT
+	ENDIF
 	RET	C
 
 	LD	HL,(SEND_PTR)
@@ -189,6 +266,13 @@ START_SEND_BUFFER
 	CALL	WIFI.UART_TX_BUFFER
 	JR	C,.TX_TIMEOUT
 
+	IFDEF ESP_TCP_MUX
+	; The recovery ladder must know whether the payload left the host: before
+	; this point a lost CIPSEND may be reissued, after it a reissue would
+	; duplicate bytes in the stream.
+	LD	A,1
+	LD	(SEND_PHASE),A
+	ENDIF
 	XOR	A
 	RET
 
@@ -314,10 +398,40 @@ CAN_READ_ANOTHER_ACTIVE_IPD
 WAIT_PROMPT
 	PUSH	IX
 	LD	IX,IPD_PREFIX
+	IFDEF ESP_TCP_MUX
+	; A suspended wait (ASYNC_MODE) resumes exactly where it left off,
+	; including a half-matched "+IPD," prefix - restarting the match there
+	; would misread the rest of the header as junk and lose the frame.
+	LD	A,(PROMPT_RESUME)
+	AND	A
+	JR	Z,.NEXT
+	XOR	A
+	LD	(PROMPT_RESUME),A
+	LD	IX,(PROMPT_STATE)
+	ENDIF
 .NEXT
+	IFDEF ESP_TCP_MUX
+	LD	BC,(WSO_TIMEOUT)	; slice in async mode, 5 s otherwise
+	ELSE
 	LD	BC,TCP_DEFAULT_TIMEOUT
+	ENDIF
+	IFDEF ESP_TCP_MUX
+	LD	A,(MUX_WINDOW_OPEN)
+	AND	A
+	JR	Z,.READ_CLOSED
+	CALL	READ_BYTE_TIMEOUT_OPEN
+	JR	.READ_DONE
+.READ_CLOSED
 	CALL	READ_BYTE_TIMEOUT
+.READ_DONE
+	ELSE
+	CALL	READ_BYTE_TIMEOUT
+	ENDIF
+	IFDEF ESP_TCP_MUX
+	JP	C,.RD_TIMEOUT
+	ELSE
 	JR	C,.TIMEOUT_POP
+	ENDIF
 	LD	E,A
 	CP	'>'
 	JR	Z,.OK_POP
@@ -337,10 +451,14 @@ WAIT_PROMPT
 	INC	IX
 	JR	.NEXT
 .IPD_HIT
+	IFDEF ESP_TCP_MUX
+	CALL	MUX_CAPTURE_IPD_FRAME
+	ELSE
 	IFDEF ESP_TCP_RX_DEFER
 	CALL	CAPTURE_IPD_FRAME
 	ELSE
 	CALL	SKIP_IPD_FRAME
+	ENDIF
 	ENDIF
 	JR	C,.TIMEOUT_POP
 	LD	IX,IPD_PREFIX
@@ -349,6 +467,23 @@ WAIT_PROMPT
 	POP	IX
 	XOR	A
 	RET
+	IFDEF ESP_TCP_MUX
+.RD_TIMEOUT
+	; Silence at a clean point (not inside a frame capture). In async mode
+	; that is a suspension, not a failure: park the prefix-match state and
+	; hand control back to the consumer.
+	LD	A,(ASYNC_MODE)
+	AND	A
+	JR	Z,.TIMEOUT_POP
+	LD	(PROMPT_STATE),IX
+	LD	A,1
+	LD	(PROMPT_RESUME),A
+	LD	(ASYNC_PEND),A		; 1 = awaiting the '>' prompt
+	POP	IX
+	LD	A,RES_AGAIN
+	SCF
+	RET
+	ENDIF
 .TIMEOUT_POP
 	POP	IX
 	LD	A,RES_RS_TIMEOUT
@@ -362,16 +497,57 @@ WAIT_PROMPT
 ; to match a CR/LF terminator inside binary payload.
 ; ------------------------------------------------------
 WAIT_SEND_OK
+	IFDEF ESP_TCP_MUX
+	; A suspended wait resumes mid-line: LINE_REMAIN/IPD_STATE_PTR survived
+	; in memory, only the store pointer needs recomputing.
+	LD	A,(WSO_RESUME)
+	AND	A
+	JR	NZ,.RESUME
+	ENDIF
 .RESTART
 	LD	IX,LINE_BUFFER
 	LD	A,TCP_LINE_SIZE-1
 	LD	(LINE_REMAIN),A
 	LD	HL,IPD_PREFIX
 	LD	(IPD_STATE_PTR),HL
+	IFDEF ESP_TCP_MUX
+	JR	.NEXT_BYTE
+.RESUME
+	XOR	A
+	LD	(WSO_RESUME),A
+	LD	A,TCP_LINE_SIZE-1
+	LD	HL,LINE_REMAIN
+	SUB	(HL)			; characters already stored in this line
+	LD	E,A
+	LD	D,0
+	LD	IX,LINE_BUFFER
+	ADD	IX,DE
+	ENDIF
 .NEXT_BYTE
+	IFDEF ESP_TCP_MUX
+	; Indirect so the recovery probe can run this loop with a short per-byte
+	; timeout; every normal caller sees TCP_DEFAULT_TIMEOUT.
+	LD	BC,(WSO_TIMEOUT)
+	ELSE
 	LD	BC,TCP_DEFAULT_TIMEOUT
+	ENDIF
+	IFDEF ESP_TCP_MUX
+	LD	A,(MUX_WINDOW_OPEN)
+	AND	A
+	JR	Z,.READ_CLOSED
+	CALL	READ_BYTE_TIMEOUT_OPEN
+	JR	.READ_DONE
+.READ_CLOSED
 	CALL	READ_BYTE_TIMEOUT
+.READ_DONE
+	ELSE
+	CALL	READ_BYTE_TIMEOUT
+	ENDIF
+	IFDEF ESP_TCP_MUX
+	JP	C,.TIMEOUT		; mux dialect handling puts .TIMEOUT out of JR reach
+	ELSE
 	JR	C,.TIMEOUT
+	ENDIF
 	LD	E,A
 	CP	13
 	JR	Z,.NEXT_BYTE
@@ -405,18 +581,145 @@ WAIT_SEND_OK
 	LD	(LINE_REMAIN),A
 	JR	.NEXT_BYTE
 .IPD_LINE_HIT
+	IFDEF ESP_TCP_MUX
+	CALL	MUX_CAPTURE_IPD_FRAME
+	JP	C,.TIMEOUT		; the marker chain puts .TIMEOUT out of JR reach
+	JP	.RESTART
+	ELSE
 	IFDEF ESP_TCP_RX_DEFER
 	CALL	CAPTURE_IPD_FRAME
 	ELSE
 	CALL	SKIP_IPD_FRAME
 	ENDIF
 	JR	C,.TIMEOUT
-	JR	.RESTART
+	JP	.RESTART
+	ENDIF
 .END_LINE
 	LD	(IX+0),0
 	LD	A,(LINE_BUFFER)
 	AND	A
-	JR	Z,.RESTART
+	JP	Z,.RESTART
+	IFDEF ESP_TCP_MUX
+	; In AT+CIPMUX=1 the ESP prefixes link-scoped notifications with "<id>,".
+	; Strip it before matching, and treat "<id>,CLOSED" as a peer-close event
+	; for that link: a foreign link closing must not abort our send, and our
+	; own link closing is still followed by SEND OK / ERROR / FAIL.
+	CALL	MUX_LINE_STRIP
+	LD	HL,CLOSED_PREFIX
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	C,.NOT_CLOSED
+	LD	A,(MUX_LINE_LINK)
+	CALL	MUX_LATCH_CLOSED
+	LD	A,(MUX_ACCEPT_CLOSED)
+	AND	A
+	JP	Z,.RESTART
+	LD	A,(MUX_LINE_LINK)
+	LD	HL,LINK_ID
+	CP	(HL)
+	JP	NZ,.RESTART
+	XOR	A
+	LD	(ASYNC_PEND),A
+	RET
+.NOT_CLOSED
+	; AT+CIPCLOSE=<id> terminates with a plain OK; the flag lets that caller
+	; share this IPD-aware line loop instead of a blind UART_TX_CMD, which
+	; would swallow peer data racing the close.
+	LD	A,(MUX_ACCEPT_OK)
+	AND	A
+	JR	Z,.NOT_OK
+	LD	HL,MSG_OK
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	C,.NOT_OK
+	; CIPSTART is complete only when its own <id>,CONNECT arrives. A bare OK
+	; can be the tail of the previous command and, on a streaming peer, waiting
+	; for the OK after CONNECT can starve forever behind continuous +IPD.
+	LD	A,(MUX_ACCEPT_CONNECT)
+	AND	A
+	JR	NZ,.NOT_OK
+	JP	.OK
+.NOT_OK
+	LD	HL,MSG_SEND_OK
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	NC,.SENDOK_HIT
+	LD	HL,MSG_ERROR
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JP	NC,.ERROR
+	LD	HL,MSG_FAIL
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JP	NC,.FAIL
+	; Evidence markers for the recovery ladder (see PROBE_AT in the DLL):
+	; matched once per complete non-matching line, never in the byte loop, so
+	; the hot path cost is nil. "ready" is the module's own reboot banner.
+	LD	HL,MSG_READY
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	NC,.MARK_READY
+	LD	HL,MSG_CONNECT_LN
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	NC,.MARK_CONNECT
+	LD	DE,MSG_BUSY_PFX
+	LD	HL,(MUX_LINE_PTR)
+	CALL	UTIL.STARTSWITH
+	JR	Z,.MARK_BUSY
+	JP	.RESTART
+.SENDOK_HIT
+	LD	HL,WSO_FLAGS
+	SET	0,(HL)
+	JR	.OK
+.MARK_READY
+	LD	HL,WSO_FLAGS
+	SET	1,(HL)
+	JP	.RESTART
+.MARK_BUSY
+	LD	HL,WSO_FLAGS
+	SET	2,(HL)
+	; In command-response mode (MUX_ACCEPT_OK), "busy p..." is terminal:
+	; the interpreter rejected the command and no OK will follow. Returning it
+	; immediately lets CIPSTART/CIPCLOSE retry safely without a false timeout.
+	LD	A,(MUX_ACCEPT_OK)
+	AND	A
+	JP	Z,.RESTART
+	XOR	A
+	LD	(ASYNC_PEND),A
+	LD	A,RES_BUSY
+	SCF
+	RET
+.MARK_CONNECT
+	LD	HL,WSO_FLAGS
+	SET	3,(HL)
+	LD	A,(MUX_ACCEPT_CONNECT)
+	AND	A
+	JP	Z,.RESTART
+	; A notification for the other mux link is evidence for recovery, but it
+	; must not complete the CIPSTART currently opening LINK_ID.
+	LD	A,(MUX_LINE_LINK)
+	LD	HL,LINK_ID
+	CP	(HL)
+	JP	NZ,.RESTART
+	; Stop the ESP at the UART boundary before returning through libman to the
+	; application. Otherwise an immediate peer greeting can overrun the 16-byte
+	; 16550 FIFO in the small CONNECT->first RECV scheduling gap. No FIFO bytes
+	; are flushed; the next data/command operation resumes RTS first.
+	LD	A,(MUX_WINDOW_OPEN)
+	AND	A
+	JR	Z,.PAUSE_CLOSED
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	JR	.PAUSED
+.PAUSE_CLOSED
+	CALL	WIFI.UART_RX_PAUSE
+.PAUSED
+	LD	A,1
+	LD	(MUX_CONNECT_PAUSED),A
+	XOR	A
+	LD	(ASYNC_PEND),A
+	RET
+	ELSE
 	LD	HL,MSG_SEND_OK
 	LD	DE,LINE_BUFFER
 	CALL	UTIL.STRCMP
@@ -429,19 +732,61 @@ WAIT_SEND_OK
 	LD	DE,LINE_BUFFER
 	CALL	UTIL.STRCMP
 	JR	NC,.FAIL
-	JR	.RESTART
+	JP	.RESTART
+	ENDIF
 .OK
+	IFDEF ESP_TCP_MUX
+	XOR	A
+	LD	(ASYNC_PEND),A		; any terminal outcome ends the transaction
+	ENDIF
 	XOR	A
 	RET
 .ERROR
+	IFDEF ESP_TCP_MUX
+	XOR	A
+	LD	(ASYNC_PEND),A
+	ENDIF
 	LD	A,RES_ERROR
 	SCF
 	RET
 .FAIL
+	IFDEF ESP_TCP_MUX
+	XOR	A
+	LD	(ASYNC_PEND),A
+	ENDIF
 	LD	A,RES_FAIL
 	SCF
 	RET
 .TIMEOUT
+	IFDEF ESP_TCP_MUX
+	; In async mode silence between bytes is a suspension: keep the partial
+	; line state (the resume entry recomputes the store pointer) and report
+	; RES_AGAIN. Only sends set ASYNC_MODE; the close path and the recovery
+	; probe always run this loop in blocking mode.
+	LD	A,(ASYNC_MODE)
+	AND	A
+	JR	Z,.hard_timeout
+	LD	A,1
+	LD	(WSO_RESUME),A
+	LD	A,2
+	LD	(ASYNC_PEND),A		; 2 = awaiting SEND OK
+	LD	A,RES_AGAIN
+	SCF
+	RET
+.hard_timeout
+	; Terminate whatever of the line had arrived, so a caller reporting the
+	; failure can show it ("busy p..." reads very differently from nothing at
+	; all). Derive the position from LINE_REMAIN rather than IX: the capture
+	; helpers reached from this loop make no promise about IX.
+	LD	A,TCP_LINE_SIZE-1
+	LD	HL,LINE_REMAIN
+	SUB	(HL)			; A = characters stored in this line
+	LD	E,A
+	LD	D,0
+	LD	HL,LINE_BUFFER
+	ADD	HL,DE
+	LD	(HL),0
+	ENDIF
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
@@ -559,10 +904,18 @@ DEFER_COMPACT
 	LD	A,B
 	OR	C
 	JR	Z,.setw			; empty region, just reset offsets
+	IFDEF ESP_TCP_MUX
+	LD	HL,(DEFER_BASE)
+	ELSE
 	LD	HL,DEFER_BUF
+	ENDIF
 	LD	DE,(DEFER_R)
-	ADD	HL,DE			; src = DEFER_BUF+R
+	ADD	HL,DE			; src = base+R
+	IFDEF ESP_TCP_MUX
+	LD	DE,(DEFER_BASE)
+	ELSE
 	LD	DE,DEFER_BUF		; dst = DEFER_BUF
+	ENDIF
 	LDIR				; forward copy, dst<src -> safe
 .setw
 	LD	HL,(DEFER_W)
@@ -597,9 +950,13 @@ DEFER_STORE_FRAME
 	SBC	HL,DE			; CF=1 if free < len+2
 	POP	DE			; DE = len
 	JR	C,.overflow
+	IFDEF ESP_TCP_MUX
+	LD	HL,(DEFER_BASE)
+	ELSE
 	LD	HL,DEFER_BUF
+	ENDIF
 	LD	BC,(DEFER_W)
-	ADD	HL,BC			; HL = &DEFER_BUF[W] (header)
+	ADD	HL,BC			; HL = &base[W] (header)
 	LD	(DEFER_FHDR),HL
 	LD	(HL),E			; length lo
 	INC	HL
@@ -612,8 +969,12 @@ DEFER_STORE_FRAME
 	LD	A,H
 	OR	L
 	JR	Z,.done
+	IFDEF ESP_TCP_MUX
+	CALL	MUX_READ_BYTE
+	ELSE
 	LD	BC,TCP_DEFAULT_TIMEOUT
 	CALL	READ_BYTE_TIMEOUT
+	ENDIF
 	JR	C,.timeout
 	LD	HL,(DEFER_WPTR)
 	LD	(HL),A
@@ -625,7 +986,11 @@ DEFER_STORE_FRAME
 	JR	.loop
 .done
 	LD	HL,(DEFER_WPTR)
+	IFDEF ESP_TCP_MUX
+	LD	DE,(DEFER_BASE)
+	ELSE
 	LD	DE,DEFER_BUF
+	ENDIF
 	OR	A
 	SBC	HL,DE
 	LD	(DEFER_W),HL		; W = WPTR - base
@@ -633,7 +998,11 @@ DEFER_STORE_FRAME
 	RET
 .timeout
 	LD	HL,(DEFER_WPTR)
+	IFDEF ESP_TCP_MUX
+	LD	DE,(DEFER_BASE)
+	ELSE
 	LD	DE,DEFER_BUF
+	ENDIF
 	OR	A
 	SBC	HL,DE
 	LD	(DEFER_W),HL		; commit partial frame
@@ -661,8 +1030,12 @@ DEFER_STORE_FRAME
 	LD	A,H
 	OR	L
 	JR	Z,.ovf_done
+	IFDEF ESP_TCP_MUX
+	CALL	MUX_READ_BYTE
+	ELSE
 	LD	BC,TCP_DEFAULT_TIMEOUT
 	CALL	READ_BYTE_TIMEOUT
+	ENDIF
 	JR	C,.ovf_timeout
 	LD	HL,(DEFER_NEED)
 	DEC	HL
@@ -745,7 +1118,9 @@ CAPTURE_IPD_FRAME
 ; If the app left a +IPD payload unread (PAYLOAD_LEFT!=0) when it starts a SEND,
 ; pull those bytes into the defer buffer as one frame so the CIPSEND handshake
 ; is not corrupted by them (this replaces the old UART_EMPTY_RS FIFO flush,
-; which would have thrown the same bytes away). Clears PAYLOAD_LEFT.
+; which would have thrown the same bytes away). PAYLOAD_LEFT is cleared only
+; after the whole tail was captured; on timeout it keeps the exact unread count
+; so a later receive/capture continues inside the same binary frame.
 CAPTURE_PENDING_PAYLOAD
 	LD	HL,(PAYLOAD_LEFT)
 	LD	A,H
@@ -753,10 +1128,19 @@ CAPTURE_PENDING_PAYLOAD
 	RET	Z			; nothing pending
 	PUSH	BC,DE,HL
 	LD	DE,(PAYLOAD_LEFT)
-	CALL	DEFER_STORE_FRAME	; best-effort; CF ignored by caller
+	CALL	DEFER_STORE_FRAME
+	JR	C,.partial
 	LD	HL,0
 	LD	(PAYLOAD_LEFT),HL
 	POP	HL,DE,BC
+	XOR	A
+	RET
+.partial
+	LD	HL,(DEFER_NEED)
+	LD	(PAYLOAD_LEFT),HL
+	POP	HL,DE,BC
+	LD	A,RES_RS_TIMEOUT
+	SCF
 	RET
 
 ; Copy min(DEFER_FRAME_LEFT, RECV_REMAIN) bytes from the current defer read
@@ -775,9 +1159,13 @@ DEFER_EMIT
 	LD	A,B
 	OR	C
 	RET	Z			; n==0
+	IFDEF ESP_TCP_MUX
+	LD	HL,(DEFER_BASE)
+	ELSE
 	LD	HL,DEFER_BUF
+	ENDIF
 	LD	DE,(DEFER_R)
-	ADD	HL,DE			; src = DEFER_BUF+R
+	ADD	HL,DE			; src = base+R
 	LD	DE,(RECV_PTR)		; dst
 	PUSH	BC
 	LDIR
@@ -824,7 +1212,11 @@ RECEIVE_FROM_DEFER
 	OR	A
 	SBC	HL,DE			; R-W; CF=1 while R<W (frames remain)
 	JR	NC,.return		; R>=W: empty
+	IFDEF ESP_TCP_MUX
+	LD	HL,(DEFER_BASE)
+	ELSE
 	LD	HL,DEFER_BUF
+	ENDIF
 	LD	DE,(DEFER_R)
 	ADD	HL,DE
 	LD	E,(HL)
@@ -856,6 +1248,768 @@ RECEIVE_FROM_DEFER
 .keep
 	LD	BC,(RECV_STORED)
 	XOR	A
+	RET
+	ENDIF
+
+	IFDEF ESP_TCP_MUX
+; ======================================================
+; Two-channel (AT+CIPMUX=1) receive demultiplexer.
+;
+; ESP-AT reports link-scoped events once CIPMUX=1 is active:
+;     +IPD,<link>,<len>:<payload>      data for one link
+;     <link>,CLOSED                    that link's peer closed
+;     <link>,CONNECT / <link>,SEND OK  command chatter
+; A caller reads one channel at a time, but the UART carries both. A frame that
+; belongs to the channel not being read is copied into that channel's own
+; receive-defer window and handed over on the next read of that channel, so
+; stream order per channel is preserved and nothing is lost while, say, an FTP
+; control reply arrives in the middle of a data transfer.
+;
+; The byte reader is indirect (MUX_READ_VEC) because the same parsing code runs
+; from two contexts: the CIPSEND handshake, where no ISA window is held, and
+; RECEIVE_MUX, which keeps the window open for the whole burst. It is also the
+; seam the host-side harness uses to feed scripted bytes.
+; ======================================================
+
+; Append the current link id to the command being built at HL, leaving HL on the
+; new terminator exactly like APPEND_STR.
+APPEND_LINK_ID
+	LD	A,(LINK_ID)
+	ADD	A,'0'
+	LD	(HL),A
+	INC	HL
+	LD	(HL),0
+	RET
+
+; Select the reader used by the parsing/stashing helpers.
+MUX_USE_SEND_READER
+	LD	HL,MUX_SEND_READER
+	LD	(MUX_READ_VEC),HL
+	RET
+
+; Select the fast reader while the caller holds the ISA window open. Both the
+; response line and a possible immediate +IPD burst are drained without two
+; ISA bank switches per byte.
+MUX_USE_SEND_OPEN_READER
+	LD	HL,MUX_SEND_OPEN_READER
+	LD	(MUX_READ_VEC),HL
+	RET
+
+MUX_USE_RECV_READER
+	LD	HL,READ_BYTE_RECV_TIMEOUT_OPEN
+	LD	(MUX_READ_VEC),HL
+	RET
+
+; Keep the ISA window open for a complete command-response wait. This removes
+; two bank switches per response byte and lets CONNECT lower RTS before the
+; immediately following +IPD burst overruns the 16550 FIFO.
+MUX_WAIT_BEGIN
+	CALL	ISA.ISA_OPEN
+	LD	A,1
+	LD	(MUX_WINDOW_OPEN),A
+	JP	MUX_USE_SEND_OPEN_READER
+
+MUX_WAIT_END
+	PUSH	AF
+	XOR	A
+	LD	(MUX_WINDOW_OPEN),A
+	CALL	ISA.ISA_CLOSE
+	CALL	MUX_USE_SEND_READER
+	POP	AF
+	RET
+
+MUX_WAIT_PROMPT
+	CALL	MUX_WAIT_BEGIN
+	CALL	WAIT_PROMPT
+	JP	MUX_WAIT_END
+
+MUX_WAIT_SEND_OK
+	CALL	MUX_WAIT_BEGIN
+	CALL	WAIT_SEND_OK
+	JP	MUX_WAIT_END
+
+MUX_SEND_READER
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	JP	READ_BYTE_TIMEOUT
+
+MUX_SEND_OPEN_READER
+	LD	BC,TCP_DEFAULT_TIMEOUT
+	JP	READ_BYTE_TIMEOUT_OPEN
+
+; Read one byte through the selected reader. Out: CF=0/A=byte, CF=1 on timeout.
+; Does not preserve HL (READ_BYTE_TIMEOUT clobbers it); callers save it.
+MUX_READ_BYTE
+	LD	HL,(MUX_READ_VEC)
+	JP	(HL)
+
+; Read a decimal field. Out: CF=0, HL=value, MUX_DELIM=terminating character.
+;      CF=1/A=RES_RS_TIMEOUT on UART timeout.
+MUX_READ_DEC
+	LD	HL,0
+.LOOP
+	PUSH	HL
+	CALL	MUX_READ_BYTE
+	POP	HL
+	RET	C
+	LD	(MUX_DELIM),A
+	CP	'0'
+	JR	C,.DONE
+	CP	'9'+1
+	JR	NC,.DONE
+	SUB	'0'
+	LD	E,A
+	LD	D,0
+	LD	B,H
+	LD	C,L
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,BC
+	ADD	HL,HL
+	ADD	HL,DE			; HL = HL*10 + digit
+	JR	.LOOP
+.DONE
+	XOR	A
+	RET
+
+; Parse "<link>,<len>:" (or "<link>,<len>,<ip>,<port>:" if CIPDINFO=1 was left
+; on) after the "+IPD," prefix has been consumed.
+; Out: CF=0, MUX_FRAME_LINK / MUX_FRAME_LEN set. CF=1/A=result code on error.
+MUX_PARSE_IPD_HDR
+	CALL	MUX_READ_DEC
+	RET	C
+	LD	A,H
+	AND	A
+	JR	NZ,.BAD
+	LD	A,L
+	CP	TCP_MUX_MAX_LINK+1
+	JR	NC,.BAD
+	LD	(MUX_FRAME_LINK),A
+	LD	A,(MUX_DELIM)
+	CP	','
+	JR	NZ,.BAD
+	CALL	MUX_READ_DEC
+	RET	C
+	LD	(MUX_FRAME_LEN),HL
+	LD	A,(MUX_DELIM)
+	CP	':'
+	JR	Z,.OK
+	CP	','
+	JR	NZ,.BAD
+.SKIP_REMOTE
+	CALL	MUX_READ_BYTE
+	RET	C
+	CP	':'
+	JR	NZ,.SKIP_REMOTE
+.OK
+	XOR	A
+	RET
+.BAD
+	LD	A,RES_ERROR
+	SCF
+	RET
+
+; ------------------------------------------------------
+; Per-channel receive-defer windows.
+; The working cursors (DEFER_W/DEFER_R/DEFER_FRAME_LEFT/DEFER_LOST) always hold
+; the selected channel's context; switching swaps them with the saved copy and
+; repoints DEFER_BASE at that channel's buffer, so every proven defer routine
+; keeps working unchanged on whichever channel is selected.
+; ------------------------------------------------------
+; In: A = channel. Preserves nothing.
+DEFER_SELECT
+	LD	HL,DEFER_CUR_CH
+	CP	(HL)
+	RET	Z
+	PUSH	AF
+	LD	A,(DEFER_CUR_CH)
+	CALL	MUX_CTX_ADDR
+	EX	DE,HL			; DE = &ctx[current]
+	LD	HL,DEFER_W
+	LD	BC,DEFER_CTX_SIZE
+	LDIR				; save working set
+	POP	AF
+	LD	(DEFER_CUR_CH),A
+	CALL	MUX_CTX_ADDR		; HL = &ctx[new]
+	LD	DE,DEFER_W
+	LD	BC,DEFER_CTX_SIZE
+	LDIR				; load working set
+	JP	MUX_SET_BASE
+
+; In: A = channel. Out: HL = &DEFER_CTX[channel].
+MUX_CTX_ADDR
+	LD	L,A
+	LD	H,0
+	LD	D,H
+	LD	E,L
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,DE
+	ADD	HL,DE
+	ADD	HL,DE			; HL = channel*7
+	LD	DE,DEFER_CTX
+	ADD	HL,DE
+	RET
+
+; Point DEFER_BASE at the selected channel's buffer (two channels by design).
+MUX_SET_BASE
+	LD	A,(DEFER_CUR_CH)
+	LD	HL,DEFER_BUF0
+	AND	A
+	JR	Z,.SET
+	LD	DE,TCP_RX_DEFER_SIZE
+	ADD	HL,DE
+.SET
+	LD	(DEFER_BASE),HL
+	RET
+
+; Clear one channel's window (a fresh link must not replay old peer data).
+; In: A = channel.
+RX_DEFER_RESET_CH
+	CALL	DEFER_SELECT
+	JP	RX_DEFER_RESET
+
+; Clear every channel's window plus the shared live-frame state. Called when the
+; session is (re)initialised.
+RX_DEFER_RESET_ALL
+	XOR	A
+	LD	(DEFER_CUR_CH),A
+	CALL	MUX_SET_BASE
+	CALL	RX_DEFER_RESET		; working set = channel 0
+	LD	HL,DEFER_CTX
+	LD	DE,DEFER_CTX+1
+	LD	BC,TCP_MUX_CHANNELS*DEFER_CTX_SIZE-1
+	LD	(HL),0
+	LDIR
+	LD	HL,0
+	LD	(PAYLOAD_LEFT),HL
+	XOR	A
+	LD	(MUX_CLOSED_MASK),A
+	LD	A,0xFF
+	LD	(MUX_PAYLOAD_LINK),A
+	RET
+
+; ------------------------------------------------------
+; Peer-close bookkeeping. A "<link>,CLOSED" can be seen while reading the other
+; channel or in the middle of a send, so it is latched per link and consumed
+; later by the channel it belongs to.
+; ------------------------------------------------------
+; In: A = link. Out: A = 1<<link.
+MUX_LINK_BIT
+	PUSH	BC
+	LD	B,A
+	LD	A,1
+	INC	B
+.SHIFT
+	DEC	B
+	JR	Z,.DONE
+	ADD	A,A
+	JR	.SHIFT
+.DONE
+	POP	BC
+	RET
+
+; In: A = link.
+MUX_LATCH_CLOSED
+	CP	TCP_MUX_CHANNELS
+	RET	NC
+	CALL	MUX_LINK_BIT
+	LD	HL,MUX_CLOSED_MASK
+	OR	(HL)
+	LD	(HL),A
+	RET
+
+; In: A = channel.
+MUX_CLEAR_CLOSED
+	CP	TCP_MUX_CHANNELS
+	RET	NC
+	CALL	MUX_LINK_BIT
+	CPL
+	LD	HL,MUX_CLOSED_MASK
+	AND	(HL)
+	LD	(HL),A
+	RET
+
+; In: A = channel. Out: CF=1 when a peer close is latched for it.
+MUX_IS_CLOSED
+	CALL	MUX_LINK_BIT
+	LD	HL,MUX_CLOSED_MASK
+	AND	(HL)
+	RET	Z			; CF=0: not closed
+	SCF
+	RET
+
+; In: A = channel. Out: CF=1 when undelivered received data is buffered for it.
+; May change the selected channel (harmless: contexts are complete).
+MUX_HAS_PENDING
+	PUSH	BC
+	LD	C,A
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	Z,.STASH
+	LD	A,(MUX_PAYLOAD_LINK)
+	CP	C
+	JR	Z,.YES
+.STASH
+	LD	A,C
+	CALL	DEFER_SELECT
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.YES
+	LD	HL,(DEFER_R)
+	LD	DE,(DEFER_W)
+	OR	A
+	SBC	HL,DE			; CF=1 while R<W (frames queued)
+	POP	BC
+	RET
+.YES
+	POP	BC
+	SCF
+	RET
+
+; ------------------------------------------------------
+; Stash helpers. Bytes are read from the UART through the selected reader, so
+; the payload is consumed either way; only its destination differs.
+; ------------------------------------------------------
+; Stash the payload of the frame just parsed by MUX_PARSE_IPD_HDR.
+MUX_STASH_FRAME
+	LD	A,(MUX_FRAME_LINK)
+	LD	HL,(MUX_FRAME_LEN)
+	JR	MUX_STASH_LEN
+
+; Stash the unread tail of the live payload. Forget it only after the complete
+; tail was consumed; otherwise preserve the exact remainder so no later AT
+; command can be injected into binary +IPD data.
+MUX_STASH_PARTIAL
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	RET	Z
+	LD	A,(MUX_PAYLOAD_LINK)
+	CALL	MUX_STASH_LEN
+	JR	C,.PARTIAL
+	LD	HL,0
+	LD	(PAYLOAD_LEFT),HL
+	XOR	A
+	RET
+.PARTIAL
+	LD	HL,(DEFER_NEED)
+	LD	(PAYLOAD_LEFT),HL
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
+
+; In: A = owner channel, HL = payload length. Restores the previously selected
+; channel before returning. Out: CF=0 ok, CF=1 on UART timeout.
+MUX_STASH_LEN
+	LD	B,A			; B = owner channel
+	LD	A,(DEFER_CUR_CH)
+	LD	C,A			; C = channel to restore afterwards
+	PUSH	BC
+	PUSH	HL			; DEFER_SELECT clobbers HL: keep the length
+	LD	A,B
+	CP	TCP_MUX_CHANNELS
+	JR	NC,.DISCARD		; link outside our channel set: drop it
+	CALL	DEFER_SELECT
+	POP	DE			; DE = payload length
+	CALL	DEFER_STORE_FRAME
+.RESTORE
+	POP	BC
+	PUSH	AF
+	LD	A,C
+	CALL	DEFER_SELECT
+	POP	AF
+	RET
+.DISCARD
+	; Unknown link: consume the payload so the stream stays framed.
+	POP	HL
+.DLOOP
+	LD	A,H
+	OR	L
+	JR	Z,.DDONE
+	PUSH	HL
+	CALL	MUX_READ_BYTE
+	POP	HL
+	JR	NC,.DGOT
+	LD	(DEFER_NEED),HL		; expose the unread tail to the caller
+	JR	.RESTORE
+.DGOT
+	DEC	HL
+	JR	.DLOOP
+.DDONE
+	XOR	A
+	JR	.RESTORE
+
+; Capture a "+IPD," frame that raced the CIPSEND/CIPSTART handshake (prefix
+; already consumed by WAIT_PROMPT / WAIT_SEND_OK). Reuse the command wait's
+; open ISA window, or open one for a legacy direct caller, for the complete
+; header+payload burst. The old per-byte open/close reader could not sustain
+; 115200 baud and truncated an early frame before the application's first RECV.
+; Out: CF=0 ok / CF=1 A=RES_RS_TIMEOUT. Preserves BC,DE,HL.
+MUX_CAPTURE_IPD_FRAME
+	PUSH	BC,DE,HL
+	LD	A,(MUX_WINDOW_OPEN)
+	AND	A
+	JR	NZ,.ALREADY_OPEN
+	CALL	ISA.ISA_OPEN
+	CALL	MUX_USE_SEND_OPEN_READER
+.ALREADY_OPEN
+	CALL	MUX_PARSE_IPD_HDR
+	JR	C,.PARSE_FAIL
+	CALL	MUX_STASH_FRAME
+	JR	C,.PAYLOAD_FAIL
+	CALL	.CLOSE_READER
+	POP	HL,DE,BC
+	XOR	A
+	RET
+.PAYLOAD_FAIL
+	; The +IPD header is already gone, so remember exactly which live payload
+	; and how many bytes still own the UART stream. Clearing this would let the
+	; next command text be mistaken for peer data (or vice versa).
+	LD	HL,(DEFER_NEED)
+	LD	(PAYLOAD_LEFT),HL
+	LD	A,(MUX_FRAME_LINK)
+	LD	(MUX_PAYLOAD_LINK),A
+.PARSE_FAIL
+	CALL	.CLOSE_READER
+	POP	HL,DE,BC
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
+.CLOSE_READER
+	PUSH	AF
+	LD	A,(MUX_WINDOW_OPEN)
+	AND	A
+	JR	NZ,.CLOSE_DONE
+	CALL	ISA.ISA_CLOSE
+	CALL	MUX_USE_SEND_READER
+.CLOSE_DONE
+	POP	AF
+	RET
+
+; Rescue a payload the app left unread when it starts a SEND, into the window of
+; the channel that owns it.
+MUX_CAPTURE_PENDING_PAYLOAD
+	CALL	MUX_RESUME_CONNECT_RX
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	RET	Z
+	PUSH	BC,DE,HL
+	CALL	ISA.ISA_OPEN
+	CALL	MUX_USE_SEND_OPEN_READER
+	CALL	MUX_STASH_PARTIAL
+	PUSH	AF
+	CALL	ISA.ISA_CLOSE
+	CALL	MUX_USE_SEND_READER
+	POP	AF
+	POP	HL,DE,BC
+	RET
+
+; Resume the internal post-CONNECT pause exactly once. This pause is distinct
+; from the public RXPAUSE option: top-level DLL guards already reject network
+; operations while the consumer's explicit pause is active.
+MUX_RESUME_CONNECT_RX
+	LD	A,(MUX_CONNECT_PAUSED)
+	AND	A
+	RET	Z
+	XOR	A
+	LD	(MUX_CONNECT_PAUSED),A
+	JP	WIFI.UART_RX_RESUME
+
+; Variant for RECEIVE_MUX after it has opened ISA window 3. The helper raises
+; RTS and returns directly into the live drain path, with no nested bank switch.
+MUX_RESUME_CONNECT_RX_OPEN
+	LD	A,(MUX_CONNECT_PAUSED)
+	AND	A
+	RET	Z
+	XOR	A
+	LD	(MUX_CONNECT_PAUSED),A
+	JP	WIFI.UART_RX_RESUME_OPEN
+
+; ------------------------------------------------------
+; Split a response line into an optional "<link>," prefix and the rest.
+; Out: MUX_LINE_PTR = text to match, MUX_LINE_LINK = link id (0xFF if absent).
+; ------------------------------------------------------
+MUX_LINE_STRIP
+	LD	HL,LINE_BUFFER
+	LD	(MUX_LINE_PTR),HL
+	LD	A,0xFF
+	LD	(MUX_LINE_LINK),A
+	LD	A,(LINE_BUFFER)
+	CP	'0'
+	RET	C
+	CP	'9'+1
+	RET	NC
+	LD	HL,LINE_BUFFER+1
+	LD	A,(HL)
+	CP	','
+	RET	NZ
+	INC	HL
+	LD	(MUX_LINE_PTR),HL
+	LD	A,(LINE_BUFFER)
+	SUB	'0'
+	LD	(MUX_LINE_LINK),A
+	RET
+
+; ------------------------------------------------------
+; Scan the UART stream for "+IPD," or "<link>,CLOSED".
+; Out: CF=0 on a +IPD header (prefix consumed).
+;      CF=1/A=RES_NOT_CONN on a close notification, MUX_CLOSED_LINK = link id
+;      (0xFF when the stream carried no "<digit>," prefix).
+;      CF=1/A=RES_RS_TIMEOUT on timeout.
+; ------------------------------------------------------
+WAIT_IPD_HEADER_MUX
+	LD	IX,IPD_PREFIX
+	LD	IY,CLOSED_PREFIX
+	LD	A,0xFF
+	LD	(MUX_CAND),A
+	XOR	A
+	LD	(MUX_B1),A
+	LD	(MUX_B2),A
+.NEXT
+	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
+	JR	C,.TIMEOUT
+	LD	E,A
+	; "CLOSED" starts only at a 'C', so the link id, if any, is the digit two
+	; bytes back. Snapshot it there and keep a two-byte history.
+	CP	'C'
+	CALL	Z,MUX_SNAP_CAND
+	CALL	MUX_SHIFT_BYTES
+	LD	A,(IX+0)
+	CP	E
+	JR	NZ,.RESET
+	INC	IX
+	LD	A,(IX+0)
+	AND	A
+	JR	Z,.OK
+	JR	.CHECK_CLOSED
+.RESET
+	LD	IX,IPD_PREFIX
+	LD	A,E
+	CP	'+'
+	JR	NZ,.CHECK_CLOSED
+	INC	IX
+	JR	.CHECK_CLOSED
+.CHECK_CLOSED
+	LD	A,(IY+0)
+	CP	E
+	JR	NZ,.CLOSED_RESET
+	INC	IY
+	LD	A,(IY+0)
+	AND	A
+	JR	Z,.CLOSED
+	JR	.NEXT
+.CLOSED_RESET
+	LD	IY,CLOSED_PREFIX
+	LD	A,E
+	CP	'C'
+	JR	NZ,.NEXT
+	INC	IY
+	JR	.NEXT
+.OK
+	XOR	A
+	RET
+.CLOSED
+	LD	A,(MUX_CAND)
+	LD	(MUX_CLOSED_LINK),A
+	LD	A,RES_NOT_CONN
+	SCF
+	RET
+.TIMEOUT
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
+
+; Preserve E, IX and IY: both helpers run inside the scan loop.
+MUX_SNAP_CAND
+	LD	A,(MUX_B2)
+	CP	','
+	JR	NZ,.NONE
+	LD	A,(MUX_B1)
+	CP	'0'
+	JR	C,.NONE
+	CP	'9'+1
+	JR	NC,.NONE
+	SUB	'0'
+	LD	(MUX_CAND),A
+	RET
+.NONE
+	LD	A,0xFF
+	LD	(MUX_CAND),A
+	RET
+
+MUX_SHIFT_BYTES
+	LD	A,(MUX_B2)
+	LD	(MUX_B1),A
+	LD	A,E
+	LD	(MUX_B2),A
+	RET
+
+; ------------------------------------------------------
+; Receive from one channel.
+; In: A - channel, HL - destination, BC - max bytes, DE - timeout ms.
+; Out: CF=0/A=0/BC=stored bytes. BC=0 means "nothing for this channel yet":
+;        either the timeout expired or a frame for the other channel was
+;        stashed, which returns immediately so the caller can switch channels
+;        instead of blocking behind the other channel's stream.
+;      CF=1/A=RES_NOT_CONN once this channel's peer closed and everything it
+;        had already received has been delivered.
+;      CF=1/A=result code on timeout with nothing buffered, or protocol error.
+; ------------------------------------------------------
+RECEIVE_MUX
+	LD	(RECV_CH),A
+	LD	(RECV_PTR),HL
+	LD	(RECV_REMAIN),BC
+	LD	(RECV_TIMEOUT),DE
+	LD	(RECV_FULL_TIMEOUT),DE
+	LD	HL,0
+	LD	(RECV_STORED),HL
+
+	; Stashed data predates anything still on the wire: replay it first.
+	LD	A,(RECV_CH)
+	CALL	DEFER_SELECT
+	LD	HL,(DEFER_FRAME_LEFT)
+	LD	A,H
+	OR	L
+	JP	NZ,RECEIVE_FROM_DEFER
+	LD	HL,(DEFER_R)
+	LD	DE,(DEFER_W)
+	OR	A
+	SBC	HL,DE			; R-W; CF=1 while R<W (frames queued)
+	JP	C,RECEIVE_FROM_DEFER
+
+	; A close seen earlier is reported only now that the stash is empty.
+	LD	A,(RECV_CH)
+	CALL	MUX_IS_CLOSED
+	JR	NC,.LIVE
+	LD	A,RES_NOT_CONN
+	SCF
+	RET
+.LIVE
+	; While a send transaction is suspended the UART stream belongs to it:
+	; scanning live here would consume its '>' / SEND OK. Only already
+	; buffered data was served above; report idle immediately.
+	LD	A,(ASYNC_PEND)
+	AND	A
+	JR	Z,.LIVE_OPEN
+	LD	BC,0
+	XOR	A
+	RET
+.LIVE_OPEN
+	CALL	ISA.ISA_OPEN
+	CALL	WIFI.UART_SET_DATA_RX_MODE_OPEN
+	CALL	MUX_RESUME_CONNECT_RX_OPEN
+	CALL	MUX_USE_RECV_READER
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	Z,.SCAN
+	LD	A,(MUX_PAYLOAD_LINK)
+	LD	HL,RECV_CH
+	CP	(HL)
+	JP	Z,.CONTINUE_PAYLOAD
+	CALL	MUX_STASH_PARTIAL	; belongs to the other channel
+	JP	C,.FAIL_STORED
+.SCAN
+	CALL	WAIT_IPD_HEADER_MUX
+	JR	C,.SCAN_FAIL
+	CALL	MUX_PARSE_IPD_HDR
+	JP	C,.FAIL_STORED
+	LD	A,(MUX_FRAME_LINK)
+	LD	HL,RECV_CH
+	CP	(HL)
+	JR	Z,.OWN_FRAME
+	CALL	MUX_STASH_FRAME
+	JP	C,.FAIL_STORED
+	JR	.RETURN_STORED		; hand control back; caller switches channel
+.OWN_FRAME
+	LD	HL,(MUX_FRAME_LEN)
+	LD	(PAYLOAD_LEFT),HL
+	LD	A,(MUX_FRAME_LINK)
+	LD	(MUX_PAYLOAD_LINK),A
+.CONTINUE_PAYLOAD
+	CALL	READ_PAYLOAD
+	JR	C,.FAIL_STORED
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.RETURN_STORED	; caller buffer filled mid-frame
+	CALL	CAN_READ_ANOTHER_ACTIVE_IPD
+	JR	C,.RETURN_STORED
+	; Peek for a back-to-back frame with a short timeout, exactly like the
+	; single-connection path: at line rate the next frame is already coming.
+	LD	HL,TCP_CONT_TIMEOUT
+	LD	(RECV_TIMEOUT),HL
+	CALL	WAIT_IPD_HEADER_MUX
+	PUSH	AF
+	LD	HL,(RECV_FULL_TIMEOUT)
+	LD	(RECV_TIMEOUT),HL
+	POP	AF
+	JR	C,.SCAN_FAIL
+	CALL	MUX_PARSE_IPD_HDR
+	JR	C,.FAIL_STORED
+	LD	A,(MUX_FRAME_LINK)
+	LD	HL,RECV_CH
+	CP	(HL)
+	JR	Z,.OWN_FRAME
+	CALL	MUX_STASH_FRAME
+	JR	C,.FAIL_STORED
+	JR	.RETURN_STORED
+.SCAN_FAIL
+	PUSH	AF
+	CP	RES_NOT_CONN
+	JR	Z,.SCAN_FAIL_CLOSED
+	POP	AF
+	JR	.FAIL_STORED
+.SCAN_FAIL_CLOSED
+	POP	AF
+	; fall through
+.CLOSED_EVENT
+	LD	A,(MUX_CLOSED_LINK)
+	CP	0xFF
+	JR	NZ,.HAVE_LINK
+	LD	A,(RECV_CH)		; unlabelled CLOSED: assume it is ours
+	LD	(MUX_CLOSED_LINK),A
+.HAVE_LINK
+	CALL	MUX_LATCH_CLOSED
+	LD	A,(MUX_CLOSED_LINK)
+	LD	HL,RECV_CH
+	CP	(HL)
+	JR	Z,.OWN_CLOSED
+	LD	HL,(RECV_STORED)
+	LD	A,H
+	OR	L
+	JR	NZ,.RETURN_STORED
+	JP	.SCAN			; other channel closed: keep looking
+.OWN_CLOSED
+	LD	HL,(RECV_STORED)
+	LD	A,H
+	OR	L
+	JR	NZ,.RETURN_STORED	; data first, RES_NOT_CONN next call
+	CALL	ISA.ISA_CLOSE
+	LD	A,RES_NOT_CONN
+	SCF
+	RET
+.RETURN_STORED
+	CALL	ISA.ISA_CLOSE
+	LD	BC,(RECV_STORED)
+	XOR	A
+	RET
+.FAIL_STORED
+	PUSH	AF
+	LD	HL,(RECV_STORED)
+	LD	A,H
+	OR	L
+	JR	Z,.FAIL_PROPAGATE
+	POP	AF
+	JR	.RETURN_STORED
+.FAIL_PROPAGATE
+	POP	AF
+	PUSH	AF
+	CALL	ISA.ISA_CLOSE
+	POP	AF
 	RET
 	ENDIF
 
@@ -1080,7 +2234,72 @@ READ_BYTE_TIMEOUT
 	LD	HL,REG_RBR
 	CALL	WIFI.UART_READ
 	LD	C,A
+	IFDEF ESP_TCP_MUX
+	JP	SEND_TRACE_PUT		; preserves A, C and CF=0
+	ELSE
 	RET
+	ENDIF
+
+	IFDEF ESP_TCP_MUX
+; Record the bytes a command/send window actually received. Every reader used
+; outside RECEIVE goes through here, so a send that ends in "no response" can
+; report whether the ESP was silent, said "busy p...", or was still streaming.
+; In: C = byte just read. Preserves A, C and CF.
+SEND_TRACE_PUT
+	PUSH	AF
+	PUSH	DE
+	PUSH	HL
+	LD	HL,(SEND_TRACE_TOTAL)
+	INC	HL
+	LD	(SEND_TRACE_TOTAL),HL
+	LD	A,(SEND_TRACE_N)
+	CP	SEND_TRACE_SIZE
+	JR	NC,.full		; keep the FIRST bytes: they name the reason
+	LD	E,A
+	LD	D,0
+	INC	A
+	LD	(SEND_TRACE_N),A
+	LD	HL,SEND_TRACE
+	ADD	HL,DE
+	LD	(HL),C
+.full
+	; The tail is a rolling window: what the ESP said LAST, right before it
+	; went quiet, is what explains a stall.
+	LD	A,(SEND_TAIL_POS)
+	LD	E,A
+	LD	D,0
+	INC	A
+	CP	SEND_TAIL_SIZE
+	JR	C,.wrapped
+	XOR	A
+.wrapped
+	LD	(SEND_TAIL_POS),A
+	LD	HL,SEND_TAIL
+	ADD	HL,DE
+	LD	(HL),C
+	POP	HL
+	POP	DE
+	POP	AF
+	RET
+
+SEND_TRACE_RESET
+	XOR	A
+	LD	(SEND_TRACE_N),A
+	LD	(SEND_TAIL_POS),A
+	LD	(SEND_PHASE),A
+	LD	(WSO_FLAGS),A
+	; A fresh transaction must never inherit a stale suspension.
+	LD	(ASYNC_PEND),A
+	LD	(PROMPT_RESUME),A
+	LD	(WSO_RESUME),A
+	; UART_WAIT_RS accumulates 16550 line errors here and only UART_TX_CMD
+	; clears them; zero it per send window so a reported overrun belongs to
+	; THIS send and not to some earlier command.
+	LD	(WIFI.CMD_LSR_ACCUM),A
+	LD	HL,0
+	LD	(SEND_TRACE_TOTAL),HL
+	RET
+	ENDIF
 
 READ_BYTE_RECV_TIMEOUT
 	LD	BC,(RECV_TIMEOUT)
@@ -1098,6 +2317,11 @@ READ_BYTE_RECV_TIMEOUT
 ; still times out.
 ; Out: CF=0, A=byte, C=byte. CF=1 on timeout/cancel.
 READ_BYTE_TIMEOUT_OPEN
+	IFDEF ESP_TCP_TEST_READER
+	; Host-side harnesses replace the LSR/RBR poll with a scripted byte source;
+	; no shipped build defines this.
+	JP	@TEST_READ_BYTE
+	ENDIF
 	PUSH	BC,DE,HL
 	LD	HL,200
 	LD	(RBT_CANCEL_TICK),HL
@@ -1188,6 +2412,16 @@ CMD_CIPCLOSE
 	DB	"AT+CIPCLOSE",13,10,0
 CMD_CRLF
 	DB	13,10,0
+	IFDEF ESP_TCP_MUX
+CMD_COMMA
+	DB	",",0
+MSG_READY
+	DB	"ready",0
+MSG_CONNECT_LN
+	DB	"CONNECT",0
+MSG_BUSY_PFX
+	DB	"busy",0
+	ENDIF
 
 IPD_PREFIX
 	DB	"+IPD,",0
@@ -1241,6 +2475,8 @@ IPD_STATE_PTR	DW 0
 ; not-yet-delivered tail of the frame a RECEIVE was in the middle of returning.
 ; DEFER_LOST is sticky: a captured frame was dropped on overflow or truncated
 ; by a UART timeout, so the peer stream has a gap.
+; DEFER_W..DEFER_LOST must stay contiguous and in this order: ESP_TCP_MUX swaps
+; the whole block in and out of the per-channel contexts with one LDIR.
 DEFER_W		DW 0
 DEFER_R		DW 0
 DEFER_FRAME_LEFT	DW 0
@@ -1249,6 +2485,50 @@ DEFER_LOST	DB 0
 DEFER_FHDR	DW 0	; address of the length header of the frame being written
 DEFER_WPTR	DW 0	; running payload write pointer
 DEFER_NEED	DW 0	; payload bytes still to read
+	ENDIF
+
+	IFDEF ESP_TCP_MUX
+DEFER_CTX_SIZE	EQU 7		; DEFER_W, DEFER_R, DEFER_FRAME_LEFT, DEFER_LOST
+	ASSERT DEFER_LOST - DEFER_W + 1 == DEFER_CTX_SIZE
+DEFER_BASE	DW 0		; buffer of the selected channel
+DEFER_CUR_CH	DB 0		; channel whose context is loaded in the working set
+DEFER_CTX	DS TCP_MUX_CHANNELS*DEFER_CTX_SIZE,0
+RECV_CH		DB 0		; channel the current RECEIVE_MUX serves
+MUX_READ_VEC	DW 0		; selected byte reader (send window vs open window)
+MUX_DELIM	DB 0		; character that terminated the last decimal field
+MUX_FRAME_LINK	DB 0		; link id of the +IPD header just parsed
+MUX_FRAME_LEN	DW 0		; payload length of that header
+MUX_PAYLOAD_LINK DB 0xFF	; owner of the live, partially read payload
+MUX_CLOSED_LINK	DB 0xFF		; link id from the last CLOSED notification
+MUX_CLOSED_MASK	DB 0		; latched peer closes, one bit per channel
+MUX_CAND	DB 0xFF		; link digit seen just before a candidate CLOSED
+MUX_B1		DB 0		; two-byte history feeding MUX_CAND
+MUX_B2		DB 0
+MUX_LINE_PTR	DW 0		; response line with any "<link>," prefix removed
+MUX_LINE_LINK	DB 0xFF		; link id of that prefix (0xFF when absent)
+MUX_ACCEPT_OK	DB 0		; WAIT_SEND_OK also accepts a bare OK (CIPCLOSE)
+MUX_ACCEPT_CONNECT DB 0		; CIPSTART terminates on its own <id>,CONNECT
+MUX_ACCEPT_CLOSED DB 0		; CIPCLOSE terminates on its own <id>,CLOSED
+MUX_CONNECT_PAUSED DB 0		; internal RTS pause between CONNECT and first I/O
+MUX_WINDOW_OPEN DB 0		; command wait currently owns an open ISA window
+LINK_ID		DB 0		; link id used by the command builders
+; Diagnostic capture of the current send window (see SEND_TRACE_PUT).
+SEND_TRACE_SIZE	EQU 20
+SEND_TAIL_SIZE	EQU 20
+SEND_TRACE_N	DB 0		; bytes captured (capped at SEND_TRACE_SIZE)
+SEND_TRACE_TOTAL DW 0		; bytes actually received in this window
+SEND_TRACE	DS SEND_TRACE_SIZE,0
+SEND_TAIL_POS	DB 0		; write cursor of the rolling tail
+SEND_TAIL	DS SEND_TAIL_SIZE,0
+WSO_TIMEOUT	DW TCP_DEFAULT_TIMEOUT	; per-byte timeout of WAIT_SEND_OK/WAIT_PROMPT
+WSO_FLAGS	DB 0		; bit0 SEND OK, bit1 ready, bit2 busy, bit3 CONNECT
+SEND_PHASE	DB 0		; 0 = before payload, 1 = payload handed to the ESP
+; Async (suspendable) send state - see SEND_BUFFER_RESUME.
+ASYNC_MODE	DB 0		; 1: silence suspends the send instead of failing it
+ASYNC_PEND	DB 0		; 0 idle / 1 awaiting '>' / 2 awaiting SEND OK
+PROMPT_RESUME	DB 0		; WAIT_PROMPT must restore PROMPT_STATE on entry
+PROMPT_STATE	DW 0		; saved "+IPD," prefix-match pointer
+WSO_RESUME	DB 0		; WAIT_SEND_OK must resume its partial line
 	ENDIF
 
 	IFNDEF	ESP_TCP_BSS_BASE_OVERRIDE
@@ -1260,11 +2540,19 @@ CMD_BUFFER	EQU TCP_BSS_BASE
 NUM_BUFFER	EQU CMD_BUFFER + TCP_CMD_SIZE
 LINE_BUFFER	EQU NUM_BUFFER + 8
 DEBUG_BUFFER	EQU LINE_BUFFER + TCP_LINE_SIZE
+	IFDEF ESP_TCP_MUX
+; One receive-defer window per channel, so data stashed for the channel that is
+; not being read cannot be crowded out by the busy channel.
+DEFER_BUF0	EQU DEBUG_BUFFER + TCP_DEBUG_SIZE
+DEFER_BUF1	EQU DEFER_BUF0 + TCP_RX_DEFER_SIZE
+TCP_BSS_END	EQU DEFER_BUF0 + TCP_MUX_CHANNELS*TCP_RX_DEFER_SIZE
+	ELSE
 	IFDEF ESP_TCP_RX_DEFER
 DEFER_BUF	EQU DEBUG_BUFFER + TCP_DEBUG_SIZE
 TCP_BSS_END	EQU DEFER_BUF + TCP_RX_DEFER_SIZE
 	ELSE
 TCP_BSS_END	EQU DEBUG_BUFFER + TCP_DEBUG_SIZE
+	ENDIF
 	ENDIF
 
 	ENDMODULE

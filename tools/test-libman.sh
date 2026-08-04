@@ -41,6 +41,16 @@ if [ ! -f "$dll_file" ]; then
   exit 1
 fi
 
+# l_load must rebuild IY from the staged L1 header after its DSS memory calls.
+# Carrying the earlier value across GETMEM/SETWIN is unsafe on real DSS and can
+# corrupt the relocation pass before INIT (observed by the shell as error #27).
+reloc_setup=$(sed -n '/pop.*bc.*новый адрес кода/,/call.*nz,remake/p' "$repo_root/src/lib/libman13.asm")
+if ! printf '%s\n' "$reloc_setup" | grep -Eq 'ld[[:space:]]+hl,0C004h'; then
+  echo "libman l_load does not rebuild the L1 relocation pointer after DSS calls" >&2
+  exit 1
+fi
+echo "libman l_load relocation-pointer rebuild: OK"
+
 # L1 code_size is little-endian at header bytes 4..5.
 set -- $(od -An -tu1 -j 4 -N 2 "$dll_file")
 dll_code_size=$(($1 + ($2 * 256)))

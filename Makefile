@@ -1,4 +1,4 @@
-.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-progress racetest clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress racetest clean
 
 build:
 	tools/build.sh
@@ -9,7 +9,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles test-send-defer test-progress
+test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress
 	tools/test-zmodem.sh
 
 test-libman:
@@ -23,6 +23,12 @@ test-uart-profiles:
 
 test-send-defer:
 	tools/test-send-defer.sh
+
+test-mux-demux:
+	tools/test-mux-demux.sh
+
+test-mux-cmd:
+	tools/test-mux-cmd.sh
 
 test-progress:
 	tools/test-progress.sh

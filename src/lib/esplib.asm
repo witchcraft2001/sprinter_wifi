@@ -291,6 +291,20 @@ UART_RX_PAUSE
 	POP		HL,DE
 	RET
 
+; Same operation while the caller already holds ISA window 3 open. Command
+; readers use this at the exact CONNECT boundary: nesting ISA_OPEN would
+; overwrite ISA.SAVE_MMU3 and, more importantly, leave enough time for the
+; following +IPD burst to overrun the FIFO before RTS drops.
+UART_RX_PAUSE_OPEN
+	LD		A,(UART_FLOW_MODE)
+	AND		A
+	LD		A,0
+	JR		Z,.WRITE
+	LD		A,MCR_AFE
+.WRITE
+	LD		(REG_MCR),A
+	RET
+
 UART_RX_RESUME
 	PUSH	DE,HL
 	CALL	UART_SET_DATA_RX_MODE
@@ -303,6 +317,19 @@ UART_RX_RESUME
 	LD	HL,REG_MCR
 	CALL	UART_WRITE
 	POP	HL,DE
+	RET
+
+; Resume while ISA window 3 is already open. The caller selects the required
+; non-flushing trigger first, then raises RTS here and immediately starts
+; draining; there is no bank-switch gap in which an eager peer can fill FIFO.
+UART_RX_RESUME_OPEN
+	LD		A,(UART_FLOW_MODE)
+	AND		A
+	LD		A,MCR_RTS
+	JR		Z,.WRITE
+	LD		A,MCR_AFE | MCR_RTS
+.WRITE
+	LD		(REG_MCR),A
 	RET
 
 ; Select the profile-specific FIFO trigger before streaming payload data,
@@ -325,6 +352,26 @@ UART_SET_DATA_RX_MODE
 	LD		E,FCR_TR4 | FCR_FIFO
 	LD		HL,REG_FCR
 	JP		UART_WRITE
+	ENDIF
+	ENDIF
+
+; Non-flushing streaming-trigger selection for a caller that already mapped
+; the ISA window. Keep the established 2.2.1/stable-profile no-op unchanged.
+UART_SET_DATA_RX_MODE_OPEN
+	IFDEF	WIFI_STABLE_ACTIVE_RX
+	RET
+	ELSE
+	IFDEF	ESP_AT_FORCE_221
+	RET
+	ELSE
+	IFNDEF	ESP_AT_FORCE_222
+	LD		A,(UART_RX_PROFILE)
+	CP		UART_RX_PROFILE_222
+	RET		NZ
+	ENDIF
+	LD		A,FCR_TR4 | FCR_FIFO
+	LD		(REG_FCR),A
+	RET
 	ENDIF
 	ENDIF
 

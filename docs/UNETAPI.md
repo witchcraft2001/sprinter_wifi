@@ -5,13 +5,17 @@ DLL. One contract, two interchangeable backends:
 
 - **UNETESP.DLL** - Sprinter-WiFi (ESP8266 running ESP-AT firmware). Shipped
   and implemented in this package. **Firmware: ESP-AT 2.2.2 only.** The DLL is
-  built for the 2.2.2 command set with the field-proven trigger-8 receive path;
+  built for the 2.2.2 command set with its complete trigger-4 receive path;
   it does not contain a 2.2.1 fallback. `NETINIT` returns `NERR_NONET` if the
   active NETUP session is not `NET_ESP_FW=2.2.2`, and its L1 header name reads
   `UNET ESP 2.2.2` (shown by UNETTEST). Run NETUP with 2.2.2 firmware first.
 - **UNETRTL.DLL** - RTL8019A Ethernet card. Same function numbers and error
   codes; implemented separately in the sprinter-rtl8019a project (see the RTL
   appendix below).
+
+Backends differ only in what they advertise through `GETCAPS`, never in the
+function numbering. The most consequential difference today is `CAP_MULTICHAN`
+(two simultaneous connections): UNETESP 0.3 and later has it, UNETRTL does not.
 
 A consumer written in asm, C or Pascal loads a backend with libman
 (`l_load` / `l_call` / `l_free`) and drives TCP, UDP, resolve and ping through
@@ -124,12 +128,12 @@ Register discipline for every UNET function:
 | 2 | GETCAPS | - | A=0, DE=caps, IX=ABI version |
 | 3 | NETINIT | - | A |
 | 4 | NETDONE | - | A=0 |
-| 5 | CONNECT | A=chan(0), DE=host, IX=port | A |
+| 5 | CONNECT | A=chan, DE=host, IX=port | A |
 | 6 | SEND | A=chan, DE=buf, IX=len | A, DE=sent |
 | 7 | RECV | A=chan, DE=buf, IX=max, IY=timeout_ms | A, DE=got, IX=flags |
 | 8 | CLOSE | A=chan | A |
 | 9 | STATUS | A=chan (or 0xFF) | A, DE=state |
-| 10 | UDPOPEN | A=chan(0), DE=host, IX=rport, IY=lport\|0 | A |
+| 10 | UDPOPEN | A=chan, DE=host, IX=rport, IY=lport\|0 | A |
 | 11 | RESOLVE | DE=host, IX=dest(>=16) | A, dest="a.b.c.d" |
 | 12 | PING | DE=host, IY=timeout_ms | A, DE=round-trip ms |
 | 13 | RXPAUSE | - | A |
@@ -140,8 +144,14 @@ Register discipline for every UNET function:
 | 18-23 | (reserved) | - | A=NERR_NOTSUP |
 
 `host` and `port` are NUL-terminated ASCII strings (e.g. `"example.com",0` and
-`"80",0`). The channel byte is reserved for a future second connection; v1
-accepts only channel 0 and returns `NERR_PARAM` for anything else.
+`"80",0`).
+
+The channel byte selects one of two independent connections. A backend that
+reports `CAP_MULTICHAN` accepts channel 0 and channel 1 and can hold both open
+at the same time; one without it accepts only channel 0. Any other value returns
+`NERR_PARAM`. Always gate on the capability bit rather than the backend name -
+UNETESP 0.3 and later has it, UNETRTL does not. See
+"[Two channels](#two-channels)" below.
 
 `NETINIT` must be called (and succeed) before `CONNECT`, `UDPOPEN`, `RESOLVE`
 or `PING`; otherwise those return `NERR_STATE`.
@@ -155,27 +165,68 @@ the DLL was not loaded into window 3; FINI closes any still-open link.
 
 Returns the capability bitmask in DE and the ABI version (`major<<8|minor`) in
 IX. Callable before `NETINIT`. Check the ABI major byte before relying on the
-numbered functions. UNETESP v1 reports `0x010F` =
-`TCP | UDP | RESOLVE | PING | RXFLOW`.
+numbered functions. UNETESP 0.4 reports `0x031F` =
+`TCP | UDP | RESOLVE | PING | RXFLOW | MULTICHAN | ASYNCSEND` (0.3 reported
+`0x011F`, 0.2 `0x010F`). The ABI version stays `0x0100`: two channels and
+suspendable sends are discovered through capability bits, not version bumps.
 
 ### Function 3 - NETINIT
 
 Brings the link layer up: verifies the network was configured (see
 "Network up" below), finds and initialises the UART at the configured baud,
 probes the ESP (resetting it once if silent), enables RTS/CTS flow control on
-both sides, clears any leftover socket and selects single-connection mode.
-Because clearing the sockets really closes any open link, NETINIT also resets
-the channel state - a repeated `NETINIT` followed by `CONNECT` is safe.
+both sides, clears any leftover socket and selects multi-connection mode
+(`AT+CIPMUX=1`). The socket cleanup must precede the mode switch - ESP-AT
+rejects `AT+CIPMUX` while a link is open - and because it really closes any
+open link, NETINIT also resets both channels' state, so a repeated `NETINIT`
+followed by `CONNECT` is safe.
+
+After the mode switch NETINIT sends `AT+CIPTCPOPT=5,-1,0,4000` (best effort:
+an `ERROR` is tolerated). This bounds the firmware's internal TCP send with a
+4 s `SO_SNDTIMEO`. Without it - the firmware default is *no* timeout - ESP-AT
+v2.2.2 holds its socket mutex across a blocking `lwip_send`, and because
+`+IPD` printing needs the same mutex, one send stalled by Wi-Fi
+retransmissions silences the module's entire UART output (prompts, `SEND OK`
+and the inbound stream alike) until the send completes; verified in the
+`v2.2.2.0_esp8266` core (`at_sending_data` / `at_process_recv_socket` /
+`s_at_socket_mutex`). With the option set, a stuck send ends in the module's
+own `SEND FAIL` within 4 s - before the DLL's 5 s client timeout - and the
+stream resumes.
 Returns `NERR_OK`, `NERR_NONET` (not configured), `NERR_HW` (no card / no
 response) or `NERR_BUSY` (ESP IP stack still warming up after join).
 
+### Function 4 / 8 - NETDONE / CLOSE
+
+`CLOSE` closes **one** channel and is idempotent. Data still buffered for that
+channel is discarded: to shut down gracefully, read until `NERR_CLOSED` first.
+
+`NETDONE` closes every channel and hands the ESP back in single-connection mode
+(`AT+CIPMUX=0`), which is what the stock utilities (WGET, FTP, TELNET, ...)
+expect to find. The network itself stays up, so a later `CONNECT` still works -
+it re-arms multi-connection mode by itself.
+
 ### Function 5 - CONNECT
 
-Opens a TCP connection to `host:port`. Retries internally while the ESP
-reports `busy` (its IP stack may still be warming up right after `NETUP`).
-`NERR_DNS` if the name could not be resolved by the ESP, `NERR_CANCEL` if the
-user cancelled a pending connect (with `CANCELKEYS` on), `NERR_CONNECT` for
-any other failure.
+Opens a TCP connection to `host:port` on the given channel. Retries internally
+while the ESP reports `busy` (its IP stack may still be warming up right after
+`NETUP`). `NERR_STATE` if that channel is already open (the other channel's
+state does not matter), `NERR_DNS` if the name could not be resolved by the ESP,
+`NERR_CANCEL` if the user cancelled a pending connect (with `CANCELKEYS` on),
+`NERR_CONNECT` for any other failure.
+
+Opening a channel clears whatever was buffered for it, so a new link never
+replays the previous one's data. The other channel is untouched.
+
+`CIPSTART` is parsed with the same link-aware binary reader as SEND. Its own
+`<id>,CONNECT` is the definitive success event; the DLL does not wait for the
+following `OK`, because an immediately streaming peer can keep continuous
+`+IPD` ahead of that command tail. Any `+IPD` arriving before `CONNECT` is
+stashed for the new channel; data after it remains on the UART and is delivered
+by the first RECV instead of being consumed as command text. A stale bare `OK`
+or a `CONNECT` notification for another link cannot complete the open. RTS is
+temporarily paused after the matching `CONNECT` and resumed by the first RECV
+or SEND, preserving already queued FIFO bytes across the libman/application
+return without allowing an immediate peer greeting to overrun the 16550.
 
 ### Function 6 - SEND
 
@@ -191,30 +242,45 @@ before sending when the peer may talk unprompted.
 
 ### Function 7 - RECV
 
-Reads up to `max` bytes with an `IY` millisecond timeout. Returns:
+Reads up to `max` bytes from one channel with an `IY` millisecond timeout.
+Returns:
 
 - `A=NERR_OK, DE>0` - data received.
-- `A=NERR_OK, DE=0` - timeout, connection still alive (use for polling).
+- `A=NERR_OK, DE=0` - nothing for this channel yet. Usually the timeout expired;
+  with two channels it can also mean the backend buffered a block for the
+  *other* channel and handed control straight back (flag bit3, below), so a
+  caller does not sit behind the busy channel's stream.
 - `A=NERR_CLOSED` - the peer closed the connection. **Any bytes already
   buffered are delivered first (DE>0, A=NERR_OK); the *next* call returns
   NERR_CLOSED with DE=0**, so a "FIN with a final data segment" never loses the
-  tail.
+  tail. A close on one channel never affects the other.
 
-IX returns status flags: bit1 = more data is immediately pending (the caller
-buffer filled mid-frame, or bytes remain in the send-window defer buffer below;
-call RECV again), bit2 = data was lost since the last RECV - either a UART
-overrun (16550 LSR overrun error) or a peer frame too large for the send-window
-defer buffer (see "Data arriving during a SEND"). bit0 is reserved for backends
-that truncate oversized datagrams; UNETESP delivers an oversized UDP datagram
-across successive RECV calls instead (bit1 set) rather than dropping the tail.
+IX returns status flags, all scoped to the channel just read:
+
+| bit | meaning |
+|-----|---------|
+| 0 | oversized datagram was truncated (never set by UNETESP - the tail arrives on the next call with bit1 instead) |
+| 1 | more data is already buffered for this channel; call RECV again |
+| 2 | data was lost since the last RECV on this channel: a UART overrun (16550 LSR) or a buffered frame dropped on overflow |
+| 3 | data is pending on the **other** channel (optional; UNETESP 0.3 and later) |
 
 ### Function 9 - STATUS
 
-With `A` = a channel number, returns the last-known channel state in DE
-(0 = closed, 2 = connected). With `A = 0xFF`, returns network status **without
-touching the hardware**: `A = NERR_OK` / `NERR_NONET`, and DE bit0 = the
-network is configured (env published), bit1 = `NETINIT` has completed. Useful
-for a launcher that wants to show status cheaply.
+With `A` = a channel number, returns that channel's state in DE:
+
+| bit | meaning |
+|-----|---------|
+| 1 (`0x02`) | channel is connected (last known state) |
+| 2 (`0x04`) | received data is buffered for it and not delivered yet (optional; only backends with `CAP_MULTICHAN` set it, so treat "clear" as "unknown" rather than "empty") |
+
+STATUS reads memory only - it never touches the UART, so it is cheap enough to
+poll between other work. A channel whose peer has closed reports the pending bit
+without the connected bit, which is the cue to keep reading until `NERR_CLOSED`.
+
+With `A = 0xFF`, returns network status **without touching the hardware**:
+`A = NERR_OK` / `NERR_NONET`, and DE bit0 = the network is configured (env
+published), bit1 = `NETINIT` has completed. Useful for a launcher that wants to
+show status cheaply.
 
 ### Function 11 - RESOLVE
 
@@ -251,6 +317,41 @@ response is longer than the buffer, the final bytes (the `ERROR`/`CLOSED`
 line - the useful part) survive the truncation. `max=0` returns `NERR_PARAM`.
 A diagnostic aid, like the ESP debug tail in the fido binkp client.
 
+After a failed SEND the buffer instead holds
+
+```
+send failed, res=<n>, last: <line>, lsr=<n>, got=<n>: <first bytes> end: <last bytes> esp=<verdict>
+```
+
+because every send failure maps to the single status `NERR_SEND` while the raw
+AT buffer still describes the previous command. `res` is the transport code
+(1 = ESP replied `ERROR`, 2 = `FAIL`, 3 = transmit timeout, 4 = no response),
+`last` is the final response line of that send (empty when none arrived),
+`lsr` accumulates 16550 line errors of this window (2 = overrun, 4 = parity,
+8 = framing, 16 = break), `got` counts every byte the window received with its
+first and last bytes shown (non-printables as dots). `esp=` is the verdict of
+the post-failure recovery probe: `alive` (the module answers AT - the command
+itself was lost), `busy` (still answering `busy p...`), `reboot` (its boot
+banner was seen: the session's links are gone), `tx-block` (our transmit
+stalled - CTS held low), `mute` (no reaction within the probe's ~10 s), `-`
+(the failure was an explicit ERROR/FAIL, no probe was run).
+
+`mute` is not proof the module died. ESP-AT serves the AT parser and ALL UART
+output from one task; in `CIPMUX=1` under bidirectional load that task can
+block inside a command for seconds - `+IPD` delivery stops with it - and then
+recover on its own (observed on real 2.2.2 hardware: after such a stall the
+module is still associated and still at its session baud). A consumer that can
+retry at the protocol level should treat `mute` as "try again shortly", not as
+a dead link.
+
+Silent connect timeouts trigger a bounded recovery ladder: the DLL probes with
+`AT` for up to ~10 s through the same +IPD-aware reader, reissues `CIPSTART`
+once when command mode is proven alive, and accepts a late `<id>,CONNECT` as
+success. For SEND the probe is safe only after the complete payload left the
+host; it can accept a late `SEND OK` or detect a reboot, but never reissues the
+payload. Before the `>` prompt even an `AT` probe could be consumed as payload
+if the prompt was merely late, so that path fails closed without probing.
+
 ### Function 17 - SETOPT
 
 - `UNET_OPT_CANCELKEYS` (1): DE=1 enables Esc / Ctrl+Z polling during blocking
@@ -260,6 +361,46 @@ A diagnostic aid, like the ESP debug tail in the fido binkp client.
   level. Default 4. Use a different value only for field diagnostics on
   specific hardware (see the overrun note). Returns `NERR_STATE` before
   `NETINIT` (the UART base is not known yet).
+- `UNET_OPT_SENDSLICE` (3): DE = milliseconds of link **silence** after which
+  a SEND suspends with `NERR_AGAIN` instead of blocking. 0 (the default)
+  keeps sends fully blocking; non-zero values are clamped to >= 50. Gate on
+  `UNET_CAP_ASYNCSEND`. See "Non-blocking SEND" below.
+
+### Non-blocking SEND (CAP_ASYNCSEND, UNETESP >= 0.4)
+
+A `CIPSEND` is a transaction: once the command text is out, a second copy may
+be swallowed as payload, so "time out and retry" is never safe. Instead the
+DLL keeps the transaction alive across calls:
+
+- With `UNET_OPT_SENDSLICE` set, a SEND whose link stays **silent** for one
+  quantum returns `NERR_AGAIN` with `DE` = bytes confirmed so far. Nothing is
+  retransmitted and nothing is lost - `+IPD` frames that arrive while the
+  transaction is parked were already stashed for their channels.
+- Repeat the **same** call (same channel, buffer, length) to continue; the
+  wait resumes exactly where it stopped, including a half-matched `+IPD,`
+  prefix or a half-received response line. A different channel or different
+  arguments while a transaction is pending return `NERR_STATE`.
+- Between repeats the consumer may run its UI, poll the keyboard, and call
+  RECV/STATUS freely: while a send is suspended RECV serves only buffered
+  data and returns immediately (never touching the live stream), and STATUS
+  never touches hardware. `UNET_RXF_XCHAN`/`UNET_ST_RXPEND` still work.
+- Functions that transmit AT text (CONNECT, UDPOPEN, CLOSE, NETDONE, PING,
+  RESOLVE, NETINIT) return `NERR_BUSY` while a SEND is pending and do not touch
+  the UART. Only the same SEND may advance the transaction: completing it from
+  another API call would lose its byte-count result, and a later SEND retry
+  would duplicate stream bytes. Finish the SEND before CLOSE/NETDONE/free; use
+  the explicit `NETRESET` tool if the module never returns to command mode.
+- As long as data keeps flowing the quantum never fires: the slice measures
+  silence, not total duration. A stalled ESP (see LASTERR's `esp=` verdicts)
+  simply yields `NERR_AGAIN` every quantum until the module recovers or the
+  consumer gives up.
+- Silence that falls **inside** a `+IPD` frame capture still uses the internal
+  5 s per-byte timeout. The captured prefix is committed and the exact unread
+  payload count remains live; a later RECV/SEND continuation resumes that
+  binary frame before any new AT text is allowed onto the UART.
+
+`RACETEST -a` exercises this mode end to end (slice 200 ms, ticks `~` per
+suspension, continuity-checked as always).
 
 ---
 
@@ -268,7 +409,8 @@ A diagnostic aid, like the ESP debug tail in the fido binkp client.
 `NERR_OK`=0, `NERR_HW`=1, `NERR_NONET`=2, `NERR_DNS`=3, `NERR_CONNECT`=4,
 `NERR_SEND`=5, `NERR_RECV_TIMEOUT`=6, `NERR_CLOSED`=7, `NERR_CANCEL`=8,
 `NERR_PARAM`=9, `NERR_NOTSUP`=10, `NERR_STATE`=11, `NERR_TIMEOUT`=12,
-`NERR_BUSY`=13, `NERR_PROTO`=14.
+`NERR_BUSY`=13, `NERR_PROTO`=14, `NERR_AGAIN`=15 (suspended send - not an
+error; see "Non-blocking SEND").
 
 ---
 
@@ -354,6 +496,60 @@ its consumers behave identically. (An ESP-only raw transparent pipe could still
 be added behind the reserved `CAP_TRANSPARENT` bit and slots 18-23, but the
 portable, now-lossless path is SEND/RECV.)
 
+### Two channels
+
+Backends with `CAP_MULTICHAN` hold two connections at once - channel 0 and
+channel 1 - which is what passive FTP needs: commands and replies on the control
+connection while the data connection transfers a file. UNETESP 0.3 and later
+supports it (through ESP-AT multi-connection mode); UNETRTL does not, so branch
+on the capability bit:
+
+```
+    GETCAPS                            ; DE bit4 (0x0010) = CAP_MULTICHAN
+    CONNECT   chan 0, host, "21"       ; control
+    ; ... login, TYPE I, PASV -> parse the 227 reply
+    CONNECT   chan 1, pasv_host, pasv_port
+    SEND      chan 0, "RETR file",13,10
+loop:
+    RECV      chan 1, buf, max, 4000 ms   ; data
+    ; A=NERR_OK/DE>0   -> write DE bytes
+    ; A=NERR_OK/DE=0   -> nothing yet; IX bit3 set means channel 0 has data
+    ; A=NERR_CLOSED    -> server closed the data link: transfer complete
+    RECV      chan 0, buf, max, 800 ms    ; picks up 150/226 whenever they came
+    CLOSE     chan 1
+    ; ... QUIT
+    CLOSE     chan 0
+    NETDONE                               ; also restores single-connection mode
+```
+
+Rules that make this work:
+
+- **Read the channels in turn.** The backend reads one shared serial link, so a
+  block that arrives for the channel you are *not* reading is buffered for it and
+  the current read returns immediately with `DE=0` and `IX` bit3 set. That is a
+  "switch channels" signal, not an idle link. `STATUS` reports the same thing
+  (`0x04`) without consuming anything.
+- **Order is preserved per channel.** Buffered data is always delivered before
+  anything newer, and before that channel's `NERR_CLOSED`.
+- **Both directions are safe while both channels are open.** Sending on the
+  control channel during a data transfer is exactly the FTP pattern (`REST`,
+  `RETR`, `STOR`, `LIST`), and data that arrives during those sends is captured
+  the same way as in the single-channel case above.
+- **Drain promptly.** Each channel has its own 2 KB buffer. If the channel you
+  are ignoring receives more than that before you come back to it, the excess is
+  dropped and flagged with `IX` bit2 on its next RECV. Alternating reads, keeping
+  slow disk/screen work between them short, and using `RXPAUSE` around that work
+  keeps the buffers shallow.
+- **One thing at a time.** Do not call `CONNECT`, `RESOLVE` or `PING` while the
+  peer on the other channel may transmit unprompted: those parse a line-based AT
+  response and would consume peer data as text. In FTP this never happens - the
+  data channel is opened between the `227` reply and the transfer command.
+
+Uploads finish the other way round: the *client* closes the data channel to
+signal end of file (`CLOSE` channel 1), then reads the `226` on the control
+channel. `CLOSE` waits for the ESP's reply without swallowing peer data, so a
+`226` racing the close is not lost.
+
 ---
 
 ## Avoiding UART overrun (ESP backend)
@@ -408,12 +604,15 @@ for the sprinter-rtl8019a project:
   in its ~14.5 KB ring. Clear `CAP_RXFLOW`.
 - **Capabilities:** at minimum `TCP | RESOLVE | PING`; add `UDP` and `RAWETH`
   as implemented. `CAP_RXFLOW` off.
-- **v2 - two channels (passive FTP):** the channel byte is already in the ABI.
-  True simultaneous connections on RTL require two TCP contexts, demultiplexing
-  inbound packets by IP/port tuple, a receive queue for the inactive
-  connection, and independent seq/ACK/FIN timers - roughly +30-50% of the stack
-  code. For the FTP control+data pattern the existing sequential
-  `SAVE_CTX` / `RESTORE_CTX` context swap is sufficient. When multi-channel
-  lands, set `CAP_MULTICHAN` and accept channel 1; existing consumers are
-  unaffected. (On ESP the equivalent is `AT+CIPMUX=1`; `NETDONE` must then
-  restore `CIPMUX=0`.)
+- **Two channels (passive FTP):** implemented on the ESP side since UNETESP 0.3
+  (`AT+CIPMUX=1`, one receive buffer per channel, `NETDONE` restoring
+  `CIPMUX=0`); still open on RTL. True simultaneous connections there require
+  two TCP contexts, demultiplexing inbound packets by IP/port tuple, a receive
+  queue for the inactive connection, and independent seq/ACK/FIN timers -
+  roughly +30-50% of the stack code. For the FTP control+data pattern the
+  existing sequential `SAVE_CTX` / `RESTORE_CTX` context swap may be enough.
+  When it lands, set `CAP_MULTICHAN`, accept channel 1, and follow the
+  semantics in "[Two channels](#two-channels)": per-channel close, buffered
+  data delivered before `NERR_CLOSED`, and - if the backend can buffer per
+  channel - the optional `STATUS` pending bit and RECV flag bit3. Existing
+  consumers are unaffected either way.

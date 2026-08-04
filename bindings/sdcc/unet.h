@@ -54,6 +54,8 @@
 #define NERR_TIMEOUT        12
 #define NERR_BUSY           13
 #define NERR_PROTO          14
+#define NERR_AGAIN          15  /* send suspended (UNET_OPT_SENDSLICE): repeat
+                                   the same unet_send_ch() call to continue */
 
 /* ----- capability bits (from unet_caps) ----- */
 #define UNET_CAP_TCP         0x0001
@@ -65,6 +67,21 @@
 #define UNET_CAP_RAWETH      0x0040
 #define UNET_CAP_TRANSPARENT 0x0080
 #define UNET_CAP_RXFLOW      0x0100
+#define UNET_CAP_ASYNCSEND   0x0200  /* NERR_AGAIN / UNET_OPT_SENDSLICE support */
+
+/* ----- STATUS(channel) state bits (unet_status_ch) ----- */
+#define UNET_ST_CONN         0x0002  /* channel is connected */
+#define UNET_ST_RXPEND       0x0004  /* data buffered for this channel.
+                                        Optional: only backends with
+                                        UNET_CAP_MULTICHAN report it. */
+
+/* ----- RECV flag bits (the flags argument of unet_recv) ----- */
+#define UNET_RXF_TRUNC       0x0001  /* datagram truncated (never on ESP) */
+#define UNET_RXF_MORE        0x0002  /* more data buffered for this channel */
+#define UNET_RXF_LOST        0x0004  /* overrun or dropped frame since last call */
+#define UNET_RXF_XCHAN       0x0008  /* data pending on the OTHER channel:
+                                        an empty read means "switch channels",
+                                        not "link idle" */
 
 /* ----- GETINFO fields ----- */
 #define UNET_IF_BACKEND     0
@@ -84,6 +101,9 @@
 /* ----- SETOPT options ----- */
 #define UNET_OPT_CANCELKEYS 1
 #define UNET_OPT_RXTRIG     2
+#define UNET_OPT_SENDSLICE  3   /* ms of silence before SEND suspends with
+                                   NERR_AGAIN; 0 = blocking (default).
+                                   Gate on UNET_CAP_ASYNCSEND. */
 
 /* unet_load error codes (distinct from NERR_*, all negative) */
 #define UNET_LOAD_OK         0
@@ -117,6 +137,22 @@ i8  unet_connect(const char *host, const char *port);
 
 /* Open a connected UDP endpoint (lport may be NULL for a default local port). */
 i8  unet_udpopen(const char *host, const char *rport, const char *lport);
+
+/*
+ * Channel-aware variants. Channel 0 behaves exactly like the functions above;
+ * channel 1 needs a backend whose unet_caps() has UNET_CAP_MULTICHAN (else
+ * NERR_PARAM). Two channels let one program hold, say, an FTP control and data
+ * connection at once. Read them in turn: a read that returns 0 with
+ * UNET_RXF_XCHAN set means the other channel has data waiting.
+ */
+i8  unet_connect_ch(u8 ch, const char *host, const char *port);
+i8  unet_udpopen_ch(u8 ch, const char *host, const char *rport, const char *lport);
+i16 unet_send_ch(u8 ch, const void *buf, u16 len);
+i16 unet_recv_ch(u8 ch, void *buf, u16 max, u16 timeout_ms, u16 *flags);
+i8  unet_close_ch(u8 ch);
+
+/* Per-channel state into *state (UNET_ST_* bits). Returns NERR_OK or NERR_*. */
+i8  unet_status_ch(u8 ch, u16 *state);
 
 /* Send len bytes. Returns bytes sent (>=0), or -(NERR_*) on failure. */
 i16 unet_send(const void *buf, u16 len);

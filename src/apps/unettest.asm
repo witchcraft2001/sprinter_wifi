@@ -1,13 +1,16 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] [-u UDPPORT] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] HOST [PORT]
 ;
 ; Loads a UNET DLL (default UNETESP.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
 ; CONNECT, SEND (HTTP HEAD), a short RECV loop, CLOSE, NETDONE, l_free.
 ; -u UDPPORT swaps the TCP half for UDPOPEN / SEND / RECV against a datagram
 ; echo server instead (see tools/dev/udp_echo.py in the sibling RTL project).
+; -2 DATAPORT swaps it for the two-channel exercise (control on PORT, data on
+; DATAPORT at the same time), which needs CAP_MULTICHAN and pairs with
+; tools/race_server.py --dual. Backends without it report and skip.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETRTL.DLL to exercise the RTL card.
 ;
@@ -221,7 +224,13 @@ START
 	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 .after_ping
-	; -u selects the UDP exercise instead of the TCP one.
+	; -u / -2 select an exercise other than the plain TCP one.
+	LD	A,(DUAL_MODE)
+	AND	A
+	JR	Z,.check_udp
+	CALL	DUAL_PHASE
+	JP	.teardown
+.check_udp
 	LD	A,(UDP_MODE)
 	AND	A
 	JR	Z,.tcp_phase
@@ -718,6 +727,222 @@ UDP_PHASE
 .verdict
 	JP	PUTS_LN
 
+; ======================================================
+; Two-channel exercise (-2 DATAPORT): hold a control and a data connection at
+; the same time, the way a passive-FTP client does.
+;
+;   channel 0 -> HOST:PORT      control: echoes a line back
+;   channel 1 -> HOST:DATAPORT  data: streams a counter, then closes
+;
+; It checks the three things a single-channel backend cannot do: the data
+; stream stays byte-continuous while the control channel is in use, a control
+; reply that arrives DURING the data transfer is buffered instead of lost, and
+; the data channel's close is reported on that channel alone.
+; Pair with tools/race_server.py --dual.
+; ======================================================
+DUAL_PHASE
+	LD	A,(CAPS)
+	AND	UNET_CAP_MULTICHAN
+	JR	NZ,.supported
+	; A single-channel backend (UNETRTL) is not a failure here.
+	LD	HL,MSG_DUAL_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	HL,MSG_DUAL
+	CALL	PUTS
+	LD	HL,PORT_BUFF
+	CALL	PUTS
+	LD	A,'/'
+	CALL	PUT_CHAR
+	LD	HL,DUAL_PORT_BUF
+	CALL	PUTS_LN
+
+	; --- control channel ---
+	LD	HL,MSG_DUAL_CTRL_OPEN
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,DUAL_CONNECT_FAILED
+
+	; --- data channel, opened while the control one stays up ---
+	LD	HL,MSG_DUAL_DATA_OPEN
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,DUAL_PORT_BUF
+	CALL	PUTS_LN
+	LD	A,1
+	LD	DE,HOST_BUFF
+	LD	IX,DUAL_PORT_BUF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,DUAL_CONNECT_FAILED
+
+	; --- send on the control channel while data is already streaming ---
+	XOR	A
+	LD	DE,DUAL_PROBE
+	LD	IX,DUAL_PROBE_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_SEND
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+
+	; --- drain the data channel until its peer closes ---
+	XOR	A
+	LD	(DUAL_NEXT),A
+	LD	(DUAL_BAD),A
+	LD	HL,0
+	LD	(DUAL_TOTAL),HL
+	LD	A,DUAL_MAX_ROUNDS
+	LD	(RECV_LEFT),A
+.data_loop
+	LD	A,(RECV_LEFT)
+	AND	A
+	JR	Z,.data_done
+	DEC	A
+	LD	(RECV_LEFT),A
+	LD	A,1
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,4000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got
+	CP	NERR_CLOSED
+	JR	Z,.data_closed
+	OR	A
+	JR	NZ,.data_err
+	LD	A,D
+	OR	E
+	JR	Z,.data_loop			; nothing for this channel yet
+	CALL	DUAL_CHECK_SEQ
+	JR	.data_loop
+.data_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	JR	.data_done
+.data_closed
+	LD	A,D
+	OR	E
+	CALL	NZ,DUAL_CHECK_SEQ		; trailing bytes precede the close
+	LD	HL,MSG_DUAL_CLOSED
+	CALL	PUTS_LN
+.data_done
+	LD	HL,MSG_DUAL_BYTES
+	CALL	PUTS
+	LD	HL,(DUAL_TOTAL)
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	LD	A,(DUAL_BAD)
+	AND	A
+	LD	HL,MSG_DUAL_SEQ_OK
+	JR	Z,.seq_verdict
+	LD	HL,MSG_DUAL_SEQ_BAD
+.seq_verdict
+	CALL	PUTS_LN
+
+	; --- the control reply must have survived the transfer ---
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> DE = state bits
+	LD	A,E
+	AND	UNET_ST_RXPEND
+	LD	HL,MSG_DUAL_PEND
+	JR	NZ,.pend_verdict
+	LD	HL,MSG_DUAL_NOPEND
+.pend_verdict
+	CALL	PUTS_LN
+
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,4000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got
+	OR	A
+	JR	NZ,.ctrl_err
+	LD	A,D
+	OR	E
+	JR	Z,.ctrl_none
+	LD	HL,MSG_DUAL_CTRL
+	CALL	PUTS
+	CALL	PRINT_RECV
+	CALL	CRLF
+	JR	.close_both
+.ctrl_none
+	LD	HL,MSG_DUAL_CTRL_NONE
+	CALL	PUTS_LN
+	JR	.close_both
+.ctrl_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+.close_both
+	LD	A,1
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+
+; A failed CONNECT here is the interesting case, so report the DLL status
+; number as well as the ESP's own last words - "connect failed" alone does not
+; say whether the link was refused, the channel was rejected, or the ESP
+; answered something unexpected.
+DUAL_CONNECT_FAILED
+	PUSH	AF
+	LD	HL,MSG_ERR_CONNECT
+	CALL	PUTS
+	LD	HL,MSG_DUAL_STATUS
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; Verify that DE bytes in RECV_BUF continue the counter stream and account for
+; them. The server sends 0,1,2,...,255,0,... so one byte of state is enough.
+DUAL_CHECK_SEQ
+	PUSH	DE
+	LD	HL,(DUAL_TOTAL)
+	ADD	HL,DE
+	LD	(DUAL_TOTAL),HL
+	POP	BC				; BC = count
+	LD	HL,RECV_BUF
+.loop
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	A,(DUAL_NEXT)
+	CP	(HL)
+	JR	Z,.ok
+	LD	A,1
+	LD	(DUAL_BAD),A
+	LD	A,(HL)				; resynchronise on the byte we got
+.ok
+	INC	A
+	LD	(DUAL_NEXT),A
+	INC	HL
+	DEC	BC
+	JR	.loop
+
 ; Compare the received datagram with the payload we sent.
 ; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
 UDP_ECHO_MATCH
@@ -787,6 +1012,7 @@ PARSE_ARGS
 	XOR	A
 	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
 	LD	(UDP_MODE),A			; default: TCP exercise
+	LD	(DUAL_MODE),A
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
@@ -809,6 +1035,10 @@ PARSE_ARGS
 	LD	DE,STR_DASH_U
 	CALL	STREQ
 	JR	Z,.flag_u
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_2
+	CALL	STREQ
+	JR	Z,.flag_2
 	JP	USAGE_EXIT			; unknown flag
 .flag_d
 	LD	DE,DLL_NAME
@@ -825,6 +1055,14 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -u without a port
 	LD	A,1
 	LD	(UDP_MODE),A
+	JR	.next_flag
+.flag_2
+	LD	DE,DUAL_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -2 without a data port
+	LD	A,1
+	LD	(DUAL_MODE),A
 	JR	.next_flag
 .host_is_tok
 	LD	HL,TOKEN_BUF
@@ -1118,7 +1356,7 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [HOST [PORT]]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -1176,6 +1414,21 @@ MSG_UDP_OK	DB "udp echo ok",0
 MSG_UDP_BAD	DB "udp echo MISMATCH",0
 MSG_UDP_NOREPLY	DB "no udp reply",0
 MSG_UDP_UNSUP	DB "UDP not supported by this backend.",0
+MSG_DUAL	DB "dual channel ports ",0
+MSG_DUAL_CTRL_OPEN DB "connect control ",0
+MSG_DUAL_DATA_OPEN DB "connect data ",0
+MSG_DUAL_STATUS	DB " status ",0
+MSG_DUAL_UNSUP	DB "two channels not supported by this backend (no CAP_MULTICHAN)",0
+MSG_DUAL_CLOSED	DB "data channel closed by peer",0
+MSG_DUAL_BYTES	DB "data bytes: ",0
+MSG_DUAL_SEQ_OK	DB "data stream continuous",0
+MSG_DUAL_SEQ_BAD DB "data stream GAP - bytes were lost",0
+MSG_DUAL_PEND	DB "control data buffered during the transfer (STATUS RXPEND)",0
+MSG_DUAL_NOPEND	DB "no control data pending",0
+MSG_DUAL_CTRL	DB "control reply: ",0
+MSG_DUAL_CTRL_NONE DB "control channel returned nothing",0
+DUAL_PROBE	DB "UNETTEST DUAL CONTROL",13,10
+DUAL_PROBE_LEN	EQU $ - DUAL_PROBE
 MSG_CRLF	DB 13,10,0
 
 DEF_DLL		DB "UNETESP.DLL",0
@@ -1183,6 +1436,7 @@ DEF_HOST	DB "example.com",0
 DEF_PORT	DB "80",0
 STR_DASH_D	DB "-d",0
 STR_DASH_U	DB "-u",0
+STR_DASH_2	DB "-2",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
@@ -1229,14 +1483,19 @@ USED_EXEDIR	EQU DLL_ARG_FLAG + 1	; 1 = first candidate was DLL_PATH
 UDP_MODE	EQU USED_EXEDIR + 1	; 1 = -u given, run the UDP exercise
 UDP_RX_LEN	EQU UDP_MODE + 1
 UDP_RX_FLAGS	EQU UDP_RX_LEN + 2
-DEC_BUF		EQU UDP_RX_FLAGS + 1
+DUAL_MODE	EQU UDP_RX_FLAGS + 1	; 1 = -2 given, run the two-channel exercise
+DUAL_NEXT	EQU DUAL_MODE + 1	; next expected byte of the data stream
+DUAL_BAD	EQU DUAL_NEXT + 1	; 1 = the data stream lost continuity
+DUAL_TOTAL	EQU DUAL_BAD + 1	; bytes received on the data channel
+DEC_BUF		EQU DUAL_TOTAL + 2
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
 HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
 UDP_PORT_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
-TOKEN_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
+DUAL_PORT_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
+TOKEN_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
@@ -1252,6 +1511,7 @@ STACK_TOP	EQU STACK_BOTTOM + 0x600
 
 RECV_MAX_BLOCKS	EQU 4
 UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
+DUAL_MAX_ROUNDS	EQU 200			; bounds the -2 data drain loop
 
 	ASSERT STACK_TOP <= 0xC000
 

@@ -121,6 +121,27 @@ START
 	LD	B,UNET_FN_SETOPT
 	CALL	DO_CALL
 
+	; --- -a: suspendable sends, gated on the capability bit ---
+	LD	A,(ASYNC_FLAG)
+	OR	A
+	JR	Z,.no_async
+	LD	A,(CAPS+1)
+	AND	HIGH UNET_CAP_ASYNCSEND
+	JR	NZ,.async_on
+	LD	HL,MSG_NO_ASYNC
+	CALL	PUTS_LN
+	XOR	A
+	LD	(ASYNC_FLAG),A
+	JR	.no_async
+.async_on
+	LD	A,UNET_OPT_SENDSLICE
+	LD	DE,200
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+	LD	HL,MSG_ASYNC
+	CALL	PUTS_LN
+.no_async
+
 	; --- NETINIT ---
 	LD	B,UNET_FN_NETINIT
 	CALL	DO_CALL
@@ -160,6 +181,9 @@ START
 	LD	A,(FAIL_FLAG)
 	AND	A
 	JR	NZ,.verdict_fail
+	LD	A,(ABORT_FLAG)
+	AND	A
+	JR	NZ,.verdict_fail
 	LD	A,(NODATA_FLAG)
 	AND	A
 	JR	NZ,.verdict_nodata
@@ -184,12 +208,13 @@ RACE_LOOP
 	LD	(TOTAL),HL
 	LD	(ITERS),HL
 	LD	(LOST_COUNT),HL
-	LD	A,1
-	LD	(NEED_ANCHOR),A
 	XOR	A
+	LD	(EXPECT),A		; the server starts every TCP stream at byte 0
+	LD	(NEED_ANCHOR),A
 	LD	(BLOCKS_SINCE),A
 	LD	(FAIL_FLAG),A
 	LD	(NODATA_FLAG),A
+	LD	(ABORT_FLAG),A
 .loop
 	LD	HL,(TOTAL)
 	LD	DE,STOP_BYTES
@@ -229,6 +254,9 @@ RACE_LOOP
 	OR	E
 	JR	Z,.send				; nothing queued -> open a race window
 	CALL	.consume
+	LD	A,(FAIL_FLAG)
+	AND	A
+	JP	NZ,.finish			; do not hide the first gap behind a SEND timeout
 	LD	A,(BLOCKS_SINCE)
 	INC	A
 	LD	(BLOCKS_SINCE),A
@@ -241,17 +269,40 @@ RACE_LOOP
 	LD	(BLOCKS_SINCE),A
 	LD	A,'.'
 	CALL	PUT_CHAR
+.send_call
 	XOR	A				; channel 0
 	LD	DE,SEND_BUF
 	LD	IX,SEND_SIZE
 	LD	B,UNET_FN_SEND
 	CALL	DO_CALL
 	OR	A
-	JP	NZ,.send_bad
+	JP	NZ,.send_check
 	LD	HL,(ITERS)
 	INC	HL
 	LD	(ITERS),HL
 	JP	.loop
+.send_check
+	CP	NERR_AGAIN
+	JP	NZ,.send_bad
+	; Suspended (-a mode): the consumer stays live between slices. Prove it -
+	; tick, drain what the transaction stashed for us (RECV never touches the
+	; wire while a send is suspended), keep the continuity check running, and
+	; repeat the same SEND to continue the transaction.
+	LD	A,'~'
+	CALL	PUT_CHAR
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,100
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,.send_call			; let the SEND resume report the state
+	LD	A,D
+	OR	E
+	JP	Z,.send_call
+	CALL	.consume
+	JP	.send_call
 .closed
 	LD	A,D
 	OR	E
@@ -273,12 +324,18 @@ RACE_LOOP
 	; NERR_CANCEL (user abort) is not a failure of the code under test.
 	CP	NERR_CANCEL
 	JR	Z,.finish
+	PUSH	AF
 	LD	HL,MSG_SEND_ERR
-	CALL	PUTS_LN
+	CALL	PUTS
+	POP	AF
+	CALL	REPORT_ABORT
 	JR	.finish
 .recv_bad
+	PUSH	AF
 	LD	HL,MSG_RECV_ERR
-	CALL	PUTS_LN
+	CALL	PUTS
+	POP	AF
+	CALL	REPORT_ABORT
 	; fall through to finish
 
 .finish
@@ -310,7 +367,16 @@ RACE_LOOP
 .have_data
 	LD	A,(FAIL_FLAG)
 	AND	A
+	JR	NZ,.mismatch
+	; A run that stopped on a SEND/RECV error proves nothing about continuity,
+	; so it must not reach the PASS verdict just because the bytes it did read
+	; were in order.
+	LD	A,(ABORT_FLAG)
+	AND	A
 	RET	Z				; PASS printed by the caller
+	LD	HL,MSG_ABORT
+	JP	PUTS_LN
+.mismatch
 	; mismatch detail
 	LD	HL,MSG_FAIL
 	CALL	PUTS
@@ -328,8 +394,8 @@ RACE_LOOP
 
 ; ======================================================
 ; Verify BC bytes at (DE) continue the incrementing byte stream.
-; First byte anchors EXPECT; each later byte must equal EXPECT, then
-; EXPECT := (byte+1) & 0xFF (resync so one gap = one recorded mismatch).
+; The server starts at zero; every byte must equal EXPECT, then EXPECT becomes
+; byte+1 modulo 256 (resync so one gap = one recorded mismatch).
 ; Records only the FIRST mismatch (FAIL_EXPECT/FAIL_GOT/FAIL_AT).
 ; ======================================================
 CHECK_BYTES
@@ -466,8 +532,11 @@ ERR_NETINIT
 	JP	EXIT
 
 ERR_CONNECT
+	PUSH	AF
 	LD	HL,MSG_ERR_CONNECT
 	CALL	PUTS_LN
+	POP	AF
+	CALL	REPORT_ABORT
 	CALL	FREE_AND_DONE
 	LD	B,3
 	JP	EXIT
@@ -489,6 +558,40 @@ FREE_AND_DONE
 EXIT
 	LD	C,DSS_EXIT
 	RST	DSS
+
+; ======================================================
+; Report an aborted round: " status <n>" plus the tail of the ESP/driver
+; response that caused it. Without the numeric code and the module's own words
+; a stopped run only says "send error", which is not enough to tell an ESP
+; refusal from a UART timeout.
+; In: A = NERR status.
+; ======================================================
+REPORT_ABORT
+	PUSH	AF
+	LD	HL,MSG_STATUS
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	LD	A,1
+	LD	(ABORT_FLAG),A
+	; fall through
+DUMP_LASTERR
+	LD	HL,MSG_LASTERR
+	CALL	PUTS
+	XOR	A
+	LD	(ERR_BUF),A
+	LD	DE,ERR_BUF
+	LD	IX,ERR_BUF_SIZE
+	LD	B,UNET_FN_LASTERR
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.unavailable
+	LD	HL,ERR_BUF
+	JP	PUTS_LN
+.unavailable
+	LD	HL,MSG_NO_LASTERR
+	JP	PUTS_LN
 
 ; ======================================================
 ; libman call helper (args in A/DE/IX/IY, B = function number).
@@ -568,6 +671,7 @@ PARSE_ARGS
 	CALL	STRCPY
 	XOR	A
 	LD	(DLL_ARG_FLAG),A
+	LD	(ASYNC_FLAG),A
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
 	LD	(PARSE_LEFT),A
@@ -585,7 +689,15 @@ PARSE_ARGS
 	LD	DE,STR_DASH_D
 	CALL	STREQ
 	JR	Z,.flag_d
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_A
+	CALL	STREQ
+	JR	Z,.flag_a
 	JP	USAGE_EXIT
+.flag_a
+	LD	A,1
+	LD	(ASYNC_FLAG),A
+	JR	.next_flag
 .flag_d
 	LD	DE,DLL_NAME
 	LD	C,DLL_NAME_SIZE
@@ -827,7 +939,9 @@ DIV10_HL
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "RACETEST - SEND-race defer stress (TCP)",0
-MSG_USAGE	DB "Usage: RACETEST [-d FILE.DLL] HOST [PORT]",0
+MSG_USAGE	DB "Usage: RACETEST [-d FILE.DLL] [-a] HOST [PORT]",0
+MSG_ASYNC	DB "async send: slice 200 ms",0
+MSG_NO_ASYNC	DB "async: DLL lacks CAP_ASYNCSEND - running blocking",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_NETUP	DB "NETINIT ok",0
@@ -842,6 +956,10 @@ MSG_FAIL3	DB " at byte ",0
 MSG_NODATA	DB "no data - is the race server streaming on this port?",0
 MSG_SEND_ERR	DB "send error (stopping)",0
 MSG_RECV_ERR	DB "receive error (stopping)",0
+MSG_STATUS	DB " status ",0
+MSG_LASTERR	DB "lasterr: ",0
+MSG_NO_LASTERR	DB "(unavailable)",0
+MSG_ABORT	DB "ABORT: stopped early - continuity not proven",0
 MSG_ERR_LOAD	DB "Cannot load DLL:",0
 MSG_LOAD_OPEN	DB "DLL file not found",0
 MSG_LOAD_MEM	DB "out of DSS memory",0
@@ -863,6 +981,7 @@ DEF_DLL		DB "UNETESP.DLL",0
 DEF_HOST	DB "192.168.1.10",0
 DEF_PORT	DB "9099",0
 STR_DASH_D	DB "-d",0
+STR_DASH_A	DB "-a",0
 
 ; Dummy SEND payload (content irrelevant; the server discards it). Fixed at
 ; SEND_SIZE bytes so the CIPSEND window is a predictable width.
@@ -881,6 +1000,7 @@ SEND_BUF	DS SEND_SIZE, 'X'
 	MODULE MAIN
 
 RECV_BUF_SIZE	EQU 1024
+ERR_BUF_SIZE	EQU 192		; full LASTERR text: reason + window trace + probe
 TOKEN_BUF_SIZE	EQU 64
 DLL_NAME_SIZE	EQU 128
 DLL_PATH_SIZE	EQU 272
@@ -909,7 +1029,10 @@ FAIL_FLAG	EQU NEED_ANCHOR + 1
 FAIL_EXPECT	EQU FAIL_FLAG + 1
 FAIL_GOT	EQU FAIL_EXPECT + 1
 NODATA_FLAG	EQU FAIL_GOT + 1
-DEC_BUF		EQU NODATA_FLAG + 1
+ABORT_FLAG	EQU NODATA_FLAG + 1
+ASYNC_FLAG	EQU ABORT_FLAG + 1
+ERR_BUF		EQU ASYNC_FLAG + 1
+DEC_BUF		EQU ERR_BUF + ERR_BUF_SIZE
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE

@@ -75,6 +75,57 @@ window 2 so the DLL can be loaded into window 2 (`UNetLoad('UNETESP.DLL', 2)`).
 
 Verified: `UNETPAS.INC` and `UNETDEMO.PAS` compile under the DSS TPC compiler.
 
+## Two channels
+
+A backend that reports `UNET_CAP_MULTICHAN` / `UNetCapMultichan` in its
+capability mask can hold **two** connections at once - channel 0 and channel 1 -
+which is what a passive-FTP client needs (control on one, data on the other).
+`UNETESP.DLL` 0.3 and later does; `UNETRTL.DLL` does not, so always gate on the
+bit rather than assuming it:
+
+```c
+if (unet_caps() & UNET_CAP_MULTICHAN) {
+    unet_connect_ch(0, host, "21");     /* control */
+    unet_connect_ch(1, host, pasv_port); /* data    */
+}
+```
+
+Both languages keep the original single-channel functions as channel-0 wrappers,
+so existing programs need no changes. The channel-aware names are
+`unet_connect_ch` / `unet_send_ch` / `unet_recv_ch` / `unet_close_ch` /
+`unet_udpopen_ch` / `unet_status_ch` in C, and `UNetConnectCh`, `UNetSendCh`,
+`UNetRecvCh`, `UNetCloseCh`, `UNetUdpOpenCh`, `UNetStatusCh` in Pascal.
+
+Read the two channels in turn. A read that returns 0 bytes with `UNET_RXF_XCHAN`
+(`UNetRxfXChan`) set in the RECV flags is not an idle link: the backend buffered
+a block for the *other* channel and handed control back so you can switch. The
+same information is available without reading, through `unet_status_ch` /
+`UNetStatusCh` (`UNET_ST_RXPEND` / `UNetStRxPend`). A channel's close is
+reported on that channel alone, and only after every byte it already received
+has been delivered.
+
+## Non-blocking sends (TUI programs)
+
+A backend with `UNET_CAP_ASYNCSEND` / `UNetCapAsyncSend` (UNETESP 0.4+) can
+suspend a send instead of blocking through an ESP stall. Enable it once with
+`unet_setopt(UNET_OPT_SENDSLICE, 200)` / `UNetSetOpt(UNetOptSendSlice, 200)`;
+then a send whose link stays silent for 200 ms returns `NERR_AGAIN` /
+`NErrAgain`, and repeating the **same** call continues the transaction without
+retransmitting anything:
+
+```c
+while ((r = unet_send_ch(ch, buf, len)) == -NERR_AGAIN) {
+    tui_poll();                      /* keep the UI alive between slices */
+    unet_recv_ch(ch, rx, sizeof rx, 50, &flags);  /* buffered data only */
+}
+```
+
+While a transaction is pending, AT-producing calls such as CLOSE return
+`NERR_BUSY`; finish the same SEND before closing/freeing the DLL. If the module
+never returns to command mode, use the explicit `NETRESET` utility. See the
+"Non-blocking SEND" section of [docs/UNETAPI.md](../docs/UNETAPI.md) for the
+exact contract.
+
 ## Bring the network up first
 
 None of these bindings configure the network. Run `NETUP` (Wi-Fi) or

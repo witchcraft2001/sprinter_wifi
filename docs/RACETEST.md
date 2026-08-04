@@ -12,6 +12,12 @@ touch it. The deterministic Z80-level unit test of the same logic is
 `tools/test-send-defer.sh` (run by `make test`); RACETEST is the end-to-end
 hardware check on top of it.
 
+RACETEST uses channel 0 only, but since UNETESP 0.3 that channel runs over the
+ESP multi-connection dialect (`AT+CIPMUX=1`, `+IPD,<link>,<len>:`), so this test
+is also the regression check that the dialect change did not disturb the proven
+single-channel receive path. `tools/race_server.py --dual` plus `UNETTEST -2`
+covers the two-channel case; see [UNETTEST.TXT](UNETTEST.TXT).
+
 ## How it works
 
 The server streams a single continuous, incrementing byte sequence
@@ -21,9 +27,10 @@ buffer must capture. The client loop is **drain-dominant**: it reads (and
 continuity-checks) several RECV blocks, then injects one SEND (the race window),
 and repeats. Draining must dominate so the inbound stream never backs up in the
 ESP; otherwise each SEND's prompt/`SEND OK` wait has to wade through a growing
-backlog byte-by-byte and the run wedges. The client checks that **every** byte
-it receives continues the sequence (`byte == previous+1 mod 256`); a dropped or
-reordered byte breaks continuity and fails the test, pinpointing the offset.
+backlog byte-by-byte and the run wedges. The client requires the first byte to
+be `0` and checks that **every** following byte continues the sequence
+(`byte == previous+1 mod 256`); a dropped or reordered byte, including a prefix
+lost during `CIPSTART`, breaks continuity and fails the test at that offset.
 
 This is why the server must be paced **below the UART line rate** (default
 4 KB/s): the client drains a backlog at line rate (~10 KB/s) but only consumes
@@ -70,7 +77,14 @@ make racetest          # -> build/RACETEST.EXE (dev tool, not packaged)
    ```
    RACETEST 192.168.1.50 9099
    RACETEST -d C:\WIFI\UNETESP.DLL 192.168.1.50 9099
+   RACETEST -a 192.168.1.50 9099
    ```
+
+   `-a` runs the same continuity test through the suspendable-send mode
+   (`UNET_OPT_SENDSLICE` 200 ms, `NERR_AGAIN` loops): every suspension prints
+   a `~`, buffered data is drained between repeats, and the byte counter is
+   still checked across the whole stream. On a DLL without `CAP_ASYNCSEND`
+   the flag prints a note and the run stays blocking.
 
 The client prints one `.` per SEND round while running (so you can see it is
 alive), then a stats line and a verdict, e.g.:
@@ -88,10 +102,38 @@ handshake stalled. Restart with the default paced server (4 KB/s). Note the
 abort keys (Esc/Ctrl+Z) do not interrupt a stalled `CIPSEND` prompt wait, so a
 wedged run may need a reset - correct pacing avoids the situation entirely.
 
-`lost=N` counts RECV calls that reported the "data lost" flag (`IX` bit2) - a
-frame too large for the defer buffer. It should be 0 with one MTU-sized frame
-per window; a non-zero value explains a continuity gap as an overflow rather than
-an ordering bug.
+`lost=N` counts RECV calls that reported the "data lost" flag (`IX` bit2):
+either the UART LSR overrun bit was observed, or a frame did not fit in the
+defer buffer. It should be 0 with one MTU-sized frame per window. A non-zero
+value confirms a real byte loss rather than only an ordering-check defect; the
+position and first surviving byte help distinguish UART overrun from defer
+overflow.
+
+The specific startup failure `lost=1`, `expected 0x00 got 0x20 at byte 0`
+means that the 16550 reported an overrun before the first RECV and the first
+32 stream bytes were lost. It is not evidence that the ESP stopped responding.
+UNETESP keeps the ISA/UART window open while it reads the `CIPSTART` response,
+drops RTS directly when the requested link's `CONNECT` notification arrives,
+then raises RTS only after the first RECV has opened the window and can drain
+the FIFO immediately. This protects an eager server that sends its first
+`+IPD` frame immediately after accepting the connection; no passive-receive
+ESP-AT mode is involved.
+
+A run that stops on a SEND or RECV error prints the numeric status, the DLL's
+`LASTERR` text, and the verdict `ABORT: stopped early - continuity not proven`
+(exit 3). It is deliberately not a PASS: the bytes read before the abort say
+nothing about the bytes that never arrived. For a send failure `LASTERR` names
+the transport reason, the window's byte trace, and the `esp=` verdict of the
+DLL's recovery probe - see "Function 16 - LASTERR" in [UNETAPI.md](UNETAPI.md).
+After the complete payload has left the host, the probe can accept a late
+`SEND OK` or detect a module reboot without duplicating bytes. Before the `>`
+prompt the DLL deliberately does not probe or reissue: a late prompt could make
+the probe/repeated command become CIPSEND payload and corrupt the stream.
+
+To tell a regression from a long-standing limit, run the same test against an
+older DLL with `-d`: `RACETEST -d C:\WIFI\UNETOLD.DLL <host> 9099`. Build the
+comparison DLL from the earlier commit into a separate file name rather than
+overwriting `UNETESP.DLL`.
 
 ## Exit codes
 

@@ -7,8 +7,8 @@
 	DEFINE	_VERSION_INC
 
 PACKAGE_VERSION_MAJOR	EQU 0
-PACKAGE_VERSION_MINOR	EQU 2
-PACKAGE_VERSION_PATCH	EQU 1
+PACKAGE_VERSION_MINOR	EQU 4
+PACKAGE_VERSION_PATCH	EQU 0
 
 	; Emit "v.<major>.<minor>.<patch>" built from the constants above. Placed
 	; right after the tool name in each banner, e.g. "FTP v.0.2.1 - ...".

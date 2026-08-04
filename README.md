@@ -3,7 +3,7 @@
 Network utility package for Sprinter DSS and the SprinterESP Wi-Fi card
 (ESP12-F/ESP8266 with ESP-AT firmware).
 
-Package version: 0.2.1
+Package version: 0.3.0
 
 ## Attribution
 

@@ -102,8 +102,8 @@ assemble_wterm()
 
 assemble_wterm
 
-# UNETESP.DLL is a UNET backend client too. It pins ESP-AT 2.2.2 + the stable
-# trigger-8 receive in-source; sprinter-mkdll only wraps these bytes in the L1
+# UNETESP.DLL is a UNET backend client too. It pins ESP-AT 2.2.2 + the complete
+# trigger-4 receive path in-source; sprinter-mkdll only wraps these bytes in the L1
 # header/relocation map, so assembling the source straight and grepping the raw
 # image is a faithful check of what ships. NETUP owns ESP UART negotiation, so
 # the DLL must never carry an AT+UART_CUR command.
@@ -123,12 +123,27 @@ if grep -a -q 'AT+UART_CUR=' "$tmp_dir/unetesp.bin"; then
 	echo "UNETESP.DLL unexpectedly contains an ESP UART reconfiguration command" >&2
 	exit 1
 fi
-# The 2.2.2-only DLL keeps the field-proven trigger-8 receive, never trigger 4.
-grep -Eq '1E 83[[:space:]]+LD[[:space:]]+E,FCR_TR8 \| FCR_RESET_RX \| FCR_FIFO' \
+# The complete 2.2.2 DLL path uses trigger 4 from command replies through +IPD;
+# queued bytes therefore never cross a trigger-mode transition.
+grep -Eq '1E 43[[:space:]]+LD[[:space:]]+E,FCR_TR4 \| FCR_RESET_RX \| FCR_FIFO' \
 	"$tmp_dir/unetesp.lst"
-if grep -Eq '1E 43[[:space:]]+LD[[:space:]]+E,FCR_TR4 \| FCR_RESET_RX \| FCR_FIFO' \
+if grep -Eq '1E 83[[:space:]]+LD[[:space:]]+E,FCR_TR8 \| FCR_RESET_RX \| FCR_FIFO' \
 	"$tmp_dir/unetesp.lst"; then
-	echo "UNETESP.DLL unexpectedly compiles active trigger 4 (should be 2.2.2 TR8)" >&2
+	echo "UNETESP.DLL unexpectedly compiles trigger 8 (should be complete 2.2.2 TR4)" >&2
+	exit 1
+fi
+# Two-channel backend: it must drive AT+CIPMUX=1 and restore AT+CIPMUX=0, and it
+# must stay on the active +IPD receive path (no ESP passive-receive commands).
+if ! grep -a -q 'AT+CIPMUX=1' "$tmp_dir/unetesp.bin"; then
+	echo "UNETESP.DLL is missing the multi-connection command AT+CIPMUX=1" >&2
+	exit 1
+fi
+if ! grep -a -q 'AT+CIPMUX=0' "$tmp_dir/unetesp.bin"; then
+	echo "UNETESP.DLL cannot restore single-connection mode (AT+CIPMUX=0)" >&2
+	exit 1
+fi
+if grep -a -q 'AT+CIPRECV' "$tmp_dir/unetesp.bin"; then
+	echo "UNETESP.DLL unexpectedly contains an ESP passive-receive command" >&2
 	exit 1
 fi
 

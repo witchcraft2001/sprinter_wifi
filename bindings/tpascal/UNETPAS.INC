@@ -53,6 +53,8 @@ const
   NErrTimeout     = 12;
   NErrBusy        = 13;
   NErrProto       = 14;
+  NErrAgain       = 15;                  { send suspended (UNetOptSendSlice):
+                                           repeat the same UNetSendCh call }
 
   { capability bits (UNetCaps) }
   UNetCapTcp         = $0001;
@@ -64,6 +66,7 @@ const
   UNetCapRawEth      = $0040;
   UNetCapTransparent = $0080;
   UNetCapRxFlow      = $0100;
+  UNetCapAsyncSend   = $0200;            { NErrAgain / UNetOptSendSlice support }
 
   { GETINFO fields }
   UNetIfBackend = 0;
@@ -83,6 +86,23 @@ const
   { SETOPT options }
   UNetOptCancelKeys = 1;
   UNetOptRxTrig     = 2;
+  UNetOptSendSlice  = 3;                 { ms of silence before SEND suspends
+                                           with NErrAgain; 0 = blocking. Gate
+                                           on UNetCapAsyncSend. }
+
+  { STATUS(channel) state bits (UNetStatusCh) }
+  UNetStConn   = $0002;                  { channel is connected }
+  UNetStRxPend = $0004;                  { data buffered for this channel;
+                                           only backends with
+                                           UNetCapMultichan report it }
+
+  { RECV flag bits (UNetRecvFlags after UNetRecv / UNetRecvCh) }
+  UNetRxfTrunc = $0001;                  { datagram truncated (never on ESP) }
+  UNetRxfMore  = $0002;                  { more data for this channel }
+  UNetRxfLost  = $0004;                  { overrun or dropped frame }
+  UNetRxfXChan = $0008;                  { data pending on the OTHER channel:
+                                           an empty read means "switch
+                                           channels", not "link idle" }
 
 const
   UNetMaxArg = 81;                       { longest host/port argument we stage }
@@ -93,6 +113,7 @@ type
 var
   UNetHandle : integer;                  { handle of the loaded DLL }
   UNetErr    : byte;                     { last function status (NErr*) }
+  UNetRecvFlags : integer;               { RECV flag bits (UNetRxf*) }
   UNetBufA   : UNetBuf;                  { ASCIIZ scratch, DE-side }
   UNetBufB   : UNetBuf;                  { ASCIIZ scratch, IX-side }
   UNetBufC   : UNetBuf;                  { ASCIIZ scratch, IY-side }
@@ -179,36 +200,48 @@ begin
   UNetDone := UNetErr
 end;
 
-function UNetClose : byte;
+{ Channel-aware entry points. Channel 0 behaves exactly like the plain
+  functions, which simply call these with ch = 0; channel 1 requires a backend
+  whose UNetCaps has UNetCapMultichan (otherwise NErrParam). Two channels let
+  one program hold an FTP control and data connection at the same time. Read
+  them in turn: a read returning 0 with UNetRxfXChan set in UNetRecvFlags means
+  the other channel has data waiting. }
+function UNetCloseCh(ch : integer) : byte;
 begin
-  LibRegA := 0;                          { channel 0 }
+  LibRegA := ch;
   UNetCall(UNetFnClose);
-  UNetClose := UNetErr
+  UNetCloseCh := UNetErr
 end;
 
-function UNetConnect(host, port : DssStr) : byte;
+function UNetClose : byte;
+begin UNetClose := UNetCloseCh(0) end;
+
+function UNetConnectCh(ch : integer; host, port : DssStr) : byte;
 begin
-  UNetConnect := NErrParam;
+  UNetConnectCh := NErrParam;
   if not UNetArgOk(host) then exit;
   if not UNetArgOk(port) then exit;
   UNetZ(host, UNetBufA);
   UNetZ(port, UNetBufB);
-  LibRegA := 0;                          { channel 0 }
+  LibRegA := ch;
   LibRegDE.W := addr(UNetBufA);
   LibRegIX.W := addr(UNetBufB);
   UNetCall(UNetFnConnect);
-  UNetConnect := UNetErr
+  UNetConnectCh := UNetErr
 end;
 
-function UNetUdpOpen(host, rport, lport : DssStr) : byte;
+function UNetConnect(host, port : DssStr) : byte;
+begin UNetConnect := UNetConnectCh(0, host, port) end;
+
+function UNetUdpOpenCh(ch : integer; host, rport, lport : DssStr) : byte;
 begin
-  UNetUdpOpen := NErrParam;
+  UNetUdpOpenCh := NErrParam;
   if not UNetArgOk(host) then exit;
   if not UNetArgOk(rport) then exit;
   if not UNetArgOk(lport) then exit;
   UNetZ(host, UNetBufA);
   UNetZ(rport, UNetBufB);
-  LibRegA := 0;
+  LibRegA := ch;
   LibRegDE.W := addr(UNetBufA);
   LibRegIX.W := addr(UNetBufB);
   if length(lport) = 0 then
@@ -219,42 +252,61 @@ begin
     LibRegIY.W := addr(UNetBufC)
   end;
   UNetCall(UNetFnUdpOpen);
-  UNetUdpOpen := UNetErr
+  UNetUdpOpenCh := UNetErr
+end;
+
+function UNetUdpOpen(host, rport, lport : DssStr) : byte;
+begin UNetUdpOpen := UNetUdpOpenCh(0, host, rport, lport) end;
+
+{ Per-channel state (UNetSt* bits) in state. Returns NErrOk or a NErr* code. }
+function UNetStatusCh(ch : integer; var state : integer) : byte;
+begin
+  LibRegA := ch;
+  UNetCall(UNetFnStatus);
+  state := LibRegDE.W;
+  UNetStatusCh := UNetErr
 end;
 
 { Send a string's bytes straight from the string body - no staging copy, so
   the full 255-char DssStr is allowed (SEND takes pointer+length, no NUL
   needed). Returns bytes sent (>=0) or -(NErr*) on failure. }
-function UNetSend(s : DssStr) : integer;
+function UNetSendCh(ch : integer; s : DssStr) : integer;
 begin
-  LibRegA := 0;
+  LibRegA := ch;
   LibRegDE.W := addr(s) + 1;             { skip the length byte }
   LibRegIX.W := length(s);
   UNetCall(UNetFnSend);
   if UNetErr = NErrOk then
-    UNetSend := LibRegDE.W
+    UNetSendCh := LibRegDE.W
   else
-    UNetSend := -UNetErr
+    UNetSendCh := -UNetErr
 end;
+
+function UNetSend(s : DssStr) : integer;
+begin UNetSend := UNetSendCh(0, s) end;
 
 { Receive into UNetOut (up to 80 bytes). Returns byte count (>0), 0 on idle,
   or -(NErr*) (e.g. -NErrClosed) on close/error. Read the text with
-  UNetRecvStr. }
-function UNetRecv(timeout : integer) : integer;
+  UNetRecvStr; the RECV flag bits are left in UNetRecvFlags. }
+function UNetRecvCh(ch : integer; timeout : integer) : integer;
 begin
-  LibRegA := 0;
+  LibRegA := ch;
   LibRegDE.W := addr(UNetOut);
   LibRegIX.W := 80;
   LibRegIY.W := timeout;
   UNetCall(UNetFnRecv);
+  UNetRecvFlags := LibRegIX.W;
   if UNetErr = NErrOk then
   begin
     UNetOut[LibRegDE.W] := chr(0);       { terminate for UNetRecvStr }
-    UNetRecv := LibRegDE.W
+    UNetRecvCh := LibRegDE.W
   end
   else
-    UNetRecv := -UNetErr
+    UNetRecvCh := -UNetErr
 end;
+
+function UNetRecv(timeout : integer) : integer;
+begin UNetRecv := UNetRecvCh(0, timeout) end;
 
 function UNetRecvStr : DssStr;
 begin UNetRecvStr := UNetFromZ(UNetOut) end;

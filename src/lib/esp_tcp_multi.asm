@@ -255,10 +255,15 @@ RECEIVE_ANY_LINK_PASSIVE
 READ_PASSIVE_IPD_LINK_LEN
 	CALL	READ_DEC_FIELD
 	RET	C
+	; Accept any ESP-AT multi-connection link id (0..4). Rejecting non-zero
+	; ids here broke passive receive on the FTP data link, which always runs
+	; on link 1 while the control link keeps link 0.
 	LD	A,H
-	OR	L
+	AND	A
 	JR	NZ,.ERROR
 	LD	A,L
+	CP	5
+	JR	NC,.ERROR
 	LD	(LAST_IPD_LINK),A
 	LD	(PAYLOAD_LINK),A
 	LD	A,(IPD_DELIM)

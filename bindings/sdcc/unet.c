@@ -221,31 +221,46 @@ i8 unet_done(void)
     return (i8)call_fn(UNET_FN_NETDONE, &r);
 }
 
-i8 unet_connect(const char *host, const char *port)
+/*
+ * Channel-aware entry points. The single-channel functions below are thin
+ * wrappers on channel 0, so existing code keeps working unchanged; channel 1
+ * requires a backend whose unet_caps() has UNET_CAP_MULTICHAN.
+ */
+i8 unet_connect_ch(u8 ch, const char *host, const char *port)
 {
     unet_regs r;
-    r.a = 0;                       /* channel 0 */
+    r.a = ch;
     r.de = (u16)host;
     r.ix = (u16)port;
     r.iy = 0;
     return (i8)call_fn(UNET_FN_CONNECT, &r);
 }
 
-i8 unet_udpopen(const char *host, const char *rport, const char *lport)
+i8 unet_connect(const char *host, const char *port)
+{
+    return unet_connect_ch(0, host, port);
+}
+
+i8 unet_udpopen_ch(u8 ch, const char *host, const char *rport, const char *lport)
 {
     unet_regs r;
-    r.a = 0;
+    r.a = ch;
     r.de = (u16)host;
     r.ix = (u16)rport;
     r.iy = (u16)lport;             /* NULL -> default local port */
     return (i8)call_fn(UNET_FN_UDPOPEN, &r);
 }
 
-i16 unet_send(const void *buf, u16 len)
+i8 unet_udpopen(const char *host, const char *rport, const char *lport)
+{
+    return unet_udpopen_ch(0, host, rport, lport);
+}
+
+i16 unet_send_ch(u8 ch, const void *buf, u16 len)
 {
     unet_regs r;
     u8 st;
-    r.a = 0;
+    r.a = ch;
     r.de = (u16)buf;
     r.ix = len;
     r.iy = 0;
@@ -254,11 +269,16 @@ i16 unet_send(const void *buf, u16 len)
     return (i16)r.de;              /* bytes sent */
 }
 
-i16 unet_recv(void *buf, u16 max, u16 timeout_ms, u16 *flags)
+i16 unet_send(const void *buf, u16 len)
+{
+    return unet_send_ch(0, buf, len);
+}
+
+i16 unet_recv_ch(u8 ch, void *buf, u16 max, u16 timeout_ms, u16 *flags)
 {
     unet_regs r;
     u8 st;
-    r.a = 0;
+    r.a = ch;
     r.de = (u16)buf;
     r.ix = max;
     r.iy = timeout_ms;
@@ -268,11 +288,31 @@ i16 unet_recv(void *buf, u16 max, u16 timeout_ms, u16 *flags)
     return (i16)(-(i16)st);                        /* -NERR_CLOSED etc. */
 }
 
-i8 unet_close(void)
+i16 unet_recv(void *buf, u16 max, u16 timeout_ms, u16 *flags)
+{
+    return unet_recv_ch(0, buf, max, timeout_ms, flags);
+}
+
+i8 unet_close_ch(u8 ch)
 {
     unet_regs r;
-    r.a = 0; r.de = 0; r.ix = 0; r.iy = 0;
+    r.a = ch; r.de = 0; r.ix = 0; r.iy = 0;
     return (i8)call_fn(UNET_FN_CLOSE, &r);
+}
+
+i8 unet_close(void)
+{
+    return unet_close_ch(0);
+}
+
+i8 unet_status_ch(u8 ch, u16 *state)
+{
+    unet_regs r;
+    u8 st;
+    r.a = ch; r.de = 0; r.ix = 0; r.iy = 0;
+    st = call_fn(UNET_FN_STATUS, &r);
+    if (state) *state = r.de;
+    return (i8)st;
 }
 
 i8 unet_resolve(const char *host, char *dst)

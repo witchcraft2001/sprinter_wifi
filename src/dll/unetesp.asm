@@ -4,10 +4,10 @@
 ; contract in src/include/unet.inc on top of the Sprinter-WiFi ESP
 ; library modules (esplib / esp_tcp / esp_udp / isa / util).
 ;
-; FIRMWARE PROFILE: this DLL is deliberately limited to ESP-AT 2.2.2 and the
-; field-proven trigger-8 receive path (like WGET/FTP/NTP/TFTP). The two
-; DEFINEs below pin that at assembly time - the DLL contains only the 2.2.2
-; command set and TR8 receive, with no runtime 2.2.1 fallback. NETINIT refuses
+; FIRMWARE PROFILE: this DLL is deliberately limited to ESP-AT 2.2.2 and its
+; complete trigger-4 receive path. The DEFINE below pins that at assembly time -
+; the DLL contains only the 2.2.2 command set and TR4 receive, with no runtime
+; 2.2.1 fallback. NETINIT refuses
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
 ; with the wrong command set. The L1 header name announces the target and full
@@ -37,16 +37,20 @@
 ;   16 KB image/input-page limit.
 ; ======================================================
 
-; 2.2.2-only, trigger-8 receive. Must precede the esplib include at the end of
-; this file (that is where both DEFINEs take effect).
+; 2.2.2-only, trigger-4 receive. Must precede the esplib include at the end of
+; this file (that is where the DEFINE takes effect).
 	DEFINE	ESP_AT_FORCE_222
-	DEFINE	WIFI_STABLE_ACTIVE_RX
 ; Capture peer +IPD data that races a SEND (arrives in the CIPSEND '>' / SEND OK
 ; window) into a 2 KB defer buffer and replay it to the next RECV, instead of
 ; discarding it. Closes the full-duplex race in docs/UNETAPI.md; grows the image
 ; by ~2 KB (still well under the 16 KB ceiling). Only the DLL enables this — the
 ; stock apps build without it and stay byte-identical. See esp_tcp.asm.
 	DEFINE	ESP_TCP_RX_DEFER
+; Two simultaneous channels (AT+CIPMUX=1): channel 0 and channel 1 can each hold
+; a TCP or UDP link, which is what a passive-FTP client needs (control on one,
+; data on the other). Adds a second receive-defer stash so a frame for the
+; channel not being read is buffered for it instead of lost. See esp_tcp.asm.
+	DEFINE	ESP_TCP_MUX
 
 	INCLUDE "dss.inc"
 	INCLUDE "sprinter.inc"
@@ -60,7 +64,9 @@ BUSY_MAX_RETRY		EQU 8
 MAX_HOST_LEN		EQU 128	; host/port length caps keep the fixed-size AT
 MAX_PORT_LEN		EQU 15	; command build buffers (CMDBUILD, TCP/UDP
 				; CMD_BUFFER) from overflowing
-UNETESP_CAPS		EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW
+UNETESP_CAPS		EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND
+UNET_CHANNELS		EQU 2	; channels this build accepts; checked against
+				; TCP_MUX_CHANNELS after the library include
 
 	ORG 0x0000			; mkdll rewrites this to 0x20 / 0x120
 
@@ -118,10 +124,23 @@ INIT
 	RET
 
 ; ======================================================
-; Function 1 - FINI (libman free hook): close any open link.
+; Function 1 - FINI (libman free hook): close any open link and hand the ESP
+; back in single-connection mode, so a consumer that frees the DLL without
+; calling NETDONE does not leave the session in a state the stock utilities do
+; not expect. Both steps no-op when NETINIT never succeeded.
 ; ======================================================
 FINI
-	CALL	CLOSE_LINK
+	; FINI is the one teardown path allowed to undo a consumer pause: once the
+	; DLL page is freed nobody can call RXRESUME, while closing links with RTS
+	; deasserted can wedge the ESP on its first reply.
+	LD	A,(INITED)
+	AND	A
+	JR	Z,.done
+	XOR	A
+	LD	(RX_PAUSED),A
+	CALL	WIFI.UART_RX_RESUME
+.done
+	CALL	F_NETDONE
 	XOR	A
 	RET
 
@@ -140,6 +159,10 @@ F_GETCAPS
 F_NETINIT
 	XOR	A
 	LD	(WCOMMON.CANCELLED),A
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	RESOLVE_PENDING		; do not interleave setup with a pending send
+	JP	C,RET_BUSY
 	; env: NET == "WIFI"
 	LD	HL,ENVN_NET
 	CALL	ENV_GET_STAGE
@@ -169,6 +192,8 @@ F_NETINIT
 	; apply configured baud and init UART
 	CALL	APPLY_ENV_BAUD
 	CALL	WIFI.UART_INIT
+	XOR	A
+	LD	(RX_PAUSED),A		; UART_INIT leaves RTS in receive-ready state
 	; A delayed terminal response from the previous client may precede the
 	; answer to our first AT. Resynchronise without destroying NETUP's
 	; deliberately session-only Wi-Fi configuration.
@@ -186,13 +211,26 @@ F_NETINIT
 	CALL	SEND_AT
 	; the CIPCLOSE pair above really closed any leftover socket - forget
 	; stale channel state so a repeated NETINIT + CONNECT works
-	XOR	A
-	LD	(CH_STATE),A
-	; single-connection mode with busy retry
-	LD	HL,CMD_CIPMUX0
+	CALL	RESET_CHANNEL_STATE
+	; multi-connection mode with busy retry. It must follow the CIPCLOSE pair:
+	; ESP-AT rejects AT+CIPMUX while any link is still open.
+	LD	HL,CMD_CIPMUX1
 	LD	BC,DEFAULT_TIMEOUT
 	CALL	SEND_AT_BUSY
 	JP	C,.busy
+	LD	A,1
+	LD	(MUX_ACTIVE),A
+	; Bound the firmware's internal TCP send. ESP-AT (verified in the
+	; v2.2.2.0_esp8266 core, at_sending_data) holds s_at_socket_mutex across
+	; a blocking lwip_send with NO timeout by default, and +IPD printing
+	; (at_process_recv_socket) needs the same mutex: one stuck send silences
+	; the whole UART for as long as Wi-Fi retransmissions take. so_sndtimeo
+	; caps that at 4 s - the module then answers "SEND FAIL" on its own,
+	; before our 5 s client timeout. Link id 5 = every connection.
+	; Best effort: an ERROR here only means the old unbounded behaviour.
+	LD	HL,CMD_CIPTCPOPT
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT_BUSY
 	LD	A,1
 	LD	(INITED),A
 	XOR	A
@@ -208,13 +246,41 @@ F_NETINIT
 	RET
 
 ; ======================================================
-; Function 4 - NETDONE / Function 8 - CLOSE (shared)
+; Function 8 - CLOSE (one channel)
 ; ======================================================
 F_CLOSE
-	AND	A
-	JP	NZ,RET_PARAM		; v1: only channel 0
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	CLOSE_CHANNEL
+	RET
+
+; ======================================================
+; Function 4 - NETDONE: close every channel and hand the ESP back in the
+; single-connection mode the stock utilities expect. The network itself
+; (Wi-Fi join, UART settings) stays up, so a later CONNECT still works: it
+; re-arms multi-connection mode through ENSURE_MUX.
+; ======================================================
 F_NETDONE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
 	CALL	CLOSE_LINK
+	AND	A
+	RET	NZ			; do not inject CIPMUX while a close is unresolved
+	LD	A,(MUX_ACTIVE)
+	AND	A
+	JR	Z,.done
+	LD	HL,CMD_CIPMUX0
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT_BUSY		; best effort; state is cleared either way
+	XOR	A
+	LD	(MUX_ACTIVE),A
+.done
 	XOR	A
 	RET
 
@@ -222,16 +288,22 @@ F_NETDONE
 ; Function 5 - CONNECT (TCP)
 ; ======================================================
 F_CONNECT
-	AND	A
-	JP	NZ,RET_PARAM		; only channel 0
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
-	LD	A,(CH_STATE)
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	GET_CH_STATE
 	AND	A
-	JP	NZ,RET_STATE		; already open
+	JP	NZ,RET_STATE		; this channel is already open
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	ENSURE_MUX
+	JP	C,RET_BUSY
 	LD	HL,(ARG_DE)
 	LD	DE,MAX_HOST_LEN
 	CALL	CHECK_STRARG
@@ -245,7 +317,7 @@ F_CONNECT
 	CALL	OPEN_RETRY
 	JR	C,.fail
 	LD	A,1
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
 	XOR	A
 	RET
 .fail
@@ -267,13 +339,49 @@ F_CONNECT
 ; Function 6 - SEND (chunked at 2048 = ESP-AT CIPSEND cap)
 ; ======================================================
 F_SEND
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	Z,RET_STATE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	CH_PEER_CLOSED		; sending on a closed link cannot succeed
+	JP	C,.closed_entry
+	LD	A,(ARG_CH)
+	LD	(TCP.LINK_ID),A		; the send routines address the link through it
+	CALL	SETUP_ASYNC_MODE	; arm/disarm suspendable mode from OPT_SLICE
+	; A suspended transaction resumes here; a fresh call while one is pending
+	; on the OTHER channel must not interleave AT text with it.
+	LD	A,(PEND_CH)
+	CP	0xFF
+	JR	Z,.fresh
+	LD	B,A
+	LD	A,(ARG_CH)
+	CP	B
+	JP	NZ,RET_STATE
+	; The resume contract requires identical arguments.
+	LD	HL,(ARG_DE)
+	LD	DE,(PEND_BUF)
+	OR	A
+	SBC	HL,DE
+	LD	A,H
+	OR	L
+	JP	NZ,RET_STATE
+	LD	HL,(ARG_IX)
+	LD	DE,(PEND_LEN)
+	OR	A
+	SBC	HL,DE
+	LD	A,H
+	OR	L
+	JP	NZ,RET_STATE
+	CALL	TCP.SEND_BUFFER_RESUME
+	JP	C,.senderr
+	JP	.chunk_done
+.fresh
+	CALL	GET_CH_STATE
 	; UDP channel: one datagram per SEND, ESP-AT payload cap 1472 bytes
 	CP	2
 	JR	NZ,.lenok
@@ -287,8 +395,14 @@ F_SEND
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
+	LD	A,1
+	LD	(SEND_TRY),A		; one ladder reissue per call
 	LD	HL,0
 	LD	(SEND_DONE),HL
+	LD	HL,(ARG_DE)
+	LD	(PEND_BUF),HL		; resume-contract reference
+	LD	HL,(ARG_IX)
+	LD	(PEND_LEN),HL
 .chunk
 	; remaining = length - done
 	LD	HL,(ARG_IX)
@@ -317,48 +431,415 @@ F_SEND
 	LD	BC,(CHUNK_LEN)
 	CALL	TCP.SEND_BUFFER
 	JR	C,.senderr
+.chunk_done
 	LD	HL,(SEND_DONE)
 	LD	BC,(CHUNK_LEN)
 	ADD	HL,BC
 	LD	(SEND_DONE),HL
 	JR	.chunk
 .complete
+	CALL	CLEAR_PEND
 	LD	DE,(SEND_DONE)
 	XOR	A
 	RET
 .senderr
-	CALL	CONSUME_CANCEL
+	; A suspension is not an error: park the transaction and hand control
+	; back; the consumer repeats the call to continue it.
+	CP	RES_AGAIN
+	JR	NZ,.realerr
+	LD	A,(ARG_CH)
+	LD	(PEND_CH),A
 	LD	DE,(SEND_DONE)
-	JR	C,.cancelled
+	LD	A,NERR_AGAIN
+	OR	A
+	RET
+.realerr
+	LD	(SEND_RES),A		; the transport reason, before CONSUME_CANCEL
+	CALL	CLEAR_PEND		; any real outcome ends the transaction
+	CALL	CONSUME_CANCEL
+	JR	C,.cancelled_de
+	; LASTERR must describe the failed window itself, so snapshot the trace
+	; counters before the recovery ladder reads more bytes through the same
+	; instrumented reader.
+	LD	HL,(TCP.SEND_TRACE_TOTAL)
+	LD	(SEND_GOT),HL
+	LD	A,(TCP.SEND_TRACE_N)
+	LD	(SEND_GOT_N),A
+	LD	A,0xFF
+	LD	(PROBE_RES),A		; "not probed"
+	; Only silence after the complete payload left the host is safe to probe.
+	; Before the '>' prompt, an AT probe can itself become CIPSEND payload if the
+	; prompt was merely late. While a +IPD payload is incomplete, its remaining
+	; binary bytes still own the receive parser and a probe response cannot be
+	; parsed safely either.
+	LD	A,(SEND_RES)
+	CP	RES_RS_TIMEOUT
+	JR	NZ,.fail
+	LD	A,(TCP.SEND_PHASE)
+	AND	A
+	JR	Z,.fail
+	LD	HL,(TCP.PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.fail
+	; The ~10 s ladder is a blocking tool; a consumer that chose sliced sends
+	; opted out of blocking - report the failure and let it decide.
+	LD	HL,(OPT_SLICE)
+	LD	A,H
+	OR	L
+	JR	NZ,.fail
+	CALL	PROBE_AT
+	CALL	CONSUME_CANCEL		; user abort during the probe rounds
+	JP	C,.cancelled_de
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	1,A			; "ready": the module rebooted mid-session
+	JR	NZ,.reboot
+	; Payload was handed over but SEND OK never arrived. Only a late
+	; "SEND OK" caught by the probe proves delivery; a bare OK from the
+	; probe's own AT does not, and a reissue here would duplicate bytes.
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	0,A
+	JR	Z,.fail
+	LD	HL,(SEND_DONE)
+	LD	BC,(CHUNK_LEN)
+	ADD	HL,BC
+	LD	(SEND_DONE),HL
+	JP	.chunk
+.reboot
+	CALL	NOTE_SEND_FAILURE
+	CALL	REBOOT_EVENT
+.closed_now
+	LD	DE,(SEND_DONE)
+	LD	A,NERR_CLOSED
+	OR	A
+	RET
+.fail
+	CALL	NOTE_SEND_FAILURE
+	LD	DE,(SEND_DONE)
 	LD	A,NERR_SEND
 	OR	A			; clear CF (reached via JR C from SEND_BUFFER)
 	RET
+.cancelled_de
+	LD	DE,(SEND_DONE)
 .cancelled
 	LD	A,NERR_CANCEL
 	OR	A
 	RET
+.closed_entry
+	; A peer close latched while a transaction was suspended ends it.
+	LD	A,(PEND_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	CALL	Z,CLEAR_PEND
+	JP	RET_CLOSED
+
+; Arm or disarm the suspendable-send machinery for this call from OPT_SLICE.
+SETUP_ASYNC_MODE
+	LD	HL,(OPT_SLICE)
+	LD	A,H
+	OR	L
+	JR	Z,.off
+	LD	(TCP.WSO_TIMEOUT),HL
+	LD	A,1
+	LD	(TCP.ASYNC_MODE),A
+	RET
+.off
+	LD	HL,TCP_DEFAULT_TIMEOUT
+	LD	(TCP.WSO_TIMEOUT),HL
+	XOR	A
+	LD	(TCP.ASYNC_MODE),A
+	RET
+
+; End any suspended transaction and restore blocking-mode timeouts.
+CLEAR_PEND
+	LD	A,0xFF
+	LD	(PEND_CH),A
+	LD	HL,TCP_DEFAULT_TIMEOUT
+	LD	(TCP.WSO_TIMEOUT),HL
+	JP	TCP.ASYNC_RESET
+
+; A suspended send owns both the ESP parser and its eventual byte-count result.
+; Only a repeat of the SAME SEND may advance it: completing it here on behalf
+; of CLOSE/CONNECT/etc. would lose the success result, and a later repeat by the
+; caller would duplicate the stream bytes. Other AT-producing calls therefore
+; fail closed with BUSY and never touch the UART.
+; Out: CF=0 when no transaction exists; CF=1/A=NERR_BUSY while one is pending.
+RESOLVE_PENDING
+	LD	A,(PEND_CH)
+	CP	0xFF
+	RET	Z
+	LD	A,NERR_BUSY
+	SCF
+	RET
+
+; Record WHY a send failed where LASTERR will find it. Every send failure maps
+; to NERR_SEND, and RS_BUFF still holds the response to the last AT command, so
+; without this a caller cannot tell an ESP refusal from a prompt timeout.
+; In: SEND_RES = transport result code. TCP.LINE_BUFFER holds the last response
+; line of this send (cleared when the send started, so it is never stale).
+NOTE_SEND_FAILURE
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,MSG_SEND_FAIL
+	CALL	TCP.APPEND_STR
+	PUSH	HL
+	LD	A,(SEND_RES)
+	LD	L,A
+	LD	H,0
+	LD	DE,TCP.NUM_BUFFER
+	CALL	UTIL.UTOA
+	POP	HL
+	LD	DE,TCP.NUM_BUFFER
+	CALL	TCP.APPEND_STR
+	LD	DE,MSG_SEND_LINE
+	CALL	TCP.APPEND_STR
+	LD	DE,TCP.LINE_BUFFER
+	CALL	TCP.APPEND_STR
+	; How much the ESP said at all during this window, and its first bytes:
+	; "got=0" is a silent module, a "busy p..." is a refused command, and a
+	; large count with binary bytes is peer data we were still swallowing.
+	LD	DE,MSG_SEND_LSR
+	CALL	TCP.APPEND_STR
+	PUSH	HL
+	LD	A,(WIFI.CMD_LSR_ACCUM)	; 2=overrun, 4=parity, 8=framing, 16=break
+	LD	L,A
+	LD	H,0
+	LD	DE,TCP.NUM_BUFFER
+	CALL	UTIL.UTOA
+	POP	HL
+	LD	DE,TCP.NUM_BUFFER
+	CALL	TCP.APPEND_STR
+	LD	DE,MSG_SEND_GOT
+	CALL	TCP.APPEND_STR
+	PUSH	HL
+	LD	HL,(SEND_GOT)
+	LD	DE,TCP.NUM_BUFFER
+	CALL	UTIL.UTOA
+	POP	HL
+	LD	DE,TCP.NUM_BUFFER
+	CALL	TCP.APPEND_STR
+	LD	DE,MSG_SEND_SEP
+	CALL	TCP.APPEND_STR
+	LD	A,(SEND_GOT_N)
+	LD	DE,TCP.SEND_TRACE
+	CALL	APPEND_PRINTABLE
+	; ... and the last bytes before the silence, oldest first.
+	LD	DE,MSG_SEND_TAIL
+	CALL	TCP.APPEND_STR
+	CALL	APPEND_TAIL
+	; The recovery ladder's verdict on the module itself.
+	LD	DE,MSG_SEND_ESP
+	CALL	TCP.APPEND_STR
+	CALL	VERDICT_STR
+	CALL	TCP.APPEND_STR
+	LD	(HL),0
+	RET
+
+; Out: DE = short word describing what the post-failure probe learned.
+VERDICT_STR
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	1,A
+	LD	DE,MSG_V_REBOOT
+	RET	NZ
+	LD	A,(PROBE_RES)
+	CP	0xFF
+	LD	DE,MSG_V_NONE
+	RET	Z			; failure was explicit, no probe was run
+	CP	RES_TX_TIMEOUT
+	LD	DE,MSG_V_TXBLOCK
+	RET	Z			; our TX stalled: CTS held low by the module
+	CALL	PROBE_ALIVE
+	LD	DE,MSG_V_ALIVE
+	RET	NC
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	2,A
+	LD	DE,MSG_V_BUSY
+	RET	NZ
+	LD	DE,MSG_V_DEAD
+	RET
+
+; CF=0 when the probe reached the module's AT parser: a clean OK, or an
+; ERROR/FAIL that late-terminated the command the ladder gave up on.
+PROBE_ALIVE
+	LD	A,(PROBE_RES)
+	AND	A
+	RET	Z
+	CP	RES_ERROR
+	RET	Z
+	CP	RES_FAIL
+	RET	Z
+	SCF
+	RET
+
+; Append the rolling tail of the send window at (HL), oldest byte first. Until
+; the window has produced SEND_TAIL_SIZE bytes the buffer is still linear.
+APPEND_TAIL
+	LD	DE,(SEND_GOT)
+	LD	A,D
+	AND	A
+	JR	NZ,.full
+	LD	A,E
+	CP	TCP.SEND_TAIL_SIZE
+	JR	NC,.full
+	LD	DE,TCP.SEND_TAIL	; A = count, buffer not wrapped yet
+	JP	APPEND_PRINTABLE
+.full
+	LD	B,TCP.SEND_TAIL_SIZE
+	LD	A,(TCP.SEND_TAIL_POS)	; oldest byte sits at the write cursor
+	LD	E,A
+	LD	D,0
+	LD	IX,TCP.SEND_TAIL
+	ADD	IX,DE
+	LD	DE,TCP.SEND_TAIL + TCP.SEND_TAIL_SIZE
+.byte
+	LD	A,(IX+0)
+	CP	32
+	JR	C,.dot
+	CP	127
+	JR	C,.store
+.dot
+	LD	A,'.'
+.store
+	LD	(HL),A
+	INC	HL
+	INC	IX
+	PUSH	HL
+	PUSH	IX
+	POP	HL
+	OR	A
+	SBC	HL,DE			; past the end?
+	POP	HL
+	JR	NZ,.next
+	LD	IX,TCP.SEND_TAIL
+.next
+	DJNZ	.byte
+	RET
+
+; Append A bytes from (DE) at (HL), non-printables as '.'. Out: HL past the last.
+APPEND_PRINTABLE
+	AND	A
+	RET	Z
+	LD	B,A
+.byte
+	LD	A,(DE)
+	CP	32
+	JR	C,.dot
+	CP	127
+	JR	C,.store
+.dot
+	LD	A,'.'
+.store
+	LD	(HL),A
+	INC	HL
+	INC	DE
+	DJNZ	.byte
+	RET
+
+; Probe whether the ESP is responsive after a silent timeout, WITHOUT losing
+; peer data: the reply is read through TCP.WAIT_SEND_OK, which stashes any +IPD
+; frame into its channel's defer window and latches "<id>,CLOSED" lines exactly
+; like a normal send window. Line markers (ready/busy/CONNECT/"SEND OK")
+; accumulate in TCP.WSO_FLAGS for the caller's ladder.
+;
+; The rounds are deliberately patient (~10 s total): ESP-AT serves the AT
+; parser and all UART output from one task, and in CIPMUX=1 under bidirectional
+; load that task can block inside a command for seconds - +IPD delivery stops
+; with it - and then recover on its own. Observed on real 2.2.2 hardware at
+; 230400: the module stays associated and keeps its session baud, so this is a
+; stall, not a crash; a probe that gives up after one round misdiagnoses it.
+; Out: PROBE_RES = 0 when the module answered, RES code otherwise.
+PROBE_AT
+	LD	A,PROBE_ROUNDS-1
+	LD	(PROBE_LEFT),A
+.round
+	LD	A,1
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	HL,PROBE_BYTE_TIMEOUT
+	LD	(TCP.WSO_TIMEOUT),HL
+	LD	HL,CMD_PROBE_AT
+	CALL	WIFI.UART_TX_STRING
+	JR	C,.txfail
+	CALL	TCP.MUX_WAIT_SEND_OK
+.settle
+	PUSH	AF
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	HL,TCP_DEFAULT_TIMEOUT
+	LD	(TCP.WSO_TIMEOUT),HL
+	POP	AF
+	LD	(PROBE_RES),A
+	AND	A
+	RET	Z
+	; An Esc/Ctrl+Z latched during a round must end the ladder here, not
+	; after another ~10 s of probing. The flag is left for the caller to
+	; consume and map to NERR_CANCEL.
+	LD	A,(WCOMMON.CANCELLED)
+	AND	A
+	RET	NZ
+	LD	A,(PROBE_LEFT)
+	AND	A
+	RET	Z
+	DEC	A
+	LD	(PROBE_LEFT),A
+	LD	HL,500
+	CALL	UTIL.DELAY
+	JR	.round
+.txfail
+	LD	A,RES_TX_TIMEOUT
+	JR	.settle
+
+; The module printed its boot banner: every link is gone and CIPMUX is back at
+; its power-on default. Latch both channels closed so pending data/close
+; reporting stays truthful, and force the next CONNECT through ENSURE_MUX.
+REBOOT_EVENT
+	XOR	A
+	LD	(MUX_ACTIVE),A
+	XOR	A
+	CALL	TCP.MUX_LATCH_CLOSED
+	LD	A,1
+	JP	TCP.MUX_LATCH_CLOSED
+
+; A bare CRLF is legitimately ignored by ESP-AT, so probe with a command that
+; always answers when the module is listening at all.
+CMD_PROBE_AT	DB "AT",13,10,0
+MSG_SEND_FAIL	DB "send failed, res=",0
+MSG_SEND_LINE	DB ", last: ",0
+MSG_SEND_LSR	DB ", lsr=",0
+MSG_SEND_GOT	DB ", got=",0
+MSG_SEND_SEP	DB ": ",0
+MSG_SEND_TAIL	DB " end: ",0
+MSG_SEND_ESP	DB " esp=",0
+MSG_V_NONE	DB "-",0
+MSG_V_ALIVE	DB "alive",0
+MSG_V_REBOOT	DB "reboot",0
+MSG_V_BUSY	DB "busy",0
+MSG_V_TXBLOCK	DB "tx-block",0
+MSG_V_DEAD	DB "mute",0	; wedged past the probe's patience - NOT proof of death
+MSG_CONN_SILENT	DB "connect failed: no ESP response",0
 
 ; ======================================================
 ; Function 7 - RECV
 ; ======================================================
 F_RECV
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	(ARG_IY),IY
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	Z,RET_STATE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
-	; TCP.RECEIVE: HL=buf, BC=max, DE=timeout
+	; TCP.RECEIVE_MUX: A=channel, HL=buf, BC=max, DE=timeout
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	LD	DE,(ARG_IY)
-	CALL	TCP.RECEIVE
+	LD	A,(ARG_CH)
+	CALL	TCP.RECEIVE_MUX
 	JR	C,.err
 	LD	(RECV_GOT),BC
 	CALL	BUILD_RECV_FLAGS
@@ -394,56 +875,52 @@ F_RECV
 	RET
 .closed
 	XOR	A
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
 	CALL	BUILD_RECV_FLAGS
 	LD	DE,0
 	LD	A,NERR_CLOSED
 	RET
 
-; Build IX = RECV status flags; reset the sticky overrun accumulator.
-; bit1 more data pending (live +IPD tail OR buffered defer data),
-; bit2 data lost (UART overrun OR a defer frame dropped on send-window overflow).
+; Build IX = RECV status flags for the channel in ARG_CH; reset its sticky
+; loss flags. Per channel: bit1 more data pending, bit2 data lost (UART overrun
+; or a buffered frame dropped). bit3 reports pending data on the OTHER channel,
+; which is what turns an empty read into "switch channels" instead of "idle".
 BUILD_RECV_FLAGS
-	LD	L,0
-	LD	H,0
-	; bit1: PAYLOAD_LEFT != 0 (partial live +IPD) ...
-	LD	A,(TCP.PAYLOAD_LEFT)
-	LD	B,A
-	LD	A,(TCP.PAYLOAD_LEFT+1)
-	OR	B
-	JR	NZ,.more
-	; ... or a partially delivered defer frame ...
-	LD	A,(TCP.DEFER_FRAME_LEFT)
-	LD	B,A
-	LD	A,(TCP.DEFER_FRAME_LEFT+1)
-	OR	B
-	JR	NZ,.more
-	; ... or whole defer frames still queued (DEFER_W != DEFER_R).
-	LD	HL,(TCP.DEFER_W)
-	LD	DE,(TCP.DEFER_R)
-	OR	A
-	SBC	HL,DE
-	LD	A,H
-	OR	L
 	LD	HL,0
-	JR	Z,.no_more
-.more
-	SET	1,L
+	LD	(RECV_FLAGS),HL
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_HAS_PENDING
+	JR	NC,.no_more
+	LD	HL,RECV_FLAGS
+	SET	1,(HL)
 .no_more
+	; MUX_HAS_PENDING left our channel selected, so DEFER_LOST is ours.
 	LD	A,(TCP.LSR_ACCUM)
 	AND	LSR_OE
 	JR	NZ,.lost
 	LD	A,(TCP.DEFER_LOST)
 	AND	A
-	JR	Z,.no_oe
+	JR	Z,.no_lost
 .lost
-	SET	2,L
-.no_oe
-	PUSH	HL
-	POP	IX
+	LD	HL,RECV_FLAGS
+	SET	2,(HL)
+.no_lost
 	XOR	A
 	LD	(TCP.LSR_ACCUM),A
 	LD	(TCP.DEFER_LOST),A
+	; the other channel of this two-channel build
+	LD	A,(ARG_CH)
+	XOR	1
+	CALL	TCP.MUX_HAS_PENDING
+	JR	NC,.no_xchan
+	LD	HL,RECV_FLAGS
+	SET	3,(HL)
+.no_xchan
+	; leave the reading channel selected for the next call
+	LD	A,(ARG_CH)
+	CALL	TCP.DEFER_SELECT
+	LD	IX,(RECV_FLAGS)
+	XOR	A
 	RET
 
 ; ======================================================
@@ -452,16 +929,28 @@ BUILD_RECV_FLAGS
 F_STATUS
 	CP	0xFF
 	JR	Z,.netstat
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	LD	HL,0
+	LD	(RECV_FLAGS),HL		; reused as the state accumulator
+	CALL	GET_CH_STATE
 	AND	A
-	JP	NZ,RET_PARAM		; v1: only channel 0
-	LD	A,(CH_STATE)
-	AND	A
-	JR	Z,.closed
-	LD	DE,2
-	XOR	A
-	RET
-.closed
-	LD	DE,0
+	JR	Z,.notopen
+	CALL	CH_PEER_CLOSED
+	JR	C,.notopen		; closed by the peer: no longer connected
+	LD	HL,RECV_FLAGS
+	SET	1,(HL)			; UNET_ST_CONN
+.notopen
+	; Report buffered-but-undelivered data so a consumer can tell "idle" from
+	; "there is something waiting on this channel". Memory only: STATUS never
+	; touches the UART.
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_HAS_PENDING
+	JR	NC,.nopend
+	LD	HL,RECV_FLAGS
+	SET	2,(HL)			; UNET_ST_RXPEND
+.nopend
+	LD	DE,(RECV_FLAGS)
 	XOR	A
 	RET
 .netstat
@@ -496,17 +985,23 @@ F_STATUS
 ; Function 10 - UDPOPEN
 ; ======================================================
 F_UDPOPEN
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	(ARG_IY),IY
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
-	LD	A,(CH_STATE)
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	GET_CH_STATE
 	AND	A
 	JP	NZ,RET_STATE
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	ENSURE_MUX
+	JP	C,RET_BUSY
 	LD	HL,(ARG_DE)
 	LD	DE,MAX_HOST_LEN
 	CALL	CHECK_STRARG
@@ -531,7 +1026,7 @@ F_UDPOPEN
 	CALL	OPEN_RETRY
 	JR	C,.fail
 	LD	A,2
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
 	XOR	A
 	RET
 .fail
@@ -556,9 +1051,15 @@ F_RESOLVE
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
 	LD	A,(RESOLVE_SUP)
 	CP	2
 	JP	Z,RET_NOTSUP
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	ANY_CHANNEL_OPEN
+	JP	NZ,RET_BUSY		; UART_TX_CMD is not binary +IPD-aware
 	LD	HL,(ARG_DE)
 	LD	DE,MAX_HOST_LEN
 	CALL	CHECK_STRARG
@@ -623,6 +1124,12 @@ F_PING
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	ANY_CHANNEL_OPEN
+	JP	NZ,RET_BUSY		; UART_TX_CMD is not binary +IPD-aware
 	LD	HL,(ARG_DE)
 	LD	DE,MAX_HOST_LEN
 	CALL	CHECK_STRARG
@@ -782,7 +1289,24 @@ F_SETOPT
 	JR	Z,.cancelkeys
 	CP	UNET_OPT_RXTRIG
 	JR	Z,.rxtrig
+	CP	UNET_OPT_SENDSLICE
+	JR	Z,.sendslice
 	JP	RET_PARAM
+.sendslice
+	; 0 disables (blocking sends); anything else is a silence quantum in ms,
+	; clamped to >= 50 so the per-byte poll stays meaningful.
+	LD	A,D
+	OR	E
+	JR	Z,.slice_store
+	LD	HL,50
+	OR	A
+	SBC	HL,DE			; CF=1 when DE > 50
+	JR	C,.slice_store
+	LD	DE,50
+.slice_store
+	LD	(OPT_SLICE),DE
+	XOR	A
+	RET
 .cancelkeys
 	LD	A,E
 	OR	D
@@ -850,19 +1374,167 @@ RET_CANCEL
 	LD	A,NERR_CANCEL
 	OR	A
 	RET
+RET_BUSY
+	LD	A,NERR_BUSY
+	OR	A
+	RET
+RET_CLOSED
+	LD	A,NERR_CLOSED
+	OR	A
+	RET
 
 ; ======================================================
 ; Helpers
 ; ======================================================
 
-; Close the active link if any; leave the network up.
-CLOSE_LINK
-	LD	A,(CH_STATE)
+; ------------------------------------------------------
+; Channel plumbing
+; ------------------------------------------------------
+; Commands and active receive require the ESP->Sprinter direction to be open.
+; Sending CIPSEND/CIPSTART while RXPAUSE holds RTS deasserted guarantees a
+; prompt timeout and can fill the ESP UART TX ring indefinitely.
+CHECK_RX_ACTIVE
+	LD	A,(RX_PAUSED)
 	AND	A
 	RET	Z
-	CALL	TCP.CLOSE		; UDP.CLOSE routes here too
+	SCF
+	RET
+
+; Out: Z when both channels are closed, NZ when either is open.
+ANY_CHANNEL_OPEN
+	LD	A,(CH_STATE)
+	LD	HL,CH_STATE+1
+	OR	(HL)
+	RET
+
+; Validate the channel number in A and latch it. Out: CF=1 when out of range.
+CHECK_CHANNEL
+	CP	UNET_CHANNELS
+	CCF
+	RET	C
+	LD	(ARG_CH),A
+	RET
+
+; Out: HL = &CH_STATE[ARG_CH].
+CH_STATE_ADDR
+	LD	A,(ARG_CH)
+	LD	HL,CH_STATE
+	ADD	A,L
+	LD	L,A
+	RET	NC
+	INC	H
+	RET
+
+; Out: A = state of the selected channel (0 closed / 1 TCP / 2 UDP).
+GET_CH_STATE
+	CALL	CH_STATE_ADDR
+	LD	A,(HL)
+	RET
+
+; In: A = new state for the selected channel.
+SET_CH_STATE
+	PUSH	AF
+	CALL	CH_STATE_ADDR
+	POP	AF
+	LD	(HL),A
+	RET
+
+; Out: CF=1 when the peer already closed the selected channel.
+CH_PEER_CLOSED
+	LD	A,(ARG_CH)
+	JP	TCP.MUX_IS_CLOSED
+
+; Forget every channel's state and buffered data. Used by NETINIT, where the
+; CIPCLOSE pair has really dropped any leftover socket.
+RESET_CHANNEL_STATE
 	XOR	A
 	LD	(CH_STATE),A
+	LD	(CH_STATE+1),A
+	JP	TCP.RX_DEFER_RESET_ALL
+
+; Re-arm AT+CIPMUX=1 if NETDONE handed the ESP back in single-connection mode.
+; Out: CF=1 when the ESP stayed busy.
+ENSURE_MUX
+	LD	A,(MUX_ACTIVE)
+	AND	A
+	RET	NZ			; CF=0
+	LD	HL,CMD_CIPMUX1
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT_BUSY
+	RET	C
+	LD	A,1
+	LD	(MUX_ACTIVE),A
+	OR	A			; CF=0
+	RET
+
+; Close one channel: AT+CIPCLOSE=<ch>. The reply is read through the IPD-aware
+; line loop, because the peer on the OTHER channel may transmit while this one
+; is closing (an FTP server sends "226 Transfer complete" on the control link
+; exactly when the client closes the data link).
+CLOSE_CHANNEL
+	CALL	GET_CH_STATE
+	AND	A
+	RET	Z			; already closed: idempotent
+	LD	A,(ARG_CH)
+	LD	(TCP.LINK_ID),A
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	JR	C,.rx_busy		; never inject AT text into a partial +IPD payload
+	LD	HL,TCP.CMD_BUFFER
+	LD	DE,CMD_CIPCLOSE_PREFIX
+	CALL	TCP.APPEND_STR
+	CALL	TCP.APPEND_LINK_ID
+	LD	DE,CMD_CRLF_STR
+	CALL	TCP.APPEND_STR
+	LD	HL,TCP.CMD_BUFFER
+	CALL	WIFI.UART_TX_STRING
+	JR	C,.tx_busy
+	LD	A,1
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CLOSED),A
+	CALL	TCP.MUX_WAIT_SEND_OK	; tolerate explicit ERROR: link may be gone already
+	JR	NC,.wait_done
+	CP	RES_RS_TIMEOUT
+	JR	Z,.wait_busy		; ambiguous: keep local state, do not send more AT
+	CP	RES_BUSY
+	JR	Z,.wait_busy		; command was rejected: the link is still open
+.wait_done
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CLOSED),A
+.forget
+	XOR	A
+	CALL	SET_CH_STATE
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_CLEAR_CLOSED
+	LD	A,(ARG_CH)
+	CALL	TCP.RX_DEFER_RESET_CH	; an explicit close discards buffered data
+	XOR	A
+	RET
+.tx_busy
+.wait_busy
+.rx_busy
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CLOSED),A
+	LD	A,NERR_BUSY
+	OR	A
+	RET
+
+; Close every open channel; leave the network up.
+CLOSE_LINK
+	LD	A,(ARG_CH)
+	PUSH	AF
+	XOR	A
+	LD	(ARG_CH),A
+	CALL	CLOSE_CHANNEL
+	AND	A
+	JR	NZ,.restore
+	LD	A,1
+	LD	(ARG_CH),A
+	CALL	CLOSE_CHANNEL
+.restore
+	POP	AF
+	LD	(ARG_CH),A
 	RET
 
 ; Open the link, retrying while the ESP answers "busy" (its IP stack may
@@ -874,23 +1546,14 @@ CLOSE_LINK
 OPEN_RETRY
 	LD	A,BUSY_MAX_RETRY
 	LD	(BUSY_RETRY),A
+	LD	A,1
+	LD	(CONN_TRY),A		; one ladder retry per call
+	LD	A,0xFF
+	LD	(PROBE_RES),A		; diagnostics belong to this CONNECT only
+	XOR	A
+	LD	(TCP.WSO_FLAGS),A
 .try
-	LD	A,(OPEN_MODE)
-	LD	HL,(ARG_DE)		; host
-	LD	DE,(ARG_IX)		; port / remote port
-	AND	A
-	JR	Z,.tcp
-	CP	2
-	JR	Z,.udplocal
-	CALL	UDP.OPEN
-	JR	.res
-.udplocal
-	LD	IX,(ARG_IY)		; local port
-	CALL	UDP.OPEN_LOCAL
-	JR	.res
-.tcp
-	CALL	TCP.OPEN
-.res
+	CALL	MUX_OPEN
 	RET	NC
 	LD	(BUSY_LAST),A
 	LD	A,(WCOMMON.CANCELLED)
@@ -908,9 +1571,169 @@ OPEN_RETRY
 	CALL	UTIL.DELAY
 	JR	.try
 .giveup
+	; Silence deserves one probe: the module may be slow (retry), rebooted
+	; (re-arm CIPMUX and retry), or may have opened the link right after our
+	; timeout ("<id>,CONNECT" caught by the probe = the connect DID succeed).
+	LD	A,(BUSY_LAST)
+	CP	RES_RS_TIMEOUT
+	JR	NZ,.hardfail
+	LD	A,(CONN_TRY)
+	AND	A
+	JR	Z,.hardfail
+	DEC	A
+	LD	(CONN_TRY),A
+	CALL	PROBE_AT
+	LD	A,(WCOMMON.CANCELLED)	; left latched: F_CONNECT maps it to
+	AND	A			; NERR_CANCEL via its own CONSUME_CANCEL
+	JR	NZ,.hardfail
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	3,A
+	JR	NZ,.late_connect
+	BIT	1,A
+	JR	NZ,.rearm
+	CALL	PROBE_ALIVE
+	JR	C,.hardfail		; truly silent: nothing left to try
+	JR	.try			; parser idle: the lost CIPSTART is dead
+.late_connect
+	XOR	A			; CF=0: the link is open
+	RET
+.rearm
+	CALL	REBOOT_EVENT
+	CALL	ENSURE_MUX
+	JR	C,.hardfail
+	JR	.try
+.hardfail
+	CALL	NOTE_CONNECT_FAILURE
 	LD	A,(BUSY_LAST)
 	SCF
 	RET
+
+; Open one link in multi-connection mode:
+;   TCP: AT+CIPSTART=<ch>,"TCP","<host>",<port>
+;   UDP: AT+CIPSTART=<ch>,"UDP","<host>",<rport>,<lport>,2
+; Mode 2 lets the remote peer change, matching the single-connection behaviour.
+; OPEN_MODE: 0 = TCP, 1 = UDP default local port, 2 = UDP explicit local port.
+; Out: CF=0 ok, CF=1 / A = ESP result code.
+MUX_OPEN
+	LD	A,(ARG_CH)
+	LD	(TCP.LINK_ID),A
+	CALL	TCP.RX_DEFER_RESET_CH	; a fresh link must not replay old data
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_CLEAR_CLOSED
+	LD	HL,0
+	LD	(TCP.PAYLOAD_LEFT),HL
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+
+	LD	HL,TCP.CMD_BUFFER
+	LD	DE,CMD_CIPSTART_PREFIX
+	CALL	TCP.APPEND_STR
+	CALL	TCP.APPEND_LINK_ID
+	LD	DE,CMD_PROTO_TCP
+	LD	A,(OPEN_MODE)
+	AND	A
+	JR	Z,.proto
+	LD	DE,CMD_PROTO_UDP
+.proto
+	CALL	TCP.APPEND_STR
+	LD	IX,(ARG_DE)		; host
+	CALL	TCP.APPEND_IX_STR
+	LD	DE,CMD_QUOTE_COMMA
+	CALL	TCP.APPEND_STR
+	LD	IX,(ARG_IX)		; port / remote port
+	CALL	TCP.APPEND_IX_STR
+	LD	A,(OPEN_MODE)
+	AND	A
+	JR	Z,.finish		; TCP needs nothing else
+	LD	DE,CMD_COMMA_STR
+	CALL	TCP.APPEND_STR
+	LD	A,(OPEN_MODE)
+	CP	2
+	JR	Z,.explicit_lport
+	; Default local port, one per channel so two default UDP channels cannot
+	; collide on the same ESP-side port.
+	LD	DE,UDP_LPORT_CH0
+	LD	A,(ARG_CH)
+	AND	A
+	JR	Z,.lport
+	LD	DE,UDP_LPORT_CH1
+.lport
+	CALL	TCP.APPEND_STR
+	JR	.udptail
+.explicit_lport
+	LD	IX,(ARG_IY)
+	CALL	TCP.APPEND_IX_STR
+.udptail
+	LD	DE,CMD_UDP_MODE
+	CALL	TCP.APPEND_STR
+.finish
+	LD	DE,CMD_CRLF_STR
+	CALL	TCP.APPEND_STR
+	LD	HL,TCP.CMD_BUFFER
+	LD	BC,TCP_OPEN_TIMEOUT
+	LD	A,1
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+	CALL	MUX_TX_COMMAND
+	PUSH	AF
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+	POP	AF
+	RET
+
+; Send a command while one or both mux links may already be producing +IPD.
+; The generic UART_TX_CMD stops only on text lines and can consume an immediate
+; peer greeting as part of CIPSTART's response (CONNECT, +IPD, OK is a legal
+; race). WAIT_SEND_OK already understands link prefixes, binary +IPD frames,
+; CLOSED, busy, ERROR and a command-mode OK, so use it from the first byte.
+; In: HL=ASCIIZ command, BC=per-byte timeout. Out: normal RES_*/CF contract.
+MUX_TX_COMMAND
+	LD	(TCP.WSO_TIMEOUT),BC
+	; SEND_TRACE_RESET and the pending-payload rescue both use HL internally.
+	; Keep the caller's command pointer until the actual UART transmit; losing
+	; it here makes UART_TX_STRING send from address zero instead of CMD_BUFFER.
+	PUSH	HL
+	CALL	TCP.SEND_TRACE_RESET
+	XOR	A
+	LD	(WIFI.RS_BUFF),A
+	LD	(TCP.LINE_BUFFER),A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	POP	HL
+	JR	C,.finish
+	LD	A,1
+	LD	(TCP.MUX_ACCEPT_OK),A
+	CALL	WIFI.UART_TX_STRING
+	JR	NC,.wait
+	LD	A,RES_TX_TIMEOUT
+	SCF
+	JR	.finish
+.wait
+	CALL	TCP.MUX_WAIT_SEND_OK
+.finish
+	PUSH	AF
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	HL,TCP_DEFAULT_TIMEOUT
+	LD	(TCP.WSO_TIMEOUT),HL
+	; Preserve the last complete/partial response line for LASTERR and the
+	; existing busy/DNS diagnostics, just as UART_TX_CMD preserved RS_BUFF.
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,TCP.LINE_BUFFER
+	CALL	TCP.APPEND_STR
+	LD	(HL),0
+	POP	AF
+	RET
+
+; Keep CONNECT failures actionable even when the ESP produced no complete
+; response line. PROBE_AT deliberately does not overwrite RS_BUFF, so without
+; this a timeout/recovery failure surfaced as an empty LASTERR.
+NOTE_CONNECT_FAILURE
+	LD	A,(WIFI.RS_BUFF)
+	AND	A
+	RET	NZ
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,MSG_CONN_SILENT
+	JP	TCP.APPEND_STR
 
 ; Consume a latched user-cancel flag. Out: CF=1 if it was set (now cleared).
 CONSUME_CANCEL
@@ -1070,7 +1893,7 @@ SELECT_ENV_RX_PROFILE
 	IFDEF	ESP_AT_FORCE_222
 	; 2.2.2-only DLL: refuse a session NETUP did not bring up as 2.2.2 rather
 	; than silently driving 2.2.1 firmware with the 2.2.2 command set. The
-	; compiled receive path is fixed (TR8); this only gates NETINIT.
+	; compiled receive path is fixed (2.2.2/TR4); this only gates NETINIT.
 	LD	HL,ENVN_ESP_FW
 	CALL	ENV_GET_STAGE
 	JR	Z,.bad222
@@ -1392,8 +2215,22 @@ SKIP_SPACES
 CMD_AT			DB "AT",13,10,0
 CMD_ATE0		DB "ATE0",13,10,0
 CMD_CIPMUX0		DB "AT+CIPMUX=0",13,10,0
+CMD_CIPMUX1		DB "AT+CIPMUX=1",13,10,0
+; SO_LINGER off, TCP_NODELAY off, SO_SNDTIMEO 4000 ms for all links (id 5).
+CMD_CIPTCPOPT		DB "AT+CIPTCPOPT=5,-1,0,4000",13,10,0
 CMD_CIPCLOSE_ALL	DB "AT+CIPCLOSE=5",13,10,0
 CMD_CIPCLOSE_ONE	DB "AT+CIPCLOSE",13,10,0
+; Multi-connection command fragments, assembled around the link digit.
+CMD_CIPSTART_PREFIX	DB "AT+CIPSTART=",0
+CMD_CIPCLOSE_PREFIX	DB "AT+CIPCLOSE=",0
+CMD_PROTO_TCP		DB ",",34,"TCP",34,",",34,0
+CMD_PROTO_UDP		DB ",",34,"UDP",34,",",34,0
+CMD_QUOTE_COMMA		DB 34,",",0
+CMD_COMMA_STR		DB ",",0
+CMD_UDP_MODE		DB ",2",0	; remote peer may change
+CMD_CRLF_STR		DB 13,10,0
+UDP_LPORT_CH0		DB "1069",0
+UDP_LPORT_CH1		DB "1070",0
 PFX_PING		DB "AT+PING=",34,0
 PFX_CIPDOMAIN		DB "AT+CIPDOMAIN=",34,0
 SFX_QUOTE_CRLF		DB 34,13,10,0
@@ -1446,7 +2283,10 @@ ENVN_TZ			DB "NET_TZ",0
 ; ======================================================
 WIN_BASE		DB 0	; high byte (top 2 bits) of our window base
 INITED			DB 0	; NETINIT completed
-CH_STATE		DB 0	; 0 closed, 1 TCP open, 2 UDP open
+CH_STATE		DB 0,0	; per channel: 0 closed, 1 TCP open, 2 UDP open
+MUX_ACTIVE		DB 0	; AT+CIPMUX=1 currently in force
+ARG_CH			DB 0	; channel argument of the call in progress
+RECV_FLAGS		DW 0	; RECV flag / STATUS state accumulator
 CANCEL_MODE		DB 0	; SETOPT CANCELKEYS
 RX_PAUSED		DB 0	; consumer requested RX pause
 RESOLVE_SUP		DB 0	; 0 unknown, 1 supported, 2 unsupported
@@ -1459,6 +2299,20 @@ ARG_IX			DW 0
 ARG_IY			DW 0
 SEND_DONE		DW 0
 CHUNK_LEN		DW 0
+SEND_RES		DB 0		; transport result of the failing send (LASTERR)
+SEND_GOT		DW 0		; window byte count, snapshot before the probe
+SEND_GOT_N		DB 0		; captured bytes in that window
+SEND_TRY		DB 0		; ladder reissue budget of the current F_SEND
+CONN_TRY		DB 0		; ladder retry budget of the current OPEN_RETRY
+; Suspended-send transaction (CAP_ASYNCSEND).
+PEND_CH			DB 0xFF		; channel of the suspended send, 0xFF = none
+PEND_BUF		DW 0		; resume-contract reference: same buffer...
+PEND_LEN		DW 0		; ...and same length must be passed again
+OPT_SLICE		DW 0		; UNET_OPT_SENDSLICE value, 0 = blocking
+PROBE_RES		DB 0xFF		; PROBE_AT outcome, 0xFF = not probed
+PROBE_LEFT		DB 0
+PROBE_ROUNDS		EQU 5	; x (1.5 s wait + 0.5 s pause) = ~10 s patience
+PROBE_BYTE_TIMEOUT EQU 1500
 RECV_GOT		DW 0
 	ENDMODULE
 
@@ -1529,8 +2383,12 @@ LINE_END	DB 13,10,0
 	INCLUDE "util.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "esp_tcp.asm"
-	INCLUDE "esp_udp.asm"
+; esp_udp.asm is deliberately NOT included: its AT+CIPSTART/CIPCLOSE builders are
+; single-connection only. In multi-connection mode a UDP link is opened by
+; MUX_OPEN and shares the link-aware CIPSEND/CIPCLOSE/+IPD paths with TCP.
 	INCLUDE "esplib.asm"
+
+	ASSERT UNET_CHANNELS == TCP_MUX_CHANNELS
 
 ; ======================================================
 ; In-image BSS. Reserve the whole RS_BUFF chain plus our staging buffers as
@@ -1538,7 +2396,7 @@ LINE_END	DB 13,10,0
 ; ======================================================
 	MODULE UNET
 
-ENV_STAGE	EQU UDP.UDP_BSS_END
+ENV_STAGE	EQU TCP.TCP_BSS_END
 ENV_STAGE_SIZE	EQU 192	; DSS ENV_GET has no length cap; headroom for long values
 CMDBUILD	EQU ENV_STAGE + ENV_STAGE_SIZE
 CMDBUILD_SIZE	EQU 160

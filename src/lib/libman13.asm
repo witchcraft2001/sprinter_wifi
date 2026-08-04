@@ -417,9 +417,21 @@ ll9:	ld	c,a
 	ld      bc,013Bh		; подкл. 2-ю страницу в 3-е окно
 	rst     10h
 	pop	bc			; новый адрес кода
+	; Do not carry IY across the GETMEM/SETWIN calls above. Estex-DSS and BIOS
+	; do not guarantee index-register preservation there; a clobbered IY makes
+	; remake read a bogus relocation bitmap and the first DLL call can jump to
+	; garbage (DSS then reports #27, unexpected application termination).
+	; Rebuild the bitmap pointer from the canonical header now that page 2 is
+	; mapped, immediately before relocation. This mirrors current libman 1.3.
+	ld	hl,0C004h
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	push	de
+	pop	iy
 	ld	de,0C000h
 	add     iy,de			; начало рел-таблицы + 0C000h
-	ex	de,hl			; hl=0C000h адрес исх. кода
+	ld	hl,0C000h		; адрес исх. кода
 l1_form:ld	a,true			; флаг формата библы
 	or	a
 	jr	z,nofix			; "L0" формат
@@ -636,6 +648,7 @@ _L_FREE:
 	ld      b,max_count		; 64 макс. число загр. библиотек
 	ld      e,0
 lf1:	ld      a,(hl)
+	or	a			; LD does not set Z: test this table entry explicitly
 	jr      z,lf2
 	inc     hl
 	ld      a,(hl)

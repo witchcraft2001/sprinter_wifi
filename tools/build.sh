@@ -106,8 +106,8 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       fi
 
       # The UNET DLL pins its own firmware profile in-source (unetesp.asm
-      # DEFINEs ESP_AT_FORCE_222 + WIFI_STABLE_ACTIVE_RX for a 2.2.2-only,
-      # trigger-8 build). Do NOT forward the EXE ESP_AT_PROFILE flag to the
+      # DEFINEs ESP_AT_FORCE_222 for a 2.2.2-only, complete trigger-4 build).
+      # Do NOT forward the EXE ESP_AT_PROFILE flag to the
       # DLL: a -DESP_AT_FORCE_221 would collide with the in-source 2.2.2 pin.
       dll_assembler=(--assembler sjasmplus)
 

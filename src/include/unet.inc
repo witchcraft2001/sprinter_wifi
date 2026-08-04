@@ -49,26 +49,30 @@ UNET_FN_FINI		EQU 1	; libman free hook. Closes any open link, A=0. Do not call d
 UNET_FN_GETCAPS		EQU 2	; ->  A=0, DE=caps bitmask, IX=UNET_ABI_VERSION. Callable before NETINIT.
 UNET_FN_NETINIT		EQU 3	; ->  A (0 / NERR_NONET / NERR_HW / NERR_BUSY). Bring the link layer up.
 UNET_FN_NETDONE		EQU 4	; Close the active channel, leave the network up. A=0. Idempotent.
-UNET_FN_CONNECT		EQU 5	; A=channel(0), DE=host ASCIIZ, IX=port ASCIIZ  ->  A
+UNET_FN_CONNECT		EQU 5	; A=channel, DE=host ASCIIZ, IX=port ASCIIZ  ->  A
+				;   channel 0..1 when GETCAPS reports CAP_MULTICHAN,
+				;   otherwise channel 0 only (else NERR_PARAM)
 				;   retries internally while the backend reports "busy"
 UNET_FN_SEND		EQU 6	; A=channel, DE=buffer, IX=length  ->  A, DE=bytes sent
 				;   TCP: chunked internally at 2048 (ESP-AT CIPSEND cap).
 				;   UDP: one datagram per call, length > 1472 -> NERR_PARAM.
 				;   Peer data arriving DURING a send may be dropped by the ESP
 				;   backend - drain RECV before sending (see docs/UNETAPI.md).
+				;   With UNET_OPT_SENDSLICE > 0 may return NERR_AGAIN:
+				;   repeat the same call to continue the transaction.
 UNET_FN_RECV		EQU 7	; A=channel, DE=buffer, IX=max, IY=timeout_ms  ->  A, DE=received, IX=flags
-				;   A=NERR_OK, DE=0            : timeout, link still alive
+				;   A=NERR_OK, DE=0            : nothing for this channel yet
+				;                                (timeout, or the backend buffered
+				;                                data for the OTHER channel - see
+				;                                UNET_RXF_XCHAN)
 				;   A=NERR_CLOSED             : peer closed (any DE bytes are valid first)
-				;   IX flags: bit0 reserved (backends that truncate oversized
-				;             datagrams; UNETESP never truncates - the tail
-				;             arrives on the next call with bit1 set),
-				;             bit1 more data pending,
-				;             bit2 UART overrun (LSR OE) seen since last call
-UNET_FN_CLOSE		EQU 8	; A=channel(0)  ->  A. Idempotent.
-UNET_FN_STATUS		EQU 9	; A=channel(0)  ->  A=0, DE=state (0 closed / 2 connected; last known)
+				;   IX flags: see UNET_RXF_* below
+UNET_FN_CLOSE		EQU 8	; A=channel  ->  A. Idempotent. Closes ONE channel;
+				;   use NETDONE to close every channel at once.
+UNET_FN_STATUS		EQU 9	; A=channel  ->  A=0, DE=state (see UNET_ST_* below)
 				;   A=0xFF     ->  network status WITHOUT touching hardware:
 				;                  A=0/NERR_NONET, DE bit0 env configured, bit1 NETINIT done
-UNET_FN_UDPOPEN		EQU 10	; A=channel(0), DE=host, IX=rport ASCIIZ, IY=lport ASCIIZ|0  ->  A
+UNET_FN_UDPOPEN		EQU 10	; A=channel, DE=host, IX=rport ASCIIZ, IY=lport ASCIIZ|0  ->  A
 				;   retries internally while the backend reports "busy"
 UNET_FN_RESOLVE		EQU 11	; DE=host ASCIIZ, IX=dest(>=16 bytes)  ->  A, dest="a.b.c.d",0
 UNET_FN_PING		EQU 12	; DE=host ASCIIZ, IY=timeout_ms  ->  A, DE=round-trip ms
@@ -106,6 +110,11 @@ NERR_STATE		EQU 11	; wrong state (e.g. CONNECT before NETINIT, or already open)
 NERR_TIMEOUT		EQU 12	; generic operation timeout (ping / resolve)
 NERR_BUSY		EQU 13	; backend busy (ESP IP stack still warming up)
 NERR_PROTO		EQU 14	; unexpected/protocol error in backend response
+NERR_AGAIN		EQU 15	; SEND suspended: the link was silent for one
+				; UNET_OPT_SENDSLICE quantum. Repeat the SAME call
+				; (same channel/buffer/length) to continue the
+				; transaction; DE = bytes confirmed so far. Only
+				; backends with UNET_CAP_ASYNCSEND return this.
 
 ; ------------------------------------------------------
 ; Capability bits (returned in DE by GETCAPS)
@@ -114,13 +123,41 @@ UNET_CAP_TCP		EQU 0x0001	; TCP client connect/send/recv/close
 UNET_CAP_UDP		EQU 0x0002	; connected UDP
 UNET_CAP_RESOLVE	EQU 0x0004	; RESOLVE returns a dotted-quad (may still NERR_NOTSUP at runtime)
 UNET_CAP_PING		EQU 0x0008	; ICMP-style ping
-UNET_CAP_MULTICHAN	EQU 0x0010	; more than one simultaneous channel (v1: 0)
+UNET_CAP_MULTICHAN	EQU 0x0010	; channels 0 and 1 can be open at the same time
+					; (UNETESP >= 0.3; UNETRTL: 0)
 UNET_CAP_LISTEN		EQU 0x0020	; inbound/listen sockets (neither backend: 0)
 UNET_CAP_RAWETH		EQU 0x0040	; raw Ethernet frames (RTL only)
 UNET_CAP_TRANSPARENT	EQU 0x0080	; ESP transparent byte-pipe mode (reserved extension)
 UNET_CAP_RXFLOW		EQU 0x0100	; consumer must honour RXPAUSE/RXRESUME for lossless receive
+UNET_CAP_ASYNCSEND	EQU 0x0200	; SEND can suspend with NERR_AGAIN instead of
+					; blocking (see UNET_OPT_SENDSLICE); UNETRTL: 0
 
 ; UNETESP v1 advertises: TCP | UDP | RESOLVE | PING | RXFLOW = 0x010F
+; UNETESP v0.3 adds MULTICHAN = 0x011F
+; UNETESP v0.4 adds ASYNCSEND = 0x031F
+
+; ------------------------------------------------------
+; STATUS(channel) state bits (returned in DE)
+; ------------------------------------------------------
+UNET_ST_CONN		EQU 0x0002	; channel is connected (last known state)
+UNET_ST_RXPEND		EQU 0x0004	; received data is buffered for this channel and
+					; not delivered yet. OPTIONAL: only backends that
+					; buffer per channel set it (UNETESP >= 0.3 with
+					; CAP_MULTICHAN); UNETRTL never does, so consumers
+					; must treat "not set" as "unknown", not as "empty".
+
+; ------------------------------------------------------
+; RECV flag bits (returned in IX)
+; ------------------------------------------------------
+UNET_RXF_TRUNC		EQU 0x0001	; oversized datagram was truncated. UNETESP never
+					; truncates - its tail arrives on the next call
+					; with UNET_RXF_MORE set.
+UNET_RXF_MORE		EQU 0x0002	; more data is already buffered for this channel
+UNET_RXF_LOST		EQU 0x0004	; UART overrun (LSR OE) or a dropped buffered frame
+					; since the last call; per channel from v0.3
+UNET_RXF_XCHAN		EQU 0x0008	; data is pending on the OTHER channel (v0.3,
+					; optional). A read that returns DE=0 with this bit
+					; set means "switch channels", not "link idle".
 
 ; ------------------------------------------------------
 ; GETINFO field ids (A on entry)
@@ -148,5 +185,12 @@ UNET_OPT_RXTRIG		EQU 2	; DE=1/4/8/14 - RX FIFO auto-RTS trigger level (ESP; defa
 				; TR4 is the stable compromise: TR1 throttles ESP to ~1 KB/s,
 				; while TR8 leaves too little headroom and causes overruns. Use
 				; other values only for field diagnostics on specific hardware.
+UNET_OPT_SENDSLICE	EQU 3	; DE=ms of link SILENCE after which SEND suspends with
+				; NERR_AGAIN instead of blocking (0 = blocking, the default;
+				; minimum 50 is enforced). Requires UNET_CAP_ASYNCSEND.
+				; While a send is suspended, RECV serves only already
+				; buffered data and returns immediately, and other
+				; transmitting calls return NERR_BUSY without touching
+				; the UART (see docs/UNETAPI.md).
 
 	ENDIF

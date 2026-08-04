@@ -6,6 +6,7 @@
 	INCLUDE "dss.inc"
 
 TEST_RESULT	EQU 0x7000
+TEST_STAGE	EQU 0x7001
 INFO_OUT	EQU 0xA000
 
 	ORG 0x0010
@@ -49,6 +50,8 @@ TEST_START
 	LD	SP,0x3FF0
 	XOR	A
 	LD	(TEST_RESULT),A
+	LD	A,1
+	LD	(TEST_STAGE),A
 
 	; Reproduce libman 1.3's L1 relocation inputs exactly.
 	LD	HL,DLL_IMAGE + 32
@@ -72,6 +75,21 @@ TEST_START
 	INC	HL
 	LD	(HL),0x5B
 
+	; The real relocated INIT contains an absolute CALL/variable reference and
+	; is exactly the function l_load invokes before returning to the application.
+	; Exercise it before GETCAPS so a damaged early relocation fails here instead
+	; of escaping through DSS's emergency return address as error #27.
+	LD	A,2
+	LD	(TEST_STAGE),A
+	LD	HL,0
+	LD	B,0
+	CALL	LIBMAN.l_call
+	JR	C,FAILED_INIT_CF
+	OR	A
+	JR	NZ,FAILED_INIT_A
+
+	LD	A,3
+	LD	(TEST_STAGE),A
 	LD	HL,0
 	LD	B,UNET_FN_GETCAPS
 	CALL	LIBMAN.l_call
@@ -91,6 +109,8 @@ TEST_START
 
 	; Exercise a real pointer+length export. This catches CHECK_BUF_RANGE
 	; corrupting BC while it checks the caller's window.
+	LD	A,4
+	LD	(TEST_STAGE),A
 	LD	A,UNET_IF_IP
 	LD	DE,INFO_OUT
 	LD	IX,32
@@ -109,17 +129,30 @@ TEST_START
 	JR	TEST_DONE
 
 FAILED
-	LD	A,1
+	LD	A,(TEST_STAGE)
+	LD	(TEST_RESULT),A
+	JR	TEST_DONE
+
+FAILED_INIT_CF
+	LD	A,0x22
+	LD	(TEST_RESULT),A
+	JR	TEST_DONE
+
+FAILED_INIT_A
+	LD	A,0x23
 	LD	(TEST_RESULT),A
 
 TEST_DONE
 	HALT
 
-EXPECTED_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW
+EXPECTED_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND
 ENV_VALUE	DB "192.168.1.2",0
 
-	ASSERT $ < 0x7800
-	DS	0x7800 - $,0
+	; Keep the flat test copy of libman above the largest legal WIN1 DLL image.
+	; UNETESP now reaches past 0x7800; placing libman there made the LDIR below
+	; overwrite its own l_call jump before the real INIT vector could run.
+	ASSERT $ < 0x8000
+	DS	0x8000 - $,0
 
 	INCLUDE "unet.inc"
 	INCLUDE "libman13.asm"

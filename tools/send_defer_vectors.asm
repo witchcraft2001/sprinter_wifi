@@ -196,6 +196,43 @@ TEST_START
 	JP	C,FAILED
 	ASSERT_W16 TCP.DEFER_W, 6	; unchanged by the prompt
 
+; ------------------------------------------------------------------
+; Vector 6: if the unread payload goes silent mid-frame, SEND must stop before
+; transmitting AT+CIPSEND. The exact remainder stays live and can be captured
+; later, so command text is never injected into binary +IPD data.
+; ------------------------------------------------------------------
+	LD	A,7
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET
+	LD	HL,5
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	HL,IN_PART_A
+	LD	BC,IN_PART_A_LEN
+	CALL	SET_INPUT
+	XOR	A
+	LD	(WIFI.TX_STRING_COUNT),A
+	LD	HL,PAYLOAD_XYZ
+	LD	BC,3
+	CALL	TCP.SEND_BUFFER
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	ASSERT_B WIFI.TX_STRING_COUNT, 0
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 3
+	ASSERT_W16 TCP.DEFER_W, 4	; patched header + "AB"
+	ASSERT_B TCP.DEFER_LOST, 1	; the split is visible diagnostically
+	LD	HL,IN_PART_B
+	LD	BC,IN_PART_B_LEN
+	CALL	SET_INPUT
+	CALL	TCP.CAPTURE_PENDING_PAYLOAD
+	JP	C,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	ASSERT_W16 TCP.DEFER_W, 9	; {2,"AB"}, then {3,"CDE"}
+	LD	HL,TCP.DEFER_BUF
+	LD	DE,EXP_SPLIT
+	LD	B,9
+	CALL	CMP_MEM
+
 	JP	TEST_DONE
 
 FAILED
@@ -240,6 +277,11 @@ IN_GOOD		DB "+IPD,4:GOOD>"
 IN_GOOD_LEN	EQU $-IN_GOOD
 IN_PENDING	DB "WXYZ>"
 IN_PENDING_LEN	EQU $-IN_PENDING
+IN_PART_A	DB "AB"
+IN_PART_A_LEN	EQU $-IN_PART_A
+IN_PART_B	DB "CDE"
+IN_PART_B_LEN	EQU $-IN_PART_B
+PAYLOAD_XYZ	DB "XYZ"
 
 ; Expected buffer contents ({len16le, payload}).
 EXP_HELLO	DB 5,0,"HELLO"
@@ -248,6 +290,7 @@ EXP_HELLOABC	DB "HELLOABC"
 EXP_WORLD	DB "WORLD"
 EXP_GOOD	DB 4,0,"GOOD"
 EXP_WXYZ	DB 4,0,"WXYZ"
+EXP_SPLIT	DB 2,0,"AB",3,0,"CDE"
 
 ; ------------------------------------------------------------------
 ; Stubs for the modules esp_tcp.asm depends on.
@@ -257,6 +300,7 @@ EXP_WXYZ	DB 4,0,"WXYZ"
 RS_BUFF		EQU 0xD000
 INPUT_PTR	DW 0
 INPUT_LEFT	DW 0
+TX_STRING_COUNT DB 0
 
 ; Read one byte from the scripted stream. In: BC=timeout (ignored).
 ; Out: CF=0 if a byte is available (mirrors UART_WAIT_RS + UART_READ split).
@@ -287,6 +331,9 @@ UART_READ
 	RET
 
 UART_TX_STRING
+	LD	A,(TX_STRING_COUNT)
+	INC	A
+	LD	(TX_STRING_COUNT),A
 	OR	A
 	RET
 UART_TX_BUFFER
