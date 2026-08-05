@@ -1424,6 +1424,17 @@ OPEN_RETRY
 	CALL	UTIL.DELAY
 	JR	.try
 .giveup
+	; After one silent attempt, "ALREADY CONNECTED" from the retry means that
+	; the original CIPSTART opened this same link and only its CONNECT event was
+	; lost. Never accept it on the first attempt: that could be an unrelated
+	; stale endpoint left by a previous process.
+	LD	A,(CONN_TRY)
+	AND	A
+	JR	NZ,.not_already
+	LD	A,(TCP.WSO_FLAGS)
+	BIT	4,A
+	JR	NZ,.late_connect
+.not_already
 	; Silence deserves one probe: the module may be slow (retry), rebooted
 	; (re-arm CIPMUX and retry), or may have opened the link right after our
 	; timeout ("<id>,CONNECT" caught by the probe = the connect DID succeed).
@@ -1435,12 +1446,16 @@ OPEN_RETRY
 	JR	Z,.hardfail
 	DEC	A
 	LD	(CONN_TRY),A
+	LD	HL,TCP.WSO_FLAGS
+	RES	4,(HL)			; do not promote ALREADY from the initial attempt
 	CALL	PROBE_AT
 	LD	A,(WCOMMON.CANCELLED)	; left latched: F_CONNECT maps it to
 	AND	A			; NERR_CANCEL via its own CONSUME_CANCEL
 	JR	NZ,.hardfail
 	LD	A,(TCP.WSO_FLAGS)
 	BIT	3,A
+	JR	NZ,.late_connect
+	BIT	4,A
 	JR	NZ,.late_connect
 	BIT	1,A
 	JR	NZ,.rearm
@@ -1581,10 +1596,15 @@ MUX_TX_COMMAND
 ; response line. PROBE_AT deliberately does not overwrite RS_BUFF, so without
 ; this a timeout/recovery failure surfaced as an empty LASTERR.
 NOTE_CONNECT_FAILURE
+	LD	A,(BUSY_LAST)
+	CP	RES_RS_TIMEOUT
+	JR	Z,.silent
 	LD	A,(WIFI.RS_BUFF)
 	AND	A
 	RET	NZ
+.silent
 	LD	HL,WIFI.RS_BUFF
+	LD	(HL),0			; discard partial/binary text from a silent command
 	LD	DE,MSG_CONN_SILENT
 	JP	TCP.APPEND_STR
 
@@ -1599,13 +1619,14 @@ CONSUME_CANCEL
 	RET
 
 ; Validate a caller buffer pointer in HL.
-; Reject window 0 (system), window 3 (ISA) and the DLL's own window.
+; Reject window 3 (ISA) and the DLL's own window. WIN0 is deliberately
+; accepted: callers may map their own page there and own the DSS/system-memory
+; risk. The DLL validates addressability, not page ownership.
 ; Out: CF=1 if invalid, CF=0 if usable. Preserves BC, DE and HL: callers such
 ; as CHECK_BUF_RANGE keep their length in BC.
 CHECK_BUF
 	LD	A,H
 	AND	0xC0
-	JR	Z,.bad			; window 0
 	CP	0xC0
 	JR	Z,.bad			; window 3 (ISA)
 	LD	A,(WIN_BASE)

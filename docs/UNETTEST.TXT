@@ -31,6 +31,9 @@ Usage
                 later); one without it prints a note and stops, which is not a
                 failure. Pair with tools/race_server.py --dual, which serves
                 the control channel on --port and the data channel on --port+1.
+                The server discards a control half that receives no data
+                connection within --pair-timeout (10 seconds by default), so
+                an aborted run cannot steal a channel from the next run.
   host          Host name or IP address to test (default example.com).
   port          TCP port for the connect/send/receive step (default 80),
                 unused when -u is given. With -2 this is the control port.
@@ -89,7 +92,12 @@ Behavior
                  Afterwards it checks that the control reply which arrived
                  during the transfer was buffered rather than lost (STATUS
                  RXPEND), reads it, and closes both channels. This is the
-                 pattern passive FTP depends on.
+                 pattern passive FTP depends on. A stream gap, missing data
+                 close, receive error, or missing control reply is a test
+                 failure (exit status 3), not a successful "done." result.
+                 Three consecutive real data timeouts stop the test after
+                 about 12 seconds; Esc cancels it without entering the later
+                 control-receive phase.
   Before SETOPT it also verifies ABI 0x0100 and the mandatory TCP capability.
   If these are invalid, it prints the loaded L1 image sizes plus the relocated
   GETCAPS bytes and exits instead of jumping farther through a damaged DLL.

@@ -691,6 +691,56 @@ TEST_START
 	LD	(TCP.MUX_ACCEPT_OK),A
 	LD	(TCP.MUX_ACCEPT_CLOSED),A
 
+; ------------------------------------------------------------------
+; Vector 21: a recovery CIPSTART may receive ALREADY CONNECTED when the first
+; silent attempt opened the link but its CONNECT notification was lost.
+; ------------------------------------------------------------------
+	LD	A,21
+	LD	(STAGE),A
+	CALL	TCP.SEND_STATE_RESET
+	LD	A,1
+	LD	(TCP.LINK_ID),A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+	LD	HL,IN_ALREADY_CONNECTED
+	LD	BC,IN_ALREADY_CONNECTED_LEN
+	CALL	SET_INPUT
+	CALL	TCP.WAIT_SEND_OK
+	JP	NC,FAILED
+	CP	RES_ERROR
+	JP	NZ,FAILED
+	LD	A,(TCP.WSO_FLAGS)
+	AND	0x10
+	JP	Z,FAILED
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+
+; ------------------------------------------------------------------
+; Vector 22: CONNECT for another link must not poison the target-link recovery
+; flag. Otherwise a delayed channel-0 notification can falsely open channel 1.
+; ------------------------------------------------------------------
+	LD	A,22
+	LD	(STAGE),A
+	CALL	TCP.SEND_STATE_RESET
+	LD	A,1
+	LD	(TCP.LINK_ID),A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+	LD	HL,IN_FOREIGN_CONNECT_ERROR
+	LD	BC,IN_FOREIGN_CONNECT_ERROR_LEN
+	CALL	SET_INPUT
+	CALL	TCP.WAIT_SEND_OK
+	JP	NC,FAILED
+	CP	RES_ERROR
+	JP	NZ,FAILED
+	LD	A,(TCP.WSO_FLAGS)
+	AND	8
+	JP	NZ,FAILED
+	XOR	A
+	LD	(TCP.MUX_ACCEPT_OK),A
+	LD	(TCP.MUX_ACCEPT_CONNECT),A
+
 	JP	PASSED
 
 FAILED
@@ -800,6 +850,10 @@ IN_CLOSE_STREAM DB "+IPD,1,2:QQ",13,10,"0,CLOSED",13,10
 IN_CLOSE_STREAM_TAIL DB "+IPD,1,3:END"
 IN_CLOSE_STREAM_LEN EQU $-IN_CLOSE_STREAM
 IN_CLOSE_STREAM_TAIL_LEN EQU $-IN_CLOSE_STREAM_TAIL
+IN_ALREADY_CONNECTED DB "ALREADY CONNECTED",13,10,"ERROR",13,10
+IN_ALREADY_CONNECTED_LEN EQU $-IN_ALREADY_CONNECTED
+IN_FOREIGN_CONNECT_ERROR DB "0,CONNECT",13,10,"ERROR",13,10
+IN_FOREIGN_CONNECT_ERROR_LEN EQU $-IN_FOREIGN_CONNECT_ERROR
 
 ; Expected payloads and buffer contents ({len16le, payload}).
 EXP_HELLO	DB "HELLO"

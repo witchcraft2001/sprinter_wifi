@@ -12,6 +12,8 @@ bindings are developer material and are not shipped in the distribution ZIP.
 Common rule for every consumer: **the DLL must own a full 16 KB window, and
 never window 3** (the ESP UART is mapped there during calls). Load buffers you
 pass to the DLL must live below `0xC000` and outside the DLL's window.
+WIN0 pointers are allowed; a consumer that remaps WIN0 over DSS/system memory
+is responsible for preserving and restoring that mapping safely.
 
 DLL name resolution: libman opens the DLL by name through DSS, which searches
 only the **current directory** - not `PATH`, not the program's own directory.

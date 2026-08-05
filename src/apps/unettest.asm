@@ -806,6 +806,10 @@ DUAL_PHASE
 	XOR	A
 	LD	(DUAL_NEXT),A
 	LD	(DUAL_BAD),A
+	LD	(DUAL_FAIL),A
+	LD	(DUAL_CLOSED),A
+	LD	A,DUAL_MAX_IDLE
+	LD	(DUAL_IDLE),A
 	LD	HL,0
 	LD	(DUAL_TOTAL),HL
 	LD	A,DUAL_MAX_ROUNDS
@@ -824,24 +828,62 @@ DUAL_PHASE
 	CALL	DO_CALL				; -> A, DE=got
 	CP	NERR_CLOSED
 	JR	Z,.data_closed
+	CP	NERR_CANCEL
+	JR	Z,.data_cancel
 	OR	A
 	JR	NZ,.data_err
 	LD	A,D
 	OR	E
-	JR	Z,.data_loop			; nothing for this channel yet
+	JR	NZ,.data_bytes
+	; An empty read caused by data pending on the control channel is not a
+	; four-second data timeout. Keep channel 1 selected for this stress test;
+	; the global round bound still prevents an endless cross-channel spin.
+	LD	A,IXL
+	AND	LOW UNET_RXF_XCHAN
+	JR	NZ,.data_loop
+	LD	A,(DUAL_IDLE)
+	DEC	A
+	LD	(DUAL_IDLE),A
+	JR	NZ,.data_loop
+	LD	HL,MSG_DUAL_IDLE
+	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
+	JR	.data_done
+.data_bytes
+	LD	A,DUAL_MAX_IDLE
+	LD	(DUAL_IDLE),A
 	CALL	DUAL_CHECK_SEQ
 	JR	.data_loop
+.data_cancel
+	LD	HL,MSG_CANCELLED
+	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
+	JP	.close_both
 .data_err
 	LD	HL,MSG_RECV_ERR
 	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
 	JR	.data_done
 .data_closed
+	LD	A,1
+	LD	(DUAL_CLOSED),A
 	LD	A,D
 	OR	E
 	CALL	NZ,DUAL_CHECK_SEQ		; trailing bytes precede the close
 	LD	HL,MSG_DUAL_CLOSED
 	CALL	PUTS_LN
 .data_done
+	LD	A,(DUAL_CLOSED)
+	AND	A
+	JR	NZ,.have_close
+	LD	A,1
+	LD	(DUAL_FAIL),A
+	LD	HL,MSG_DUAL_NOT_CLOSED
+	CALL	PUTS_LN
+.have_close
 	LD	HL,MSG_DUAL_BYTES
 	CALL	PUTS
 	LD	HL,(DUAL_TOTAL)
@@ -878,18 +920,30 @@ DUAL_PHASE
 	LD	A,D
 	OR	E
 	JR	Z,.ctrl_none
+	PUSH	DE
 	LD	HL,MSG_DUAL_CTRL
 	CALL	PUTS
 	CALL	PRINT_RECV
 	CALL	CRLF
+	POP	DE
+	CALL	DUAL_CONTROL_MATCH
+	JR	Z,.close_both
+	LD	HL,MSG_DUAL_CTRL_BAD
+	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
 	JR	.close_both
 .ctrl_none
 	LD	HL,MSG_DUAL_CTRL_NONE
 	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
 	JR	.close_both
 .ctrl_err
 	LD	HL,MSG_RECV_ERR
 	CALL	PUTS_LN
+	LD	A,1
+	LD	(DUAL_FAIL),A
 .close_both
 	LD	A,1
 	LD	B,UNET_FN_CLOSE
@@ -897,7 +951,14 @@ DUAL_PHASE
 	XOR	A
 	LD	B,UNET_FN_CLOSE
 	CALL	DO_CALL
-	RET
+	LD	A,(DUAL_FAIL)
+	AND	A
+	RET	Z
+	LD	HL,MSG_DUAL_FAILED
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
 
 ; A failed CONNECT here is the interesting case, so report the DLL status
 ; number as well as the ESP's own last words - "connect failed" alone does not
@@ -935,6 +996,7 @@ DUAL_CHECK_SEQ
 	JR	Z,.ok
 	LD	A,1
 	LD	(DUAL_BAD),A
+	LD	(DUAL_FAIL),A
 	LD	A,(HL)				; resynchronise on the byte we got
 .ok
 	INC	A
@@ -942,6 +1004,28 @@ DUAL_CHECK_SEQ
 	INC	HL
 	DEC	BC
 	JR	.loop
+
+; The dual test proves that the response generated while data was in flight
+; survived. A late fallback response is useful server diagnostics, but it is
+; not proof of the FTP-style race we are testing.
+; In: DE=received byte count. Out: ZF=1 only for the exact expected reply.
+DUAL_CONTROL_MATCH
+	LD	HL,DUAL_EXPECT_LEN
+	OR	A
+	SBC	HL,DE
+	RET	NZ
+	LD	HL,RECV_BUF
+	LD	DE,DUAL_EXPECT
+	LD	B,DUAL_EXPECT_LEN
+.loop
+	LD	A,(DE)
+	CP	(HL)
+	RET	NZ
+	INC	HL
+	INC	DE
+	DJNZ	.loop
+	XOR	A
+	RET
 
 ; Compare the received datagram with the payload we sent.
 ; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
@@ -1420,6 +1504,8 @@ MSG_DUAL_DATA_OPEN DB "connect data ",0
 MSG_DUAL_STATUS	DB " status ",0
 MSG_DUAL_UNSUP	DB "two channels not supported by this backend (no CAP_MULTICHAN)",0
 MSG_DUAL_CLOSED	DB "data channel closed by peer",0
+MSG_DUAL_NOT_CLOSED DB "data channel did not close cleanly",0
+MSG_DUAL_IDLE	DB "data channel timed out",0
 MSG_DUAL_BYTES	DB "data bytes: ",0
 MSG_DUAL_SEQ_OK	DB "data stream continuous",0
 MSG_DUAL_SEQ_BAD DB "data stream GAP - bytes were lost",0
@@ -1427,8 +1513,13 @@ MSG_DUAL_PEND	DB "control data buffered during the transfer (STATUS RXPEND)",0
 MSG_DUAL_NOPEND	DB "no control data pending",0
 MSG_DUAL_CTRL	DB "control reply: ",0
 MSG_DUAL_CTRL_NONE DB "control channel returned nothing",0
+MSG_DUAL_CTRL_BAD DB "unexpected/late control reply",0
+MSG_DUAL_FAILED DB "dual channel test FAILED",0
+MSG_CANCELLED	DB "cancelled",0
 DUAL_PROBE	DB "UNETTEST DUAL CONTROL",13,10
 DUAL_PROBE_LEN	EQU $ - DUAL_PROBE
+DUAL_EXPECT	DB "CONTROL REPLY DURING TRANSFER",13,10
+DUAL_EXPECT_LEN	EQU $ - DUAL_EXPECT
 MSG_CRLF	DB 13,10,0
 
 DEF_DLL		DB "UNETESP.DLL",0
@@ -1486,7 +1577,10 @@ UDP_RX_FLAGS	EQU UDP_RX_LEN + 2
 DUAL_MODE	EQU UDP_RX_FLAGS + 1	; 1 = -2 given, run the two-channel exercise
 DUAL_NEXT	EQU DUAL_MODE + 1	; next expected byte of the data stream
 DUAL_BAD	EQU DUAL_NEXT + 1	; 1 = the data stream lost continuity
-DUAL_TOTAL	EQU DUAL_BAD + 1	; bytes received on the data channel
+DUAL_FAIL	EQU DUAL_BAD + 1	; 1 = any fatal dual-test condition
+DUAL_CLOSED	EQU DUAL_FAIL + 1	; 1 = data peer close was observed
+DUAL_IDLE	EQU DUAL_CLOSED + 1	; consecutive real data timeouts left
+DUAL_TOTAL	EQU DUAL_IDLE + 1	; bytes received on the data channel
 DEC_BUF		EQU DUAL_TOTAL + 2
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
@@ -1512,6 +1606,7 @@ STACK_TOP	EQU STACK_BOTTOM + 0x600
 RECV_MAX_BLOCKS	EQU 4
 UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
 DUAL_MAX_ROUNDS	EQU 200			; bounds the -2 data drain loop
+DUAL_MAX_IDLE	EQU 3			; 3 x 4 s without channel-1 data
 
 	ASSERT STACK_TOP <= 0xC000
 

@@ -26,6 +26,7 @@ Examples:
 """
 
 import argparse
+import select
 import socket
 import sys
 import time
@@ -127,7 +128,72 @@ def serve_udp(host, port, chunk, rate):
         log(f"stopped; sent {sent} bytes")
 
 
-def serve_dual(host, port, chunk, rate, count):
+def _close_socket(sock):
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _accept_dual_pair(ctrl_srv, data_srv, pair_timeout):
+    """Return a live control/data pair without reusing half of an old run.
+
+    A failed UNETTEST can leave the server blocked after accepting control but
+    before data arrives.  The next run would then donate its data socket to the
+    stale control socket.  Watch the control peer and bound that half-open
+    state; while no control is pending, discard orphan data sockets left by a
+    late ESP connect from an already failed run.
+    """
+    while True:
+        ready, _, _ = select.select([ctrl_srv, data_srv], [], [])
+        if ctrl_srv not in ready:
+            data, addr = data_srv.accept()
+            log(f"discarding orphan data connection: {addr[0]}:{addr[1]}")
+            _close_socket(data)
+            continue
+
+        ctrl, ctrl_addr = ctrl_srv.accept()
+        ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        log(f"control connected: {ctrl_addr[0]}:{ctrl_addr[1]}")
+        deadline = time.monotonic() + pair_timeout
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log("control timed out waiting for data; discarding stale pair")
+                _close_socket(ctrl)
+                break
+
+            ready, _, _ = select.select([ctrl, data_srv], [], [], remaining)
+            if not ready:
+                log("control timed out waiting for data; discarding stale pair")
+                _close_socket(ctrl)
+                break
+
+            # If EOF and a new data connection arrive together, discard the
+            # stale control first and leave data queued for the next control.
+            if ctrl in ready:
+                try:
+                    probe = ctrl.recv(1, socket.MSG_PEEK)
+                except (BlockingIOError, InterruptedError):
+                    probe = None
+                except OSError:
+                    probe = b""
+                if probe == b"":
+                    log("control closed before data; discarding stale pair")
+                    _close_socket(ctrl)
+                    break
+
+            if data_srv in ready:
+                data, data_addr = data_srv.accept()
+                data.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                log(f"data connected: {data_addr[0]}:{data_addr[1]} - streaming")
+                return ctrl, data
+
+
+def serve_dual(host, port, chunk, rate, count, pair_timeout=10.0):
     """Two-channel peer for UNETTEST -2 (see docs/UNETTEST.TXT).
 
     Control socket on `port`: echoes whatever the client sends, but only after
@@ -143,12 +209,7 @@ def serve_dual(host, port, chunk, rate, count):
         f"rate={'full' if not rate else str(rate) + ' B/s'}) - waiting...")
 
     while True:
-        ctrl, addr = ctrl_srv.accept()
-        ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log(f"control connected: {addr[0]}:{addr[1]}")
-        data, addr = data_srv.accept()
-        data.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log(f"data connected: {addr[0]}:{addr[1]} - streaming")
+        ctrl, data = _accept_dual_pair(ctrl_srv, data_srv, pair_timeout)
 
         counter = 0
         sent = 0
@@ -182,11 +243,8 @@ def serve_dual(host, port, chunk, rate, count):
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             log(f"client gone ({e.__class__.__name__}); streamed {sent} bytes")
         finally:
-            for s in (ctrl, data):
-                try:
-                    s.close()
-                except OSError:
-                    pass
+            _close_socket(ctrl)
+            _close_socket(data)
 
 
 def _listener(host, port):
@@ -210,6 +268,9 @@ def main():
     ap.add_argument("--count", type=int, default=8192,
                     help="bytes to stream on the data channel in --dual mode "
                          "(default 8192)")
+    ap.add_argument("--pair-timeout", type=float, default=10.0,
+                    help="seconds to wait for the dual data connection before "
+                         "discarding its control half (default 10)")
     ap.add_argument("--chunk", type=int, default=None,
                     help="bytes per send (default 128)")
     ap.add_argument("--rate", type=int, default=4000,
@@ -232,10 +293,13 @@ def main():
         ap.error("--dual and --udp are mutually exclusive")
     if args.count < 1:
         ap.error("--count must be >= 1")
+    if args.pair_timeout <= 0:
+        ap.error("--pair-timeout must be > 0")
 
     try:
         if args.dual:
-            serve_dual(args.host, args.port, chunk, rate, args.count)
+            serve_dual(args.host, args.port, chunk, rate, args.count,
+                       args.pair_timeout)
         elif args.udp:
             serve_udp(args.host, args.port, chunk, rate)
         else:

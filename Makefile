@@ -1,4 +1,4 @@
-.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress racetest clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-race-server racetest clean
 
 build:
 	tools/build.sh
@@ -9,7 +9,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress
+test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-race-server
 	tools/test-zmodem.sh
 
 test-libman:
@@ -32,6 +32,9 @@ test-mux-cmd:
 
 test-progress:
 	tools/test-progress.sh
+
+test-race-server:
+	python3 tools/test-race-server.py
 
 # Developer-only SEND-race stress tool; NOT part of the distribution.
 # Pair with tools/race_server.py running on the target host.

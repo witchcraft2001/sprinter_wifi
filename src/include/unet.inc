@@ -28,6 +28,8 @@
 ;     destinations) must live BELOW 0xC000 and OUTSIDE the 16 KB window
 ;     the DLL was loaded into - the WHOLE buffer, not just its first byte;
 ;     both ends of the range are validated. Violations return NERR_PARAM.
+;     WIN0 pointers are accepted: mapping a caller-owned page over DSS/system
+;     memory there, and restoring it safely, is entirely the caller's duty.
 ;   - Host strings are limited to 128 bytes, port strings to 15 bytes
 ;     (longer arguments return NERR_PARAM).
 ;   - Keep at least ~256 bytes of free stack across a call.

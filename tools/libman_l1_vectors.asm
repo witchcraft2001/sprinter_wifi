@@ -7,6 +7,7 @@
 
 TEST_RESULT	EQU 0x7000
 TEST_STAGE	EQU 0x7001
+INFO_WIN0	EQU 0x2000
 INFO_OUT	EQU 0xA000
 
 	ORG 0x0010
@@ -84,28 +85,28 @@ TEST_START
 	LD	HL,0
 	LD	B,0
 	CALL	LIBMAN.l_call
-	JR	C,FAILED_INIT_CF
+	JP	C,FAILED_INIT_CF
 	OR	A
-	JR	NZ,FAILED_INIT_A
+	JP	NZ,FAILED_INIT_A
 
 	LD	A,3
 	LD	(TEST_STAGE),A
 	LD	HL,0
 	LD	B,UNET_FN_GETCAPS
 	CALL	LIBMAN.l_call
-	JR	C,FAILED
+	JP	C,FAILED
 	LD	A,D
 	CP	HIGH EXPECTED_CAPS
-	JR	NZ,FAILED
+	JP	NZ,FAILED
 	LD	A,E
 	CP	LOW EXPECTED_CAPS
-	JR	NZ,FAILED
+	JP	NZ,FAILED
 	PUSH	IX
 	POP	HL
 	LD	DE,UNET_ABI_VERSION
 	OR	A
 	SBC	HL,DE
-	JR	NZ,FAILED
+	JP	NZ,FAILED
 
 	; Exercise a real pointer+length export. This catches CHECK_BUF_RANGE
 	; corrupting BC while it checks the caller's window.
@@ -117,16 +118,66 @@ TEST_START
 	LD	HL,0
 	LD	B,UNET_FN_GETINFO
 	CALL	LIBMAN.l_call
-	JR	C,FAILED
+	JP	C,FAILED
 	OR	A
-	JR	NZ,FAILED
+	JP	NZ,FAILED
 	LD	A,(INFO_OUT)
 	CP	'1'
-	JR	NZ,FAILED
+	JP	NZ,FAILED
 	LD	A,(INFO_OUT + 12)
 	OR	A
-	JR	NZ,FAILED
+	JP	NZ,FAILED
+
+	; WIN0 ownership is the caller's responsibility. The ABI must accept a
+	; caller-owned page mapped there instead of treating every WIN0 pointer as
+	; DSS/system memory.
+	LD	A,5
+	LD	(TEST_STAGE),A
+	LD	A,UNET_IF_BACKEND
+	LD	DE,INFO_WIN0
+	LD	IX,16
+	LD	HL,0
+	LD	B,UNET_FN_GETINFO
+	CALL	LIBMAN.l_call
+	JP	C,FAILED
+	OR	A
+	JP	NZ,FAILED
+	LD	HL,INFO_WIN0
+	LD	DE,EXPECTED_BACKEND
+.check_win0
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,FAILED
+	INC	DE
+	INC	HL
+	OR	A
+	JR	NZ,.check_win0
+
+	; Allowing WIN0 must not open either window occupied by the DLL itself or
+	; WIN3, which is reserved for the ISA aperture while UNETESP is executing.
+	LD	A,6
+	LD	(TEST_STAGE),A
+	LD	DE,0x6000		; DLL is relocated into WIN1 in this vector
+	CALL	EXPECT_BAD_INFO_PTR
+	JP	NZ,FAILED
+
+	LD	A,7
+	LD	(TEST_STAGE),A
+	LD	DE,0xC100		; WIN3 / ISA aperture
+	CALL	EXPECT_BAD_INFO_PTR
+	JP	NZ,FAILED
 	JR	TEST_DONE
+
+; In: DE=destination expected to be rejected by GETINFO.
+; Out: Z when the DLL returned the required NERR_PARAM status.
+EXPECT_BAD_INFO_PTR
+	LD	A,UNET_IF_BACKEND
+	LD	IX,16
+	LD	HL,0
+	LD	B,UNET_FN_GETINFO
+	CALL	LIBMAN.l_call
+	CP	NERR_PARAM
+	RET
 
 FAILED
 	LD	A,(TEST_STAGE)
@@ -146,6 +197,7 @@ TEST_DONE
 	HALT
 
 EXPECTED_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND
+EXPECTED_BACKEND DB "ESP",0
 ENV_VALUE	DB "192.168.1.2",0
 
 	; Keep the flat test copy of libman above the largest legal WIN1 DLL image.

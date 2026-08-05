@@ -663,6 +663,10 @@ WAIT_SEND_OK
 	LD	DE,(MUX_LINE_PTR)
 	CALL	UTIL.STRCMP
 	JR	NC,.MARK_CONNECT
+	LD	HL,MSG_ALREADY_CONNECTED
+	LD	DE,(MUX_LINE_PTR)
+	CALL	UTIL.STRCMP
+	JR	NC,.MARK_ALREADY
 	LD	DE,MSG_BUSY_PFX
 	LD	HL,(MUX_LINE_PTR)
 	CALL	UTIL.STARTSWITH
@@ -690,18 +694,26 @@ WAIT_SEND_OK
 	LD	A,RES_BUSY
 	SCF
 	RET
+.MARK_ALREADY
+	; A retry after a silent CIPSTART can find that its first attempt really
+	; opened the requested link but the <id>,CONNECT notification was lost.
+	; Record the firmware's unambiguous reply; OPEN_RETRY decides whether this
+	; is a recovery retry (safe to accept) or a stale pre-existing link.
+	LD	HL,WSO_FLAGS
+	SET	4,(HL)
+	JP	.RESTART
 .MARK_CONNECT
+	; Only the requested link is evidence for this recovery/open. A foreign
+	; CONNECT must neither complete CIPSTART nor poison the recovery flag.
+	LD	A,(MUX_LINE_LINK)
+	LD	HL,LINK_ID
+	CP	(HL)
+	JP	NZ,.RESTART
 	LD	HL,WSO_FLAGS
 	SET	3,(HL)
 	LD	A,(MUX_ACCEPT_CONNECT)
 	AND	A
 	JP	Z,.RESTART
-	; A notification for the other mux link is evidence for recovery, but it
-	; must not complete the CIPSTART currently opening LINK_ID.
-	LD	A,(MUX_LINE_LINK)
-	LD	HL,LINK_ID
-	CP	(HL)
-	JP	NZ,.RESTART
 	; Stop the ESP at the UART boundary before returning through libman to the
 	; application. Otherwise an immediate peer greeting can overrun the 16-byte
 	; 16550 FIFO in the small CONNECT->first RECV scheduling gap. No FIFO bytes
@@ -2369,6 +2381,8 @@ MSG_READY
 	DB	"ready",0
 MSG_CONNECT_LN
 	DB	"CONNECT",0
+MSG_ALREADY_CONNECTED
+	DB	"ALREADY CONNECTED",0
 MSG_BUSY_PFX
 	DB	"busy",0
 	ENDIF
@@ -2463,7 +2477,8 @@ MUX_CONNECT_PAUSED DB 0		; internal RTS pause between CONNECT and first I/O
 MUX_WINDOW_OPEN DB 0		; command wait currently owns an open ISA window
 LINK_ID		DB 0		; link id used by the command builders
 WSO_TIMEOUT	DW TCP_DEFAULT_TIMEOUT	; per-byte timeout of WAIT_SEND_OK/WAIT_PROMPT
-WSO_FLAGS	DB 0		; bit0 SEND OK, bit1 ready, bit2 busy, bit3 CONNECT
+WSO_FLAGS	DB 0		; bit0 SEND OK, bit1 ready, bit2 busy, bit3 target CONNECT,
+				; bit4 ALREADY CONNECTED
 SEND_PHASE	DB 0		; 0 = before payload, 1 = payload handed to the ESP
 ; Async (suspendable) send state - see SEND_BUFFER_RESUME.
 ASYNC_MODE	DB 0		; 1: silence suspends the send instead of failing it

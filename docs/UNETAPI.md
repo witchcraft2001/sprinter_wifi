@@ -106,6 +106,10 @@ Register discipline for every UNET function:
   was loaded into** - the whole buffer, not just its first byte: both ends of
   the range (`buf .. buf+len-1`, or the string terminator) are validated.
   Violations return `NERR_PARAM`.
+- Pointers in **window 0 (`0x0000..0x3FFF`) are accepted**. The DLL does not
+  verify which page is mapped there. If a program replaces the DSS/system page
+  with its own page, preserving and restoring that mapping safely is entirely
+  the caller's responsibility.
 - Host strings are limited to **128 bytes** and port strings to **15 bytes**
   (longer arguments return `NERR_PARAM`); this protects the DLL's fixed-size
   AT command build buffers.
@@ -334,11 +338,15 @@ space for transport functionality.
 
 Silent connect timeouts trigger a bounded recovery ladder: the DLL probes with
 `AT` for up to ~10 s through the same +IPD-aware reader, reissues `CIPSTART`
-once when command mode is proven alive, and accepts a late `<id>,CONNECT` as
-success. For SEND the probe is safe only after the complete payload left the
-host; it can accept a late `SEND OK` or detect a reboot, but never reissues the
-payload. Before the `>` prompt even an `AT` probe could be consumed as payload
-if the prompt was merely late, so that path fails closed without probing.
+once when command mode is proven alive, and accepts either a late target-link
+`<id>,CONNECT` or `ALREADY CONNECTED` from that recovery retry as success. The
+latter means the first attempt opened the same numbered link but its event was
+lost; it is never accepted on an initial attempt, where it could describe a
+stale endpoint. For SEND the probe is safe only after the complete payload left
+the host; it can accept a late `SEND OK` or detect a reboot, but never reissues
+the payload. Before the `>` prompt even an `AT` probe could be consumed as
+payload if the prompt was merely late, so that path fails closed without
+probing.
 
 ### Function 17 - SETOPT
 

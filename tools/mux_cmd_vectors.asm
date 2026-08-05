@@ -247,6 +247,37 @@ TEST_START
 	LD	DE,EXP_LASTERR
 	CALL	CHECK_ASCIIZ
 
+; ------------------------------------------------------------------
+; Vector 10: a silent CONNECT must replace any partial/binary parser residue
+; with a bounded textual LASTERR diagnostic.
+; ------------------------------------------------------------------
+	LD	A,10
+	LD	(STAGE),A
+	LD	A,RES_RS_TIMEOUT
+	LD	(UNET.BUSY_LAST),A
+	LD	HL,BINARY_LASTERR
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,BINARY_LASTERR_LEN
+	LDIR
+	CALL	UNET.NOTE_CONNECT_FAILURE
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,EXP_CONNECT_TIMEOUT
+	CALL	CHECK_ASCIIZ
+
+; A real ESP error remains more useful than the timeout fallback.
+	LD	A,11
+	LD	(STAGE),A
+	LD	A,RES_ERROR
+	LD	(UNET.BUSY_LAST),A
+	LD	HL,LAST_ERROR
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,LAST_ERROR_LEN
+	LDIR
+	CALL	UNET.NOTE_CONNECT_FAILURE
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,LAST_ERROR
+	CALL	CHECK_ASCIIZ
+
 	JP	PASSED
 
 ; Patch the routine at HL with "XOR A / RET" (success, CF=0).
@@ -342,5 +373,10 @@ EXP_CLOSE1	DB "AT+CIPCLOSE=1",13,10,0
 LAST_LINE	DB "OK",0
 LAST_LINE_LEN	EQU $-LAST_LINE
 EXP_LASTERR	DB "send failed 4: OK",0
+BINARY_LASTERR	DB 0x91,0x02,0xFF,0
+BINARY_LASTERR_LEN EQU $-BINARY_LASTERR
+LAST_ERROR	DB "ERROR",0
+LAST_ERROR_LEN	EQU $-LAST_ERROR
+EXP_CONNECT_TIMEOUT DB "connect failed: no ESP response",0
 
 	END TEST_START
