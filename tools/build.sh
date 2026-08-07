@@ -76,15 +76,14 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
   if [ "${#mkdll_cmd[@]}" -eq 0 ]; then
     echo "Warning: sprinter-mkdll not found (install libman or set UNET_LIBMAN_SRC); skipping DLL build" >&2
   else
-    # The L1 numeric header carries only major.minor. Its 15-byte name field
-    # carries the full human-readable package tag, so consumers can identify
-    # the exact DLL revision without decoding the numeric header.
+    # The L1 numeric header carries only major.minor. The UNETESP DLL has its
+    # own revision, independent of the package version; its 15-byte name field
+    # carries the full human-readable DLL tag.
     package_version="$(tr -d '\r\n' < "$repo_root/VERSION" 2>/dev/null || true)"
     if ! [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "Error: VERSION must use major.minor.patch format, got: ${package_version:-<missing>}" >&2
       exit 1
     fi
-    dll_version="$(printf '%s' "$package_version" | cut -d. -f1,2)"
     for dll in "${BUILD_DLLS[@]}"; do
       src="$repo_root/src/dll/$dll.asm"
       upper="$(printf '%s' "$dll" | tr '[:lower:]' '[:upper:]')"
@@ -96,9 +95,17 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       fi
 
       case "$dll" in
-        unetesp) dll_name="UNETESP v$package_version" ;;
-        unetrtl) dll_name="UNET RTL" ;;
-        *)       dll_name="$upper" ;;
+        unetesp)
+          unetesp_version="$(tr -d '\r\n' < "$repo_root/UNETESP_VERSION" 2>/dev/null || true)"
+          if ! [[ "$unetesp_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: UNETESP_VERSION must use major.minor.patch format, got: ${unetesp_version:-<missing>}" >&2
+            exit 1
+          fi
+          dll_name="UNETESP v$unetesp_version"
+          dll_version="$(printf '%s' "$unetesp_version" | cut -d. -f1,2)"
+          ;;
+        unetrtl) dll_name="UNET RTL"; dll_version="0.0" ;;
+        *)       dll_name="$upper"; dll_version="0.0" ;;
       esac
       if [ "${#dll_name}" -gt 15 ]; then
         echo "Error: L1 text tag '$dll_name' exceeds the 15-byte header field" >&2

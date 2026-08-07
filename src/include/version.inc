@@ -7,7 +7,7 @@
 	DEFINE	_VERSION_INC
 
 PACKAGE_VERSION_MAJOR	EQU 0
-PACKAGE_VERSION_MINOR	EQU 4
+PACKAGE_VERSION_MINOR	EQU 3
 PACKAGE_VERSION_PATCH	EQU 0
 
 	; Emit "v.<major>.<minor>.<patch>" built from the constants above. Placed
