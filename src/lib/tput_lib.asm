@@ -100,6 +100,225 @@ START
 	LD	(SUF_OK),A
 	LD	(SHOWN),A
 	RET
+	IFDEF	TPUT_ALIGNED
+	IFDEF	TPUT_ALIGN_TEST_SHORT
+TPUT_ALIGN_TIMEOUT_MS EQU 4
+	ELSE
+TPUT_ALIGN_TIMEOUT_MS EQU 2500
+	ENDIF
+STORE_START
+	LD	(T_START),HL
+	LD	A,B
+	LD	(T_START+2),A
+	RET
+
+; ------------------------------------------------------
+; START_ALIGNED: wait for an exact DSS RTC second transition, then capture the
+; first value on the new second.  The edge-detecting NOW result is stored
+; directly; there is deliberately no extra clock read after the transition.
+; ------------------------------------------------------
+START_ALIGNED
+	CALL	NOW
+	LD	(T_STOP),HL		; temporary previous sample
+	LD	A,B
+	LD	(T_STOP+2),A
+	LD	HL,TPUT_ALIGN_TIMEOUT_MS
+	LD	(ALIGN_LEFT),HL
+.WAIT_EDGE
+	; Do not spin forever on a stopped/missing RTC. A 1 ms pause also keeps this
+	; diagnostic from monopolising the machine while waiting for the edge.
+	CALL	@UTIL.DELAY_1MS
+	CALL	NOW
+	LD	DE,(T_STOP)
+	LD	A,L
+	CP	E
+	JR	NZ,.EDGE
+	LD	A,H
+	CP	D
+	JR	NZ,.EDGE
+	LD	A,(T_STOP+2)
+	CP	B
+	JR	NZ,.EDGE
+	LD	HL,(ALIGN_LEFT)
+	DEC	HL
+	LD	(ALIGN_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	NZ,.WAIT_EDGE
+	SCF
+	RET
+.EDGE
+	CALL	STORE_START
+	OR	A
+	RET
+
+; Capture the stop time.  DLSPEED calls this at the exact Content-Length
+; boundary, before CIPCLOSE or any console output.
+STOP
+	CALL	NOW
+	LD	(T_STOP),HL
+	LD	A,B
+	LD	(T_STOP+2),A
+	RET
+
+; Calculate elapsed seconds from the saved start and stop snapshots.
+; Out: B:HL = elapsed (24-bit), also stored in T_ELAPSED.
+CALC_STOPPED
+	LD	HL,(T_STOP)
+	LD	A,(T_STOP+2)
+	LD	B,A
+	LD	DE,(T_START)
+	LD	A,L
+	SUB	E
+	LD	L,A
+	LD	A,H
+	SBC	A,D
+	LD	H,A
+	LD	A,(T_START+2)
+	LD	E,A
+	LD	A,B
+	SBC	A,E
+	LD	B,A
+	JR	NC,.NO_WRAP
+	; crossed midnight: add 86400 (0x015180)
+	LD	DE,0x5180
+	ADD	HL,DE
+	LD	A,B
+	ADC	A,1
+	LD	B,A
+.NO_WRAP
+	LD	(T_ELAPSED),HL
+	LD	A,B
+	LD	(T_ELAPSED+2),A
+	RET
+
+; Print the saved DLSPEED result.  Unlike REPORT this never reads the RTC.
+; In: DE:HL = received bytes. Out: CF=1 when the sample is zero seconds.
+REPORT_STOPPED
+	LD	(HBUF),HL
+	LD	(HBUF+2),DE
+	CALL	CALC_STOPPED
+	LD	A,B
+	OR	H
+	OR	L
+	JR	Z,.BAD_SAMPLE
+
+	PRINT	S_TIME
+	LD	HL,(T_ELAPSED)
+	LD	A,(T_ELAPSED+2)
+	LD	E,A
+	LD	D,0
+	CALL	PRINT_DEC_32
+	PRINT	S_SEC_NL
+
+	; bytes/sec = received byte count / elapsed seconds.
+	LD	HL,(HBUF)
+	LD	(SCRATCH),HL
+	LD	HL,(HBUF+2)
+	LD	(SCRATCH+2),HL
+	CALL	DIV32_BY_ELAPSED
+	LD	HL,(SCRATCH)
+	LD	(HBUF),HL
+	LD	HL,(SCRATCH+2)
+	LD	(HBUF+2),HL
+
+	PRINT	S_RATE
+	LD	HL,(HBUF)
+	LD	DE,(HBUF+2)
+	CALL	PRINT_DEC_32
+	PRINT	S_BPS_PAREN
+	; Integer KiB/s = B/s >> 10.
+	LD	HL,(HBUF)
+	LD	DE,(HBUF+2)
+	LD	L,H
+	LD	H,E
+	LD	E,D
+	LD	D,0
+	SRL	E
+	RR	H
+	RR	L
+	SRL	E
+	RR	H
+	RR	L
+	CALL	PRINT_DEC_32
+	PRINT	S_KIBPS_NL
+	OR	A
+	RET
+.BAD_SAMPLE
+	SCF
+	RET
+
+; In-place unsigned 32-bit / 24-bit division for the saved DLSPEED duration.
+; Dividend/quotient: SCRATCH (LE). Divisor: T_ELAPSED (non-zero, LE).
+DIV32_BY_ELAPSED
+	XOR	A
+	LD	(REM24),A
+	LD	(REM24+1),A
+	LD	(REM24+2),A
+	LD	B,32
+.DIV_LOOP
+	; Shift the dividend/quotient left and feed its old top bit into REM24.
+	LD	HL,SCRATCH
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	LD	HL,REM24
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+
+	; Compare remainder and divisor from the most significant byte.
+	LD	A,(T_ELAPSED+2)
+	LD	C,A
+	LD	A,(REM24+2)
+	CP	C
+	JR	C,.NO_SUB
+	JR	NZ,.SUBTRACT
+	LD	A,(T_ELAPSED+1)
+	LD	C,A
+	LD	A,(REM24+1)
+	CP	C
+	JR	C,.NO_SUB
+	JR	NZ,.SUBTRACT
+	LD	A,(T_ELAPSED)
+	LD	C,A
+	LD	A,(REM24)
+	CP	C
+	JR	C,.NO_SUB
+.SUBTRACT
+	LD	HL,REM24
+	LD	DE,T_ELAPSED
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SUB	C
+	LD	(HL),A
+	INC	HL
+	INC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	LD	(HL),A
+	INC	HL
+	INC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	LD	(HL),A
+	LD	HL,SCRATCH
+	SET	0,(HL)
+.NO_SUB
+	DJNZ	.DIV_LOOP
+	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; REPORT: print "  <bytes> bytes in <secs> sec[, <rate>]".
@@ -563,9 +782,21 @@ S_COMMA		DB ", ",0
 S_KBS		DB " KB/s",0
 S_BPS		DB " B/s",0
 S_NL		DB 13,10,0
+	IFDEF	TPUT_ALIGNED
+S_TIME		DB "Time: ",0
+S_SEC_NL	DB " sec",13,10,0
+S_RATE		DB "Rate: ",0
+S_BPS_PAREN	DB " B/s (",0
+S_KIBPS_NL	DB " KiB/s)",13,10,0
+	ENDIF
 
 ; Small in-image scratch/state (not large runtime buffers).
 T_START		DS 3,0
+	IFDEF	TPUT_ALIGNED
+T_STOP		DS 3,0
+REM24		DS 3,0
+ALIGN_LEFT	DS 2,0
+	ENDIF
 T_ELAPSED	DS 3,0
 HBUF		DS 4,0
 SCRATCH		DS 4,0

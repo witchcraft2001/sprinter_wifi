@@ -60,6 +60,15 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   prompting. `-d` replaces the in-place `<KB>KB / <KB>KB` counter with one dot
   per write, the output WGET had before the counter existed; use it to measure
   what the console repaint costs on a given link.
+- `DLSPEED.EXE http://host[:port]/path` is a developer-only throughput
+  diagnostic built with `make dlspeed` (it is not included in ZIP/floppy
+  distributions). It discards a non-empty, identity-encoded HTTP body with a
+  known `Content-Length`, aligns GET transmission to an RTC second edge, and
+  reports B/s and KiB/s without file or progress-output overhead. Use at least
+  512 KiB and pair it with `tools/dlspeed_server.py --port 8080 --count 524288`.
+  The port must also appear in the URL (`http://host:8080/test.bin`); omitting
+  it selects normal HTTP port 80. There is intentionally no timed-region
+  progress output, so 512 KiB takes about 46 seconds at 115200 baud.
 - `NTP.EXE` sets DSS time over UDP NTP using the `NET_TZ`/`NET_NTP` values
   published by `NETUP.EXE`.
 - `NETPROBE.EXE` checks low-level UART and ESP-AT firmware response. It is a
@@ -239,6 +248,11 @@ Current utility-specific notes:
 - `WGET.EXE` returns `0` after a successful body download, `1` for invalid
   command line or URL, `2` when hardware is not found, `3` for ESP/TCP/HTTP
   errors and `5` for local output file errors.
+- `DLSPEED.EXE` returns `0` only for an exact non-zero `Content-Length`, a
+  non-zero saved duration and a clean UART LSR; `1` means invalid command line
+  or URL, `2` means no card, `3` covers ESP/TCP/HTTP errors, timeout, a
+  same-second sample or UART integrity failure, and `4` means `NETUP` has not
+  established a compatible session.
 - `NTP.EXE` returns `0` after DSS time is set, `2` when hardware is not found
   and `3` on ESP SNTP, response parse or DSS SETTIME failure.
 - `TFTP.EXE` returns `0` after a successful download or upload, `1` for invalid

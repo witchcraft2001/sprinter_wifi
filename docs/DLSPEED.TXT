@@ -1,0 +1,61 @@
+DLSPEED - ESP download throughput diagnostic
+=============================================
+
+Usage:
+
+  DLSPEED.EXE http://host[:port]/path
+  DLSPEED.EXE /?
+
+DLSPEED measures the active TCP/+IPD/UART receive path without writing a file
+or displaying progress. It requires a plain HTTP/1.1 2xx response with a
+non-zero Content-Length. Redirects, HTTPS, chunked transfer coding and encoded
+bodies are rejected so the received byte count remains unambiguous.
+
+The client opens TCP first, waits for the next DSS RTC second edge, and sends
+GET immediately. It saves the stop time as soon as Content-Length bytes have
+been counted, before closing the socket or printing the result. RTC resolution
+is one second, so use at least 512 KiB; a transfer contained in one reported
+second is rejected as "sample too short".
+
+Build (developer-only; DLSPEED is not in the package manifest):
+
+  make dlspeed
+  ESP_AT_PROFILE=2.2.1 make dlspeed
+  ESP_AT_PROFILE=2.2.2 make dlspeed
+
+Start a deterministic LAN source on another computer:
+
+  tools/dlspeed_server.py --port 8080 --count 524288
+
+Port 8080 is not implied by HTTP. It must also be present in the URL. Without
+":8080" DLSPEED correctly tries TCP port 80, where this test server is not
+listening:
+
+  DLSPEED.EXE http://192.168.1.50:8080/test.bin
+
+For a quicker functional smoke test, start with 65536 bytes; use 512 KiB or
+more for repeatable measurements:
+
+  tools/dlspeed_server.py --port 8080 --count 65536
+
+DLSPEED deliberately prints no progress inside the measured region. A 512-KiB
+run can therefore appear idle for roughly 46 seconds at 115200 baud or 23
+seconds at 230400 baud. The new banner line says that the transfer is silent;
+Esc cancels stalled receive waits. If the RTC does not advance, the utility now
+reports an error after a bounded wait instead of spinning forever.
+
+Repeat the same URL several times at each configured NETUP baud. Approximate
+8N1 payload ceilings are 11.25 KiB/s at 115200 and 22.5 KiB/s at 230400; HTTP,
+ESP-AT framing and software overhead make actual results lower.
+
+ESP result #9 means "busy p/s". It often follows an earlier TCP attempt that is
+still settling. Wait briefly and retry; the utility sends a non-blocking close
+after failed/pending connects so a corrected invocation does not inherit them.
+
+Exit status:
+
+  0  exact length, non-zero duration, clean UART LSR
+  1  invalid command line or URL
+  2  Sprinter-WiFi card not found
+  3  ESP/TCP/HTTP error, timeout, short sample, or integrity failure
+  4  NETUP session is missing or incompatible

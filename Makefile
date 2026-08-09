@@ -1,4 +1,4 @@
-.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-race-server racetest clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-dlspeed test-race-server dlspeed racetest clean
 
 build:
 	tools/build.sh
@@ -9,7 +9,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-race-server
+test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-progress test-dlspeed test-race-server
 	tools/test-zmodem.sh
 
 test-libman:
@@ -33,8 +33,15 @@ test-mux-cmd:
 test-progress:
 	tools/test-progress.sh
 
+test-dlspeed:
+	tools/test-dlspeed.sh
+
 test-race-server:
 	python3 tools/test-race-server.py
+
+# Developer-only throughput diagnostic; NOT part of tools/artifacts.sh.
+dlspeed:
+	tools/build-dlspeed.sh
 
 # Developer-only SEND-race stress tool; NOT part of the distribution.
 # Pair with tools/race_server.py running on the target host.
