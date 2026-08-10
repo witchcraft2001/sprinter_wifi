@@ -1,0 +1,115 @@
+; Correctness vector and cycle benchmark for the real ESP payload hot path.
+; REG_LSR remains data-ready and REG_RBR returns the same byte, modelling a
+; full UART FIFO without making protocol parsing or a host socket part of the
+; measurement.
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "unetesp.asm"
+
+PAYLOAD_SIZE	EQU 4096
+PAYLOAD_DEST	EQU 0x8000
+TEST_RESULT	EQU 0xBFE2
+TEST_MARKER	EQU 0xBFE3
+
+DRIVER_BASE	EQU 0x4000
+	ASSERT $ <= DRIVER_BASE
+	DS DRIVER_BASE - $, 0
+	ORG DRIVER_BASE
+
+TEST_START
+	LD	SP,0x7FF0
+	XOR	A
+	LD	(TEST_RESULT),A
+	LD	(TEST_MARKER),A
+	CALL	INIT_PAYLOAD_RUN
+	CALL	TCP.READ_PAYLOAD
+	JP	C,FAILED
+	LD	HL,PAYLOAD_SIZE
+	OR	A
+	SBC	HL,BC
+	JP	NZ,FAILED
+	LD	HL,(TCP.PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JP	NZ,FAILED
+	LD	HL,(TCP.RECV_REMAIN)
+	LD	A,H
+	OR	L
+	JP	NZ,FAILED
+	LD	HL,(TCP.RECV_PTR)
+	LD	DE,PAYLOAD_DEST+PAYLOAD_SIZE
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,(TCP.RECV_STORED)
+	LD	DE,PAYLOAD_SIZE
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	A,(PAYLOAD_DEST)
+	CP	0xA5
+	JP	NZ,FAILED
+	LD	A,(PAYLOAD_DEST+PAYLOAD_SIZE-1)
+	CP	0xA5
+	JP	NZ,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	CP	LSR_DR | LSR_THRE | LSR_TEMT
+	JP	NZ,FAILED
+
+	; The common fast path avoids a per-byte accumulator write, but sticky UART
+	; errors must still survive even when data-ready is set in the same LSR read.
+	LD	HL,1
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	(TCP.RECV_REMAIN),HL
+	LD	HL,PAYLOAD_DEST
+	LD	(TCP.RECV_PTR),HL
+	LD	HL,0
+	LD	(TCP.RECV_STORED),HL
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	A,LSR_DR | LSR_OE | LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	CALL	TCP.READ_PAYLOAD
+	JP	C,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_OE
+	JP	Z,FAILED
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+TEST_DONE
+	HALT
+
+FAILED
+	LD	A,1
+	LD	(TEST_RESULT),A
+	JR	TEST_DONE
+
+; Standalone entry used for the cycle count. Initialization is deliberately
+; included so the threshold remains stable if setup bookkeeping changes.
+BENCH_START
+	LD	SP,0x7FF0
+	CALL	INIT_PAYLOAD_RUN
+	CALL	TCP.READ_PAYLOAD
+BENCH_DONE
+	HALT
+
+INIT_PAYLOAD_RUN
+	LD	HL,PAYLOAD_SIZE
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	(TCP.RECV_REMAIN),HL
+	LD	HL,PAYLOAD_DEST
+	LD	(TCP.RECV_PTR),HL
+	LD	HL,0
+	LD	(TCP.RECV_STORED),HL
+	LD	HL,1000
+	LD	(TCP.RECV_TIMEOUT),HL
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	A,LSR_DR | LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	LD	A,0xA5
+	LD	(REG_RBR),A
+	RET
+
+	END TEST_START

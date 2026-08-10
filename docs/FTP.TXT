@@ -24,8 +24,18 @@ Flags
             "<KB>KB / <KB>KB" counter. The counter is drawn through the
             DSS console while receive is paused, so -d is the way to
             measure how much console work costs on a given link.
+            Both progress modes keep that receive pause active until FTP is
+            ready to drain the next ESP +IPD block.
+            The final 8 KiB of a sized download is retained in memory and
+            written after receive completes, limiting disk pauses near close.
   When the local file exists, FTP asks [R]esume / [O]verwrite / [C]ancel;
   -y (or -f) forces overwrite and -r forces resume, with no prompt.
+
+  A clean data-link timeout in a sized download preserves the verified bytes,
+  closes the stale links, reconnects, and continues with REST. Before recovery
+  FTP prints RX timeout diagnostics (total/expected/held bytes, +IPD parser
+  phase, payload-left, last header byte, and UART LSR). UART integrity errors
+  are never auto-resumed because the saved file offset is then untrustworthy.
 
 Run NETUP first. FTP.EXE uses the active network connection and does not join
 Wi-Fi by itself.

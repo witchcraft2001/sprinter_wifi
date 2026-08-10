@@ -8,6 +8,9 @@ EXE_VERSION		EQU 1
 DEFAULT_TIMEOUT		EQU 2000
 RECV_TIMEOUT		EQU 7000
 MUX_RECOVERY_DELAY	EQU 250
+ABORT_SETTLE_DELAY	EQU 250
+ABORT_DRAIN_IDLE	EQU 60
+ABORT_DRAIN_MAX		EQU 32768
 RECV_BUFFER_SIZE	EQU 16384
 URL_SIZE		EQU 192
 HOST_SIZE		EQU 96
@@ -101,6 +104,7 @@ START
 	LD	HL,HEADER_BUFF
 	LD	DE,HEADER_SIZE
 	CALL	DHTTP.RESET
+	CALL	TCP.DIAG_RESET
 	PRINTLN	MSG_WAIT_EDGE
 	CALL	TPUT.START_ALIGNED
 	JP	C,RTC_ERROR
@@ -128,6 +132,7 @@ START
 	LD	DE,(DHTTP.BODY_BYTES+2)
 	CALL	TPUT.REPORT_STOPPED
 	JP	C,SAMPLE_TOO_SHORT
+	CALL	PRINT_DIAGNOSTICS
 	PRINTLN	MSG_INTEGRITY_OK
 	LD	B,0
 	JP	WCOMMON.EXIT
@@ -153,19 +158,23 @@ SHOW_HELP
 	JP	WCOMMON.EXIT
 
 SAMPLE_TOO_SHORT
+	CALL	PRINT_DIAGNOSTICS
 	PRINTLN	MSG_SAMPLE_SHORT
 	LD	B,3
 	JP	WCOMMON.EXIT
 
 RTC_ERROR
-	CALL	CLOSE_SOCKET
+	CALL	ABORT_SOCKET
+	CALL	PRINT_ABORT_STATUS
 	PRINTLN	MSG_RTC_STOPPED
 	LD	B,3
 	JP	WCOMMON.EXIT
 
 RECEIVE_ERROR
 	LD	(RECEIVE_RESULT),A
-	CALL	CLOSE_SOCKET
+	CALL	ABORT_SOCKET
+	CALL	PRINT_DIAGNOSTICS
+	CALL	PRINT_ABORT_STATUS
 	LD	A,(WCOMMON.CANCELLED)
 	OR	A
 	JR	Z,.NOT_CANCELLED
@@ -184,6 +193,7 @@ RECEIVE_ERROR
 	PRINTLN	MSG_UART_ERROR
 	JR	.ERROR_EXIT
 .INCOMPLETE
+	CALL	PRINT_INCOMPLETE_DIAGNOSTICS
 	PRINTLN	MSG_INCOMPLETE
 .ERROR_EXIT
 	LD	B,3
@@ -191,11 +201,12 @@ RECEIVE_ERROR
 
 NETWORK_ERROR
 	LD	(RECEIVE_RESULT),A
-	CALL	CLOSE_SOCKET
+	CALL	ABORT_SOCKET
 	PRINT	MSG_NETWORK_ERROR
 	CALL	PRINT_RECEIVE_RESULT
 	PRINT	WCOMMON.LINE_END
 	CALL	PRINT_NETWORK_HINT
+	CALL	PRINT_ABORT_STATUS
 	LD	B,3
 	JP	WCOMMON.EXIT
 
@@ -222,6 +233,41 @@ PRINT_RECEIVE_RESULT
 	LD	DE,NUM_BUFF
 	CALL	UTIL.UTOA
 	PRINT	NUM_BUFF
+	RET
+
+; A clean UART can still finish early because the peer closed the connection,
+; the stream stayed idle for the complete receive budget, or the ESP response
+; stopped being valid +IPD framing. Preserve that distinction: the generic
+; Content-Length message alone made real-hardware failures indistinguishable.
+PRINT_INCOMPLETE_DIAGNOSTICS
+	PRINT	MSG_RECEIVE_RESULT
+	CALL	PRINT_RECEIVE_RESULT
+	LD	A,(RECEIVE_RESULT)
+	CP	RES_RS_TIMEOUT
+	LD	HL,MSG_RECEIVE_TIMEOUT
+	JR	Z,.RESULT_READY
+	CP	RES_NOT_CONN
+	LD	HL,MSG_RECEIVE_CLOSED
+	JR	Z,.RESULT_READY
+	CP	RES_ERROR
+	LD	HL,MSG_RECEIVE_FRAMING
+	JR	Z,.RESULT_READY
+	LD	HL,MSG_RECEIVE_OTHER
+.RESULT_READY
+	CALL	PRINT_STRING_HL
+	PRINT	WCOMMON.LINE_END
+
+	; BODY_BYTES excludes the HTTP header and never advances beyond the declared
+	; length, so this is the exact application-visible truncation point.
+	PRINT	MSG_RECEIVED
+	LD	HL,(DHTTP.BODY_BYTES)
+	LD	DE,(DHTTP.BODY_BYTES+2)
+	CALL	TPUT.PRINT_DEC_32
+	PRINT	MSG_OF
+	LD	HL,(DHTTP.CONTENT_LENGTH)
+	LD	DE,(DHTTP.CONTENT_LENGTH+2)
+	CALL	TPUT.PRINT_DEC_32
+	PRINTLN	MSG_BYTES
 	RET
 
 PRINT_NETWORK_HINT
@@ -262,6 +308,87 @@ SEND_CLOSE_NO_WAIT
 	LD	HL,CMD_CIPCLOSE
 	JP	WIFI.UART_TX_STRING
 
+; Abort a live diagnostic transfer without leaving its +IPD tail for the next
+; utility. A plain no-wait CIPCLOSE is sufficient after successful completion,
+; but on an error PAYLOAD_LEFT may still describe binary bytes which are queued
+; in the ESP/UART. Let the close reach the ESP, drain that tail to an idle gap,
+; then clear the abandoned parser state. Do not run the normal line-oriented AT
+; synchronizer here: if close transmission itself failed, a continuous binary
+; tail could keep that reader alive indefinitely. This cold path is byte-capped,
+; time-bounded and never resets ESP.
+ABORT_SOCKET
+	LD	A,(TCP_IS_OPEN)
+	OR	A
+	RET	Z
+	XOR	A
+	LD	(TCP_IS_OPEN),A
+	LD	(ABORT_STATUS),A
+	CALL	WIFI.UART_RX_PAUSE
+	CALL	SEND_CLOSE_NO_WAIT
+	LD	A,1
+	JR	NC,.CLOSE_STATUS
+	XOR	A
+.CLOSE_STATUS
+	LD	(ABORT_CLOSE_OK),A
+	LD	HL,ABORT_SETTLE_DELAY
+	CALL	UTIL.DELAY
+	CALL	ABORT_DRAIN_RX
+	LD	A,1
+	JR	NC,.DRAIN_STATUS
+	INC	A
+.DRAIN_STATUS
+	LD	(ABORT_STATUS),A
+	LD	HL,0
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	A,(ABORT_CLOSE_OK)
+	OR	A
+	RET	NZ
+	LD	A,2
+	LD	(ABORT_STATUS),A
+	RET
+
+; Discard at most ABORT_DRAIN_MAX bytes while holding the ISA window open.
+; Explicit RTS pause/resume prevents a slow banked per-byte drain from creating
+; a second overrun. UART_EMPTY_RS is used only after the close settle interval,
+; when resetting the abandoned FIFO can no longer truncate CIPCLOSE itself.
+ABORT_DRAIN_RX
+	CALL	ISA.ISA_OPEN
+	CALL	WIFI.UART_SET_DATA_RX_MODE_OPEN
+	CALL	WIFI.UART_RX_RESUME_OPEN
+	LD	DE,ABORT_DRAIN_MAX
+.LOOP
+	LD	BC,ABORT_DRAIN_IDLE
+	CALL	WIFI.UART_WAIT_RS_INT
+	JR	C,.DONE
+	LD	A,(REG_RBR)
+	DEC	DE
+	LD	A,D
+	OR	E
+	JR	NZ,.LOOP
+	SCF				; safety cap reached before an idle gap
+	JR	.FINISH
+.DONE
+	OR	A			; idle gap: CF=0
+.FINISH
+	PUSH	AF
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	CALL	ISA.ISA_CLOSE
+	CALL	WIFI.UART_EMPTY_RS
+	CALL	WIFI.UART_RX_RESUME
+	POP	AF
+	RET
+
+PRINT_ABORT_STATUS
+	LD	A,(ABORT_STATUS)
+	OR	A
+	RET	Z
+	CP	1
+	LD	HL,MSG_ABORT_FAILED
+	JR	NZ,.READY
+	LD	HL,MSG_ABORT_OK
+.READY
+	JP	PRINT_STRING_HL
+
 ; ------------------------------------------------------
 ; Receive loop. No file I/O or progress output is performed. The only DSS call
 ; in the loop is the cancellation poll. DHTTP counts no more than the declared
@@ -276,7 +403,19 @@ RECEIVE_BODY
 	LD	BC,RECV_BUFFER_SIZE
 	LD	DE,RECV_TIMEOUT
 	CALL	TCP.RECEIVE
+	; ESP-AT 2.2.2 real hardware needs an explicit block boundary even with
+	; 16550 AFE enabled: leaving auto-RTS live indefinitely can wedge the ESP
+	; sender without producing a UART error. Preserve RECEIVE's result while
+	; lowering RTS before parser/cancel work; .LOOP raises it again. A forced
+	; 2.2.1 build compiles this guard out completely; the universal image checks
+	; the profile published by NETUP.
+	IFNDEF ESP_AT_FORCE_221
+	PUSH	AF,BC
+	CALL	PAUSE_RX_222
+	POP	BC,AF
+	ENDIF
 	JR	C,.TRANSPORT_ERROR
+	CALL	TCP.DIAG_RECORD_RECV_BLOCK
 	LD	(RECEIVE_RESULT),A
 	LD	A,(TCP.LSR_ACCUM)
 	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
@@ -305,6 +444,162 @@ RECEIVE_BODY
 	LD	A,RES_RS_TIMEOUT
 	LD	(RECEIVE_RESULT),A
 	SCF
+	RET
+
+	IFNDEF ESP_AT_FORCE_221
+PAUSE_RX_222
+	IFNDEF ESP_AT_FORCE_222
+	LD	A,(WCOMMON.UART_ESP_PROFILE)
+	CP	UART_RX_PROFILE_222
+	RET	NZ
+	ENDIF
+	JP	WIFI.UART_RX_PAUSE
+	ENDIF
+
+; ------------------------------------------------------
+; Print saved receive telemetry after STOP/cleanup. All counters are collected
+; without console I/O, and none is updated on the byte-ready hot path.
+; ------------------------------------------------------
+PRINT_DIAGNOSTICS
+	PRINTLN	MSG_DIAG_HEADER
+	PRINT	MSG_DIAG_UART
+	PRINT	NETCFG.CFG_BAUD
+	PRINT	MSG_DIAG_BAUD_FLOW
+	LD	A,(WIFI.UART_FLOW_MODE)
+	OR	A
+	LD	HL,MSG_DIAG_FLOW_0
+	JR	Z,.FLOW_READY
+	LD	HL,MSG_DIAG_FLOW_3
+.FLOW_READY
+	CALL	PRINT_STRING_HL
+	PRINT	MSG_DIAG_PROFILE
+	LD	A,(WCOMMON.UART_ESP_PROFILE)
+	CP	UART_RX_PROFILE_221
+	LD	HL,MSG_DIAG_PROFILE_222
+	JR	NZ,.PROFILE_READY
+	LD	HL,MSG_DIAG_PROFILE_221
+.PROFILE_READY
+	CALL	PRINT_STRING_HL
+	PRINT	MSG_DIAG_TRIGGER
+	IFDEF ESP_AT_FORCE_222
+	PRINTLN	MSG_DIAG_TRIGGER_4
+	ELSE
+	PRINTLN	MSG_DIAG_TRIGGER_8
+	ENDIF
+
+	PRINT	MSG_DIAG_RECEIVE
+	LD	HL,TCP.DIAG_RECEIVE_CALLS
+	CALL	PRINT_U32_PTR
+	PRINT	MSG_DIAG_CALLS_MIN
+	LD	HL,TCP.DIAG_RECV_MIN
+	CALL	PRINT_U16_PTR
+	PRINT	MSG_DIAG_MAX
+	LD	HL,TCP.DIAG_RECV_MAX
+	CALL	PRINT_U16_PTR
+	PRINT	WCOMMON.LINE_END
+
+	PRINT	MSG_DIAG_IPD
+	LD	HL,TCP.DIAG_IPD_FRAMES
+	CALL	PRINT_U32_PTR
+	PRINT	MSG_DIAG_FRAMES_BYTES
+	LD	HL,TCP.DIAG_IPD_BYTES
+	CALL	PRINT_U32_PTR
+	PRINT	MSG_DIAG_MIN
+	LD	HL,TCP.DIAG_IPD_MIN
+	CALL	PRINT_U16_PTR
+	PRINT	MSG_DIAG_MAX
+	LD	HL,TCP.DIAG_IPD_MAX
+	CALL	PRINT_U16_PTR
+	PRINT	MSG_DIAG_AVG
+	CALL	PRINT_IPD_AVERAGE
+	PRINT	WCOMMON.LINE_END
+
+	PRINT	MSG_DIAG_WAITS
+	LD	HL,TCP.DIAG_WAIT_TICKS
+	CALL	PRINT_U32_PTR
+	PRINT	MSG_DIAG_WAITS_CONT
+	LD	HL,TCP.DIAG_CONT_WAIT_TICKS
+	CALL	PRINT_U32_PTR
+	PRINTLN	MSG_DIAG_MS
+	PRINT	MSG_DIAG_MAX_IDLE
+	LD	HL,TCP.DIAG_WAIT_MAX
+	CALL	PRINT_U16_PTR
+	PRINTLN	MSG_DIAG_MS
+
+	PRINT	MSG_DIAG_CONT
+	LD	HL,TCP.DIAG_CONT_PROBES
+	CALL	PRINT_U32_PTR
+	PRINT	MSG_DIAG_PROBES_MISSES
+	LD	HL,TCP.DIAG_CONT_MISSES
+	CALL	PRINT_U32_PTR
+	PRINT	WCOMMON.LINE_END
+
+	PRINT	MSG_DIAG_LSR
+	LD	A,(TCP.LSR_ACCUM)
+	LD	L,A
+	LD	H,0
+	LD	DE,0
+	CALL	TPUT.PRINT_DEC_32
+	PRINT	MSG_DIAG_LSR_ERRORS
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+	LD	L,A
+	LD	H,0
+	LD	DE,0
+	CALL	TPUT.PRINT_DEC_32
+	PRINT	WCOMMON.LINE_END
+	RET
+
+; Print unsigned little-endian values addressed by HL.
+PRINT_U32_PTR
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
+	INC	HL
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	LD	H,B
+	LD	L,C
+	JP	TPUT.PRINT_DEC_32
+
+PRINT_U16_PTR
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
+	LD	H,B
+	LD	L,C
+	LD	DE,0
+	JP	TPUT.PRINT_DEC_32
+
+PRINT_STRING_HL
+	LD	C,DSS_PCHARS
+	RST	DSS
+	RET
+
+PRINT_IPD_AVERAGE
+	LD	HL,(TCP.DIAG_IPD_FRAMES+2)
+	LD	A,H
+	OR	L
+	JR	NZ,.TOO_MANY
+	LD	DE,(TCP.DIAG_IPD_FRAMES)
+	LD	A,D
+	OR	E
+	JR	Z,.ZERO
+	LD	HL,(TCP.DIAG_IPD_BYTES)
+	LD	(TPUT.SCRATCH),HL
+	LD	HL,(TCP.DIAG_IPD_BYTES+2)
+	LD	(TPUT.SCRATCH+2),HL
+	CALL	TPUT.DIV32_BY_DE
+	LD	HL,(TPUT.SCRATCH)
+	LD	DE,(TPUT.SCRATCH+2)
+	JP	TPUT.PRINT_DEC_32
+.ZERO
+	LD	HL,0
+	LD	DE,0
+	JP	TPUT.PRINT_DEC_32
+.TOO_MANY
+	PRINT	MSG_DIAG_NA
 	RET
 
 ; ------------------------------------------------------
@@ -652,6 +947,33 @@ MSG_WAIT_EDGE	DB "Waiting for RTC second edge; transfer is silent until done..."
 MSG_RECEIVED	DB "Received: ",0
 MSG_BYTES	DB " bytes",0
 MSG_INTEGRITY_OK DB "Integrity: OK",0
+MSG_DIAG_HEADER DB "Diagnostics:",0
+MSG_DIAG_UART	DB "UART: ",0
+MSG_DIAG_BAUD_FLOW DB " baud, flow ",0
+MSG_DIAG_FLOW_0 DB "0",0
+MSG_DIAG_FLOW_3 DB "3",0
+MSG_DIAG_PROFILE DB ", ESP-AT ",0
+MSG_DIAG_PROFILE_221 DB "2.2.1",0
+MSG_DIAG_PROFILE_222 DB "2.2.2",0
+MSG_DIAG_TRIGGER DB ", FIFO trigger ",0
+MSG_DIAG_TRIGGER_4 DB "4",0
+MSG_DIAG_TRIGGER_8 DB "8",0
+MSG_DIAG_RECEIVE DB "RECEIVE: ",0
+MSG_DIAG_CALLS_MIN DB " calls, block min ",0
+MSG_DIAG_MAX DB ", max ",0
+MSG_DIAG_IPD DB "IPD: ",0
+MSG_DIAG_FRAMES_BYTES DB " frames, ",0
+MSG_DIAG_MIN DB " bytes, min ",0
+MSG_DIAG_AVG DB ", avg ",0
+MSG_DIAG_WAITS DB "RX 1-ms waits: ",0
+MSG_DIAG_WAITS_CONT DB ", continuation ",0
+MSG_DIAG_MAX_IDLE DB "Max RX idle: ",0
+MSG_DIAG_MS DB " ms",0
+MSG_DIAG_CONT DB "Continuation: ",0
+MSG_DIAG_PROBES_MISSES DB " probes, misses ",0
+MSG_DIAG_LSR DB "UART LSR mask: ",0
+MSG_DIAG_LSR_ERRORS DB ", errors: ",0
+MSG_DIAG_NA DB "n/a",0
 MSG_SAMPLE_SHORT DB "Sample too short (less than one RTC second).",0
 MSG_RTC_STOPPED DB "RTC second did not advance; measurement cancelled.",0
 MSG_WIFI_NOT_FOUND DB "Sprinter-WiFi not found!",0
@@ -662,6 +984,14 @@ MSG_RESULT_CLOSE DB ").",0
 MSG_BUSY_HINT DB "ESP is busy. Wait for the previous connection attempt to finish and retry.",0
 MSG_TIMEOUT_HINT DB "ESP did not answer before timeout; Esc can cancel long waits.",0
 MSG_CONNECT_HINT DB "Check the server address, port and host firewall.",0
+MSG_ABORT_OK	DB "ESP receive stream drained after abort.",13,10,0
+MSG_ABORT_FAILED DB "ESP cleanup incomplete; run NETRESET, then NETUP.",13,10,0
+MSG_RECEIVE_RESULT DB "Receive result #",0
+MSG_RECEIVE_TIMEOUT DB ": stream idle timeout.",0
+MSG_RECEIVE_CLOSED DB ": peer closed the TCP connection.",0
+MSG_RECEIVE_FRAMING DB ": invalid ESP +IPD framing.",0
+MSG_RECEIVE_OTHER DB ".",0
+MSG_OF		DB " of ",0
 MSG_INCOMPLETE	DB "HTTP response ended before Content-Length.",0
 MSG_UART_ERROR	DB "Integrity failed: UART LSR error detected.",0
 MSG_CANCELLED	DB "Measurement cancelled.",0
@@ -692,6 +1022,8 @@ HELP_REQUESTED	DB 0
 ARG_LEN		DB 0
 TCP_IS_OPEN	DB 0
 RECEIVE_RESULT	DB 0
+ABORT_STATUS	DB 0
+ABORT_CLOSE_OK	DB 0
 
 	ENDMODULE
 
@@ -699,10 +1031,14 @@ RECEIVE_RESULT	DB 0
 	INCLUDE "netcfg_lib.asm"
 	INCLUDE "wcommon.asm"
 	INCLUDE "isa.asm"
+	DEFINE	ESP_TCP_DIAGNOSTICS
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "dlspeed_http.asm"
 	DEFINE	TPUT_ALIGNED
 	INCLUDE "tput_lib.asm"
+	; Universal/2.2.1 builds retain the hardware-proven trigger-8 path. The
+	; trigger-4 experiment caused immediate multi-bit LSR corruption on the
+	; modified real board; keep it isolated to an explicitly forced 2.2.2 image.
 	IFNDEF	ESP_AT_FORCE_222
 	DEFINE	WIFI_STABLE_ACTIVE_RX
 	ENDIF

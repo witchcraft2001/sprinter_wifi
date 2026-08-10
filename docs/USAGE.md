@@ -68,7 +68,14 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   512 KiB and pair it with `tools/dlspeed_server.py --port 8080 --count 524288`.
   The port must also appear in the URL (`http://host:8080/test.bin`); omitting
   it selects normal HTTP port 80. There is intentionally no timed-region
-  progress output, so 512 KiB takes about 46 seconds at 115200 baud.
+  progress output, so 512 KiB takes about 46 seconds at 115200 baud. After the
+  saved time/rate result it prints receive telemetry: the active UART/profile
+  settings, successful `TCP.RECEIVE` block sizes, `+IPD` frame count and size
+  range, receive-loop 1-ms waits, continuation probes/misses, and the UART LSR
+  error mask. Large `RX 1-ms waits`/continuation counts indicate gaps between
+  ESP `+IPD` bursts; consistently small RECEIVE blocks indicate that those
+  gaps are forcing early returns. Low wait counts with throughput below the
+  UART ceiling instead point toward host-side byte-drain/ISA-memory cost.
 - `NTP.EXE` sets DSS time over UDP NTP using the `NET_TZ`/`NET_NTP` values
   published by `NETUP.EXE`.
 - `NETPROBE.EXE` checks low-level UART and ESP-AT firmware response. It is a

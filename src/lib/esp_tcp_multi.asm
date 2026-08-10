@@ -23,6 +23,9 @@ OPEN_LINK
 	LD	(PAYLOAD_LEFT),HL
 	XOR	A
 	LD	(LSR_ACCUM),A
+	IFNDEF	ESP_AT_FORCE_221
+	LD	(MULTI_PENDING_RESULT),A
+	ENDIF
 
 	LD	HL,CMD_BUFFER
 	LD	DE,CMD_CIPSTART_LINK_PREFIX
@@ -145,6 +148,9 @@ START_SEND_BUFFER_LINK
 ;   dispatches by LAST_IPD_LINK.
 ; ------------------------------------------------------
 RECEIVE_ANY_LINK
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	CALL	MULTI_DIAG_RESET
+	ENDIF
 	; Reassert the profile-specific streaming trigger without flushing bytes
 	; that may already have followed the command response.
 	CALL	WIFI.UART_SET_DATA_RX_MODE
@@ -167,17 +173,191 @@ RECEIVE_ANY_LINK
 	LD	A,H
 	OR	L
 	JR	NZ,.CONTINUE_PAYLOAD
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,1
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
 	CALL	WAIT_IPD_HEADER_MULTI
 	JR	C,.DONE
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,2
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
 	CALL	READ_IPD_LINK_LEN
 	JR	C,.DONE
 .CONTINUE_PAYLOAD
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,3
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
 	CALL	READ_PAYLOAD
 .DONE
 	CALL	ISA.ISA_CLOSE
 	RET
 	; (No ENDIF here: the active body is shared by the 2.2.1 and universal
 	; branches after the optional passive jump above.)
+
+	IFNDEF	ESP_AT_FORCE_221
+; ------------------------------------------------------
+; Receive a burst of consecutive +IPD payloads without closing the ISA window.
+; In/out contract is identical to RECEIVE_ANY_LINK.
+;
+; This is deliberately absent from forced ESP-AT 2.2.1 builds: their proven
+; one-frame receive path remains unchanged. Universal callers select this entry
+	; only when NET_ESP_FW says 2.2.2. The active path lowers RTS while ISA is
+	; still mapped; the caller retains its idempotent pause guard before any
+	; DSS/file/console work.
+;
+; Only frames from the first observed link are coalesced. If a frame for the
+; other FTP link is encountered, its header is retained in PAYLOAD_LEFT and its
+; body is delivered by the next receive call. A CLOSED result seen after stored
+; data is similarly deferred so byte delivery remains ordered before close.
+; ------------------------------------------------------
+RECEIVE_ANY_LINK_BURST
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	CALL	MULTI_DIAG_RESET
+	ENDIF
+	IFDEF	ESP_AT_FORCE_222
+	LD	A,(PASSIVE_RECEIVE_ENABLED)
+	AND	A
+	JR	Z,.ACTIVE_RECEIVE
+	; Passive mode issues AT+CIPRECVDATA outside a held ISA window and retains
+	; the established caller-resume contract.
+	CALL	WIFI.UART_RX_RESUME
+	JP	RECEIVE_ANY_LINK_PASSIVE
+.ACTIVE_RECEIVE
+	ENDIF
+	LD	(RECV_PTR),HL
+	LD	(RECV_REMAIN),BC
+	LD	(RECV_TIMEOUT),DE
+	LD	(RECV_FULL_TIMEOUT),DE
+	LD	HL,0
+	LD	(RECV_STORED),HL
+
+	; A close/protocol result detected only after a prior burst had already
+	; produced bytes is reported on the following call, never before those bytes.
+	LD	A,(MULTI_PENDING_RESULT)
+	AND	A
+	JR	Z,.NO_PENDING_RESULT
+	LD	E,A
+	XOR	A
+	LD	(MULTI_PENDING_RESULT),A
+	CALL	WIFI.UART_RX_PAUSE
+	LD	A,E
+	LD	BC,0
+	SCF
+	RET
+.NO_PENDING_RESULT
+
+	; Eliminate the resume-to-drain race: map ISA and select the non-flushing
+	; streaming trigger first, then raise RTS in-place and read immediately.
+	CALL	ISA.ISA_OPEN
+	CALL	WIFI.UART_SET_DATA_RX_MODE_OPEN
+	CALL	WIFI.UART_RX_RESUME_OPEN
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.CONTINUE_PENDING_PAYLOAD
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,1
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
+	CALL	WAIT_IPD_HEADER_MULTI
+	JR	C,.DONE
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,2
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
+	CALL	READ_IPD_LINK_LEN
+	JR	C,.DONE
+	LD	A,(LAST_IPD_LINK)
+	LD	(MULTI_BURST_LINK),A
+	JR	.READ_CURRENT_PAYLOAD
+
+.CONTINUE_PENDING_PAYLOAD
+	; A different-link header may have been parsed by the preceding burst while
+	; its payload was intentionally left unread. Restore its owner before return.
+	LD	A,(PAYLOAD_LINK)
+	LD	(LAST_IPD_LINK),A
+	LD	(MULTI_BURST_LINK),A
+
+.READ_CURRENT_PAYLOAD
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,3
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
+	CALL	READ_PAYLOAD
+	JR	C,.DONE
+	LD	HL,(PAYLOAD_LEFT)
+	LD	A,H
+	OR	L
+	JR	NZ,.DONE
+	; Leave enough buffer for the next maximum active +IPD. If less remains,
+	; return under the existing outer RTS guard rather than consume/discard data.
+	CALL	CAN_READ_ANOTHER_ACTIVE_IPD
+	JR	C,.RETURN_STORED_OK
+
+	; Probe only briefly for a back-to-back frame. Unlike the former FTP-side
+	; loop, this keeps ISA mapped and drains every arriving byte while RTS is high.
+	LD	HL,TCP_CONT_TIMEOUT
+	LD	(RECV_TIMEOUT),HL
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,1
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
+	CALL	WAIT_IPD_HEADER_MULTI
+	PUSH	AF
+	LD	HL,(RECV_FULL_TIMEOUT)
+	LD	(RECV_TIMEOUT),HL
+	POP	AF
+	JR	C,.CONTINUATION_ERROR
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	A,2
+	LD	(MULTI_DIAG_PHASE),A
+	ENDIF
+	CALL	READ_IPD_LINK_LEN
+	JR	C,.CONTINUATION_ERROR
+	LD	A,(LAST_IPD_LINK)
+	LD	E,A
+	LD	A,(MULTI_BURST_LINK)
+	CP	E
+	JR	Z,.READ_CURRENT_PAYLOAD
+	; The other link's header is complete and PAYLOAD_LEFT owns its body. Report
+	; the accumulated link now; CONTINUE_PENDING_PAYLOAD restores the other link.
+	LD	(LAST_IPD_LINK),A
+	JR	.RETURN_STORED_OK
+
+.CONTINUATION_ERROR
+	; If this burst has not produced bytes, preserve the original error. Once it
+	; has produced bytes, deliver them first. Timeout merely ends this burst;
+	; CLOSED/protocol errors are latched for the next call.
+	PUSH	AF
+	LD	HL,(RECV_STORED)
+	LD	A,H
+	OR	L
+	JR	Z,.NO_STORED_ERROR
+	POP	AF
+	CP	RES_RS_TIMEOUT
+	JR	Z,.RETURN_STORED_OK
+	LD	(MULTI_PENDING_RESULT),A
+	JR	.RETURN_STORED_OK
+.NO_STORED_ERROR
+	POP	AF
+	JR	.DONE
+
+.RETURN_STORED_OK
+	LD	BC,(RECV_STORED)
+	XOR	A
+.DONE
+	; Close the only overrun window left by the FTP-side accumulator: throttle
+	; ESP while MCR and UART registers are still mapped, then unmap ISA. The
+	; outer FTP guard repeats the pause harmlessly before slow work.
+	PUSH	AF
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	POP	AF
+	CALL	ISA.ISA_CLOSE
+	RET
+	ENDIF
 
 	; ------------------------------------------------------
 	; ESP-AT 2.2.2 passive receive backend.
@@ -555,6 +735,14 @@ WAIT_IPD_HEADER_MULTI
 .NEXT
 	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
 	JR	C,.TIMEOUT
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	(MULTI_DIAG_LAST_BYTE),A
+	PUSH	HL
+	LD	HL,(MULTI_DIAG_SCAN_BYTES)
+	INC	HL
+	LD	(MULTI_DIAG_SCAN_BYTES),HL
+	POP	HL
+	ENDIF
 	LD	E,A
 	LD	A,(IX+0)
 	CP	E
@@ -651,6 +839,14 @@ READ_DEC_FIELD
 .NEXT
 	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
 	JR	C,.TIMEOUT
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+	LD	(MULTI_DIAG_LAST_BYTE),A
+	PUSH	HL
+	LD	HL,(MULTI_DIAG_SCAN_BYTES)
+	INC	HL
+	LD	(MULTI_DIAG_SCAN_BYTES),HL
+	POP	HL
+	ENDIF
 	CP	','
 	JR	Z,.DELIM
 	CP	':'
@@ -761,6 +957,28 @@ LAST_IPD_LINK	DB 0
 PAYLOAD_LINK	DB 0
 IPD_DELIM	DB 0
 PASSIVE_RECEIVE_ENABLED DB 0
+	IFNDEF	ESP_AT_FORCE_221
+; State used only by RECEIVE_ANY_LINK_BURST. A parsed different-link payload or
+; terminal result survives one return so the public receive ordering is exact.
+MULTI_BURST_LINK DB 0xFF
+MULTI_PENDING_RESULT DB 0
+	ENDIF
+
+	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
+; FTP-only post-mortem state. No payload-byte instrumentation is used: the
+; counters cover only the short +IPD header path and cannot throttle a transfer.
+MULTI_DIAG_PHASE	DB 0		; 1=prefix scan, 2=link/length, 3=payload
+MULTI_DIAG_SCAN_BYTES	DW 0
+MULTI_DIAG_LAST_BYTE	DB 0
+
+MULTI_DIAG_RESET
+	XOR	A
+	LD	(MULTI_DIAG_PHASE),A
+	LD	(MULTI_DIAG_SCAN_BYTES),A
+	LD	(MULTI_DIAG_SCAN_BYTES+1),A
+	LD	(MULTI_DIAG_LAST_BYTE),A
+	RET
+	ENDIF
 
 	ENDMODULE
 

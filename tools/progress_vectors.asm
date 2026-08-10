@@ -98,9 +98,20 @@ TEST_START
 	CALL	TPUT.PROGRESS
 	JP	C,FAILED
 
-	; Every paint must have re-armed RTS exactly once.
+	; 9. FTP download already owns an outer RX pause while writing/painting.
+	; The paused entry must repaint after START without nesting a resume that
+	; would release the next +IPD before FTP is ready to drain it.
+	CALL	TPUT.START
+	CALL	WIFI.UART_RX_PAUSE
+	LD	HL,DONE
+	LD	DE,TOTAL
+	CALL	TPUT.PROGRESS_PAUSED
+	JP	C,FAILED
+
+	; Seven normal paints own a pause/resume pair. The eighth pause is the
+	; caller-owned FTP guard; PROGRESS_PAUSED must not add a pause or a resume.
 	LD	A,(WIFI.PAUSE_COUNT)
-	CP	7
+	CP	8
 	JP	NZ,FAILED
 	LD	A,(WIFI.RESUME_COUNT)
 	CP	7
@@ -200,6 +211,7 @@ EXPECTED
 	DB 13,"1KB / 1024KB"
 	DB 13,"1024KB / 1024KB"
 	DB 13,"4194303KB / 1024KB"
+	DB 13,"1000000KB / 1024KB"
 	DB 13,"1000000KB / 1024KB"
 	DB 13,"1000000KB / 1024KB"
 EXPECTED_LEN	EQU $ - EXPECTED

@@ -32,11 +32,9 @@ PASS_SIZE		EQU 64
 PATH_SIZE		EQU 128
 ARG_SIZE		EQU 128
 CMD_SIZE		EQU 128
-; Retain-tail margin for file downloads: once the server-announced size is
-; within this many bytes of completion we stop pausing for DSS_WRITE and
-; accumulate the final bytes in RECV_BUFFER, flushing only after the data link
-; closes. This keeps RTS asserted across the close so ESP-AT never discards
-; queued-but-unsent +IPD data on the data-connection FIN. Must be < RECV_SIZE.
+; Retain the final 8 KiB of a sized download in RECV_BUFFER and flush it once
+; receive completes. This bounds disk-write pauses near the end without moving
+; an entire small transfer into one large deferred DSS_WRITE.
 FTP_HOLD_TAIL_MARGIN	EQU 8192
 ; FTP control replies used here (220/227/150/226/...) are short. Keeping this
 ; at 78 preserves the mandatory WIN1 stack margin while the common library
@@ -304,9 +302,11 @@ START
 		CALL	CHECK_LIST_PRELIM_REPLY
 		JP	C,FTP_ERROR_EXIT
 		CALL	PARSE_EXPECTED_SIZE
+		; RECV_CONTROL_REPLY keeps RX paused after the preliminary 1xx reply.
+		; Print the heading under that guard and let RECV_DATA_TRANSFER release
+		; the data burst only after its first receive buffer is prepared.
 		CALL	WIFI.UART_RX_PAUSE
 		PRINTLN	MSG_LISTING
-		CALL	WIFI.UART_RX_RESUME
 		CALL	RECV_DATA_TRANSFER
 		JP	C,NET_ERROR_EXIT
 		LD	A,(FINAL_REPLY_SEEN)
@@ -1308,7 +1308,6 @@ RECV_CONTROL_REPLY_TIMEOUT
 		LD	(CONTROL_TIMEOUT),DE
 		CALL	RESET_REPLY_STATE
 .READ
-		CALL	WIFI.UART_RX_RESUME
 		; Clear sticky LSR error bits before each RECEIVE so OE detection
 		; below reflects only this iteration's UART status.
 		XOR	A
@@ -1316,6 +1315,9 @@ RECV_CONTROL_REPLY_TIMEOUT
 		LD	HL,RECV_BUFFER
 		LD	BC,RECV_SIZE
 		LD	DE,(CONTROL_TIMEOUT)
+		; Keep RTS low while preparing the next read. Resume only after every
+		; register is ready, immediately before entering the UART drain path.
+		CALL	WIFI.UART_RX_RESUME
 		CALL	TCP.RECEIVE_ANY_LINK
 		PUSH	AF,BC
 		CALL	WIFI.UART_RX_PAUSE
@@ -1335,9 +1337,8 @@ RECV_CONTROL_REPLY_TIMEOUT
 		JR	Z,.CONTROL
 		CP	DATA_LINK
 		JR	NZ,.READ
-			; Data link bytes arrived before the control reply. Pause RX for
-			; the slow console/file output path — same rationale as in
-			; RECV_DATA_TRANSFER.
+			; Data link bytes arrived before the control reply. RX is paused for
+			; the slow console/file output path.
 			LD	A,1
 			LD	(DATA_BYTES_SEEN),A
 			; Size still unknown (150 not parsed): suppress the progress
@@ -1355,17 +1356,28 @@ RECV_CONTROL_REPLY_TIMEOUT
 			CALL	WIFI.UART_RX_RESUME
 			JP	FILE_ERROR_EXIT
 .DATA_HANDLED
-			CALL	WIFI.UART_RX_RESUME
 			JR	.READ
 .CONTROL
 		; FEED_CONTROL_BYTES calls FINISH_LINE → PRINTLN on every CR/LF.
 		; RX is already paused immediately after RECEIVE_ANY_LINK.
 		LD	HL,RECV_BUFFER
 		CALL	FEED_CONTROL_BYTES_MAYBE_DEFERRED
-		CALL	WIFI.UART_RX_RESUME
 		LD	A,(REPLY_DONE)
 		AND	A
 		JR	Z,.READ
+		; A completed 1xx reply starts RETR/STOR/LIST data transfer. Keep RTS
+		; low across the caller's reply checks and buffer setup; otherwise the
+		; first 2920-byte +IPD can fill the 16-byte FIFO before the data loop.
+		LD	A,(DATA_OPEN)
+		AND	A
+		JR	Z,.RESUME_RETURN
+		LD	A,(REPLY_FIRST)
+		CP	'1'
+		JR	Z,.RETURN_PAUSED
+		; Other replies return to command-mode callers, which may send again.
+.RESUME_RETURN
+		CALL	WIFI.UART_RX_RESUME
+.RETURN_PAUSED
 		XOR	A
 		RET
 
@@ -1377,8 +1389,9 @@ RECV_CONTROL_REPLY_TIMEOUT
 		RET
 
 .UART_ERROR
-		CALL	WIFI.UART_RX_RESUME
+		CALL	WIFI.UART_RX_PAUSE
 		CALL	PRINT_UART_OVERRUN
+		CALL	WIFI.UART_RX_RESUME
 		LD	A,RES_RS_TIMEOUT
 		SCF
 		RET
@@ -1823,6 +1836,7 @@ RECV_DATA_TRANSFER
 			LD	(HOLD_MODE),A
 			LD	(HOLD_LEN),A
 			LD	(HOLD_LEN+1),A
+			LD	(TIMEOUT_RECOVERY),A
 			INC	A
 			LD	(TRANSFER_ACTIVE),A
 		; Note: DATA_BYTES_SEEN may already be set by an earlier
@@ -1830,7 +1844,6 @@ RECV_DATA_TRANSFER
 		; waiting for the 150 reply. Don't clear it here.
 		CALL	RESET_REPLY_STATE
 .READ
-		CALL	WIFI.UART_RX_RESUME
 		; Clear sticky LSR error bits before each RECEIVE — see same
 		; rationale in RECV_CONTROL_REPLY_TIMEOUT.
 		XOR	A
@@ -1841,17 +1854,42 @@ RECV_DATA_TRANSFER
 		CALL	FTP_SETUP_RECV_DEST
 		LD	HL,(RECV_DEST)
 		LD	BC,(RECV_CAP)
-		; Once the control link has delivered the final "226 Transfer complete"
-		; the server is done; if the ESP then stops short of the announced size
-		; (its FIN-time +IPD drop) wait only a short grace instead of the full
-		; data timeout, so a truncated transfer no longer hangs ~20-30 s.
-		LD	DE,FTP_DATA_TIMEOUT
+		; A 226 on the control link may overtake queued data-link +IPD blocks.
+		; Keep the full data timeout while a known-size RETR is still incomplete;
+		; real ESP-AT 2.2.2 runs have shown multi-second RX gaps after 226. Use the
+		; short final grace only when no announced bytes remain (or size is unknown).
 		LD	A,(FINAL_REPLY_SEEN)
 		AND	A
-		JR	Z,.HAVE_TIMEOUT
+		JR	Z,.DATA_TIMEOUT
+		LD	A,(DATA_EXPECTED_SEEN)
+		AND	A
+		JR	Z,.FINAL_TIMEOUT
+		PUSH	HL,BC
+		CALL	DATA_TOTAL_BELOW_EXPECTED
+		POP	BC,HL
+		JR	C,.DATA_TIMEOUT
+.FINAL_TIMEOUT
 		LD	DE,FTP_FINAL_TIMEOUT
+		JR	.HAVE_TIMEOUT
+.DATA_TIMEOUT
+		LD	DE,FTP_DATA_TIMEOUT
 .HAVE_TIMEOUT
+		; Do not let ESP refill the 16-byte FIFO while the destination/capacity
+		; and timeout are still being calculated. The selected receive backend
+		; raises RTS only after its UART/ISA window is ready.
+		; Stream mode uses the multi-link receiver's in-window burst entry: it
+		; drains consecutive data +IPD frames under one ISA mapping, but still
+		; returns to this guard before DSS_WRITE/progress. Retain-tail mode keeps
+		; the conservative one-frame receive used by the proven FIN path.
+		LD	A,(HOLD_MODE)
+		AND	A
+		JR	NZ,.RECEIVE_ONE
+		CALL	RECEIVE_STREAM_ANY_LINK
+		JR	.RECEIVE_DONE
+.RECEIVE_ONE
+		CALL	WIFI.UART_RX_RESUME
 		CALL	TCP.RECEIVE_ANY_LINK
+.RECEIVE_DONE
 		PUSH	AF,BC
 		CALL	WIFI.UART_RX_PAUSE
 		POP	BC,AF
@@ -1861,7 +1899,7 @@ RECV_DATA_TRANSFER
 		; if anything has been received already; otherwise propagate.
 		LD	A,(TCP.LSR_ACCUM)
 		AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-		JR	NZ,.UART_ERROR
+		JP	NZ,.UART_ERROR
 		LD	A,B
 		OR	C
 		JR	Z,.READ
@@ -1908,30 +1946,51 @@ RECV_DATA_TRANSFER
 			CALL	WIFI.UART_RX_RESUME
 			JP	FILE_ERROR_EXIT
 .DATA_HANDLED
-			; In retain-tail mode there is no DSS_WRITE or progress rendering here.
-			; Keep RTS deasserted while we inspect the completed block and any
-			; deferred control reply. The next .READ resumes it immediately before
-			; the next UART drain; this removes the unprotected gap between tail
-			; blocks and the data-link FIN.
-			LD	A,(HOLD_MODE)
-			AND	A
-			JR	NZ,.TAIL_STILL_PAUSED
-			CALL	WIFI.UART_RX_RESUME
-.TAIL_STILL_PAUSED
+			; The outer receive pause remains active through pending-control work;
+			; the next prepared .READ resumes the UART immediately before draining.
 			CALL	PROCESS_PENDING_CONTROL
 			LD	A,(DATA_CLOSE_SEEN)
 		AND	A
 		JR	NZ,.CLOSED
 		JP	.READ
 .ERROR
+		; Retain-tail receives normally remain resumed; freeze the UART before
+		; diagnostics, cleanup, or the retained-buffer flush below.
 		PUSH	AF
-		CALL	WIFI.UART_RX_RESUME
+		CALL	WIFI.UART_RX_PAUSE
 		POP	AF
 		; Never turn a receive timeout or a parser error into a successful list.
 		; Doing so left the still-buffered UART tail to be consumed by QUIT and
 		; printed it as garbage. Only an explicit ESP link-close ends a transfer.
 		CP	RES_NOT_CONN
 		JR	Z,.CLOSED
+		CP	RES_RS_TIMEOUT
+		JR	NZ,.RETURN_ERROR
+		; A timeout can also be the visible result of a lost UART byte. Never
+		; REST-resume that case: DATA_TOTAL may already include corrupt data.
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+		JR	NZ,.UART_ERROR
+		CALL	PRINT_RX_TIMEOUT_DIAG
+		; A clean 20-second stall during a sized RETR is recoverable. Preserve and
+		; flush every verified byte, return as an incomplete transfer, then let
+		; the existing reconnect + REST path continue from DATA_TOTAL. LIST/NLST
+		; has no safe restart offset and therefore remains a fatal timeout.
+		LD	A,(LIST_FLAG)
+		AND	A
+		JR	NZ,.TIMEOUT_FATAL
+		LD	A,(DATA_EXPECTED_SEEN)
+		AND	A
+		JR	Z,.TIMEOUT_FATAL
+		LD	A,1
+		LD	(TIMEOUT_RECOVERY),A
+		JR	.CLOSED
+.TIMEOUT_FATAL
+		LD	A,RES_RS_TIMEOUT
+.RETURN_ERROR
+		PUSH	AF
+		CALL	WIFI.UART_RX_RESUME
+		POP	AF
 		SCF
 		RET
 .UART_ERROR
@@ -1939,23 +1998,34 @@ RECV_DATA_TRANSFER
 			; output can no longer be repaired by REST from DATA_TOTAL: that
 			; offset is after potentially corrupt bytes. Fail this run instead
 			; of treating it as a clean close / auto-resume opportunity.
-			CALL	WIFI.UART_RX_RESUME
+			CALL	WIFI.UART_RX_PAUSE
 			XOR	A
 			LD	(TRANSFER_ACTIVE),A
 			CALL	PRINT_UART_OVERRUN
+			CALL	WIFI.UART_RX_RESUME
 			LD	A,RES_RS_TIMEOUT
 			SCF
 			RET
 .CLOSED
-		CALL	WIFI.UART_RX_RESUME
+		CALL	WIFI.UART_RX_PAUSE
 		XOR	A
 		LD	(TRANSFER_ACTIVE),A
 		; Persist the retained tail now that the data link has closed and all
-		; +IPD bytes have been drained into RECV_BUFFER.
+		; +IPD bytes have been drained into RECV_BUFFER. Keep RX paused across
+		; this slow DSS write so a final control reply cannot overrun the FIFO.
 		CALL	FTP_FLUSH_HOLD
-		JP	C,FILE_ERROR_EXIT
-		XOR	A
+		JR	NC,.FLUSHED
+		CALL	WIFI.UART_RX_RESUME
+		JP	FILE_ERROR_EXIT
+.FLUSHED
+		; On an explicit CLOSED notification the data link is already gone. On a
+		; clean timeout leave DATA_OPEN set so the caller's REST recovery actively
+		; closes the possibly-stalled ESP socket before reconnecting.
+		LD	A,(TIMEOUT_RECOVERY)
+		AND	A
+		JR	NZ,.KEEP_DATA_OPEN
 		LD	(DATA_OPEN),A
+.KEEP_DATA_OPEN
 		; Reset TCP receive state. Without this a partially-read
 		; +IPD chunk leaves PAYLOAD_LEFT non-zero and LAST_IPD_LINK
 		; pointing at the data link, so the next RECEIVE_ANY_LINK
@@ -1968,6 +2038,8 @@ RECV_DATA_TRANSFER
 		LD	(TCP.LAST_IPD_LINK),A
 		CALL	PRINT_DEFERRED_CONTROL
 			PRINT WCOMMON.LINE_END
+			CALL	WIFI.UART_RX_RESUME
+			XOR	A			; CF=0: completed or safely resumable partial
 			RET
 
 SEND_DATA_TRANSFER
@@ -2033,8 +2105,8 @@ SEND_DATA_TRANSFER
 ; PROGRESS_TICK: per-write progress output for the data loops.
 ; Default: repaint the in-place "<KB>KB / <KB>KB" counter.
 ; Under -d: one dot and nothing else — the output FTP had before the counter
-; existed. The counter is drawn through the DSS console with RX paused, so -d
-; is what makes its cost measurable against the same transfer.
+; existed. The download path uses PROGRESS_TICK_RX_PAUSED below because its
+; outer receive loop already owns the RTS pause.
 ; Must return CF=0: callers propagate CF as success/fail.
 ; ------------------------------------------------------
 PROGRESS_TICK
@@ -2049,6 +2121,21 @@ PROGRESS_TICK
 		CALL	PUT_CHAR
 		OR	A			; CF=0 (success)
 		RET
+
+; Download-side progress is called with the outer receive loop already paused.
+; Preserve that ownership: the next +IPD is released only by the next .READ.
+PROGRESS_TICK_RX_PAUSED
+		LD	A,(DOTS_FLAG)
+		AND	A
+		JR	Z,.COUNTER
+		LD	A,'.'
+		CALL	PUT_CHAR
+		OR	A
+		RET
+.COUNTER
+		LD	HL,DATA_TOTAL
+		LD	DE,DATA_EXPECTED
+		JP	TPUT.PROGRESS_PAUSED
 
 HANDLE_DATA_BUFFER
 			LD	A,(LIST_FLAG)
@@ -2090,8 +2177,7 @@ ACCUMULATE_DATA_BURST
 			ADD	HL,DE
 			LD	(BURST_DEST),HL
 			LD	DE,FTP_BURST_TIMEOUT
-			CALL	WIFI.UART_RX_RESUME
-			CALL	TCP.RECEIVE_ANY_LINK
+			CALL	RECEIVE_STREAM_ANY_LINK
 			PUSH	AF,BC
 			CALL	WIFI.UART_RX_PAUSE
 			POP	BC,AF
@@ -2138,6 +2224,25 @@ ACCUMULATE_DATA_BURST
 			LD	A,RES_RS_TIMEOUT
 			SCF
 			RET
+
+; Stream receive selector. Forced builds compile only their matching backend;
+; universal FTP trusts NETUP's published NET_ESP_FW and never probes ESP again.
+; The ESP-AT 2.2.1 target stays on the proven one-frame path.
+RECEIVE_STREAM_ANY_LINK
+			IFDEF	ESP_AT_FORCE_221
+			CALL	WIFI.UART_RX_RESUME
+			JP	TCP.RECEIVE_ANY_LINK
+			ELSE
+			IFDEF	ESP_AT_FORCE_222
+			JP	TCP.RECEIVE_ANY_LINK_BURST
+			ELSE
+			LD	A,(WCOMMON.UART_ESP_PROFILE)
+			CP	UART_RX_PROFILE_222
+			JP	Z,TCP.RECEIVE_ANY_LINK_BURST
+			CALL	WIFI.UART_RX_RESUME
+			JP	TCP.RECEIVE_ANY_LINK
+			ENDIF
+			ENDIF
 
 PROCESS_PENDING_CONTROL
 			LD	A,(PENDING_CONTROL_SEEN)
@@ -2277,7 +2382,7 @@ WRITE_DATA_BUFFER
 		LD	A,(PROGRESS_SUPPRESS)
 		AND	A
 		JR	NZ,.NO_PROGRESS
-		CALL	PROGRESS_TICK
+		CALL	PROGRESS_TICK_RX_PAUSED
 .NO_PROGRESS
 		XOR	A
 		RET
@@ -2856,6 +2961,86 @@ PRINT_UART_OVERRUN
 		PRINTLN MSG_UART_FRAMING
 		RET
 
+; Snapshot the exact active-receive state while RTS is still low. This runs
+; only after a 20-second wait (before recovery or failure), never in the hot path.
+PRINT_RX_TIMEOUT_DIAG
+		PRINTLN	MSG_RX_DIAG_HEADER
+		PRINT	MSG_RX_DIAG_TOTAL
+		LD	HL,DATA_TOTAL
+		CALL	PRINT_U32_PTR_FTP
+		PRINT	MSG_RX_DIAG_EXPECTED
+		LD	HL,DATA_EXPECTED
+		CALL	PRINT_U32_PTR_FTP
+		PRINT	MSG_RX_DIAG_HELD
+		LD	HL,HOLD_LEN
+		CALL	PRINT_U16_PTR_FTP
+		PRINT	WCOMMON.LINE_END
+
+		PRINT	MSG_RX_DIAG_PHASE
+		LD	A,(TCP.MULTI_DIAG_PHASE)
+		CALL	PRINT_U8_FTP
+		PRINT	MSG_RX_DIAG_SCANNED
+		LD	HL,TCP.MULTI_DIAG_SCAN_BYTES
+		CALL	PRINT_U16_PTR_FTP
+		PRINT	MSG_RX_DIAG_PAYLOAD
+		LD	HL,TCP.PAYLOAD_LEFT
+		CALL	PRINT_U16_PTR_FTP
+		PRINT	MSG_RX_DIAG_STORED
+		LD	HL,TCP.RECV_STORED
+		CALL	PRINT_U16_PTR_FTP
+		PRINT	WCOMMON.LINE_END
+
+		PRINT	MSG_RX_DIAG_LINK
+		LD	A,(TCP.LAST_IPD_LINK)
+		CALL	PRINT_U8_FTP
+		PRINT	MSG_RX_DIAG_IPD_LEN
+		LD	HL,TCP.LAST_IPD_LEN
+		CALL	PRINT_U16_PTR_FTP
+		LD	A,(TCP.MULTI_DIAG_LAST_BYTE)
+		LD	C,A
+		LD	DE,MSG_RX_DIAG_LAST_HEX
+		CALL	UTIL.HEXB
+		PRINTLN	MSG_RX_DIAG_LAST
+		; Reuse the existing exact LSR line, but not its explanatory error text:
+		; a clean recovery requires the error-bit mask to be zero.
+		LD	A,(TCP.LSR_ACCUM)
+		LD	C,A
+		LD	DE,MSG_UART_LSR_ACC_HEX
+		CALL	UTIL.HEXB
+		LD	A,(TCP.LAST_LSR)
+		LD	C,A
+		LD	DE,MSG_UART_LSR_LAST_HEX
+		CALL	UTIL.HEXB
+		PRINTLN	MSG_UART_LSR
+		RET
+
+PRINT_U32_PTR_FTP
+		LD	C,(HL)
+		INC	HL
+		LD	B,(HL)
+		INC	HL
+		LD	E,(HL)
+		INC	HL
+		LD	D,(HL)
+		LD	H,B
+		LD	L,C
+		JP	TPUT.PRINT_DEC_32
+
+PRINT_U16_PTR_FTP
+		LD	C,(HL)
+		INC	HL
+		LD	B,(HL)
+		LD	H,B
+		LD	L,C
+		LD	DE,0
+		JP	TPUT.PRINT_DEC_32
+
+PRINT_U8_FTP
+		LD	L,A
+		LD	H,0
+		LD	DE,0
+		JP	TPUT.PRINT_DEC_32
+
 CLEAR_BSS
 		LD	HL,FTP_BSS_BASE
 		LD	DE,FTP_BSS_BASE+1
@@ -3019,6 +3204,30 @@ MSG_UART_LSR
 MSG_UART_LSR_ACC_HEX
 		DB "xx, last=0x"
 MSG_UART_LSR_LAST_HEX
+		DB "xx",0
+MSG_RX_DIAG_HEADER
+		DB "RX timeout diagnostics:",0
+MSG_RX_DIAG_TOTAL
+		DB "total ",0
+MSG_RX_DIAG_EXPECTED
+		DB "/",0
+MSG_RX_DIAG_HELD
+		DB ", held ",0
+MSG_RX_DIAG_PHASE
+		DB "phase ",0
+MSG_RX_DIAG_SCANNED
+		DB ", scanned ",0
+MSG_RX_DIAG_PAYLOAD
+		DB ", payload-left ",0
+MSG_RX_DIAG_STORED
+		DB ", stored ",0
+MSG_RX_DIAG_LINK
+		DB "link ",0
+MSG_RX_DIAG_IPD_LEN
+		DB ", IPD length ",0
+MSG_RX_DIAG_LAST
+		DB ", last header byte 0x"
+MSG_RX_DIAG_LAST_HEX
 		DB "xx",0
 MSG_FILE_ERROR
 			DB "File create/read/write/close error.",0
@@ -3187,6 +3396,10 @@ HOLD_MODE
 		DB 0
 HOLD_LEN
 		DW 0
+; Set only when a clean sized-download timeout is converted into an incomplete
+; transfer so the caller can close the stale link and REST-resume safely.
+TIMEOUT_RECOVERY
+		DB 0
 ; FTP REST-resume state and 32-bit decimal scratch for the REST offset.
 RESUME_MODE
 		DB 0
@@ -3269,13 +3482,16 @@ PASV_P2
 		INCLUDE "dss_error.asm"
 		INCLUDE "isa.asm"
 		INCLUDE "esp_tcp.asm"
+		DEFINE	ESP_TCP_MULTI_DIAGNOSTICS
 		INCLUDE "esp_tcp_multi.asm"
 		INCLUDE "tput_lib.asm"
 		; esplib.asm MUST be last: it ends with the RS_BUFF label that anchors
 		; the runtime receive buffer and all BSS. Any include after it would be
 		; overlaid by the ESP receive buffer.
-		; Universal/2.2.1 FTP uses the field-proven active trigger-8 transport.
-		; A forced 2.2.2 build retains its trigger-4/passive receive backend.
+		; Keep the universal/2.2.1 active path on the field-proven trigger 8.
+		; Real universal 2.2.2 hardware loses the initial FTP greeting with
+		; trigger 4 (LSR FE/BI, then timeout), before any data-loop guard runs.
+		; The explicitly forced 2.2.2 diagnostic build retains trigger 4.
 		IFNDEF	ESP_AT_FORCE_222
 		DEFINE	WIFI_STABLE_ACTIVE_RX
 		ENDIF

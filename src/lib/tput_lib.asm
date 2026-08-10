@@ -555,6 +555,17 @@ DIV32_BY_DE
 ; Trashes everything.
 ; ------------------------------------------------------
 PROGRESS
+	XOR	A
+	JR	PROGRESS_MODE
+
+; Variant for a caller which already owns an RX pause. It renders the same
+; line but deliberately leaves RTS deasserted. FTP download uses this while it
+; writes a received block: the normal nested pause/resume pair would otherwise
+; release the next +IPD burst before the outer receive loop was ready to drain.
+PROGRESS_PAUSED
+	LD	A,1
+PROGRESS_MODE
+	LD	(PROGRESS_RX_HELD),A
 	PUSH	DE			; total ptr
 	CALL	KB_AT_HL		; B:HL = downloaded KB
 	LD	(CUR_KB),HL
@@ -591,11 +602,19 @@ PROGRESS
 	; bursts. The line is formatted BEFORE the pause, so RTS now stays down for
 	; a single DSS_PCHARS instead of a divide-and-putchar sequence.
 	; MUST return CF=0 — callers propagate CF as success/fail.
+	LD	A,(PROGRESS_RX_HELD)
+	AND	A
+	JR	NZ,.PRINT_HELD
 	CALL	@WIFI.UART_RX_PAUSE
+.PRINT_HELD
 	LD	HL,LINE
 	LD	C,DSS_PCHARS
 	RST	DSS
+	LD	A,(PROGRESS_RX_HELD)
+	AND	A
+	JR	NZ,.RX_READY
 	CALL	@WIFI.UART_RX_RESUME
+.RX_READY
 	LD	HL,(CUR_KB)
 	LD	(LAST_KB),HL
 	LD	A,(CUR_KB+2)
@@ -810,6 +829,7 @@ SUF_OK		DB 0
 SHOWN		DB 0
 FMT_DIG		DB 0
 FMT_STARTED	DB 0
+PROGRESS_RX_HELD DB 0
 SUFFIX		DS 16,0
 LINE		DS 24,0
 

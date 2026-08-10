@@ -25,15 +25,33 @@ class DLSpeedHandler(BaseHTTPRequestHandler):
 
         block = bytes(range(256)) * (self.write_chunk // 256)
         left = self.payload_count
-        while left:
-            piece = block[: min(left, len(block))]
-            self.wfile.write(piece)
-            left -= len(piece)
-        self.wfile.flush()
+        sent = 0
+        try:
+            while left:
+                piece = block[: min(left, len(block))]
+                self.wfile.write(piece)
+                sent += len(piece)
+                left -= len(piece)
+            self.wfile.flush()
+        except OSError as exc:
+            # This line is deliberately emitted by the reproducible benchmark
+            # server: it distinguishes an application/server-side truncation
+            # from a downstream TCP/ESP/UART stall seen only by DLSPEED.
+            self.log_message(
+                "send stopped after %d/%d bytes: %s",
+                sent,
+                self.payload_count,
+                exc,
+            )
+            self.close_connection = True
+            return
+        self.log_message(
+            "sent %d/%d bytes; keeping connection open", sent, self.payload_count
+        )
         self.close_connection = False
 
     def log_message(self, fmt: str, *args: object) -> None:
-        print(f"{self.client_address[0]} - {fmt % args}")
+        print(f"{self.client_address[0]} - {fmt % args}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +74,10 @@ def main() -> None:
     DLSpeedHandler.write_chunk = args.chunk
     server = ThreadingHTTPServer((args.bind, args.port), DLSpeedHandler)
     host, port = server.server_address[:2]
-    print(f"DLSPEED source: http://{host}:{port}/test.bin ({args.count} bytes)")
+    print(
+        f"DLSPEED source: http://{host}:{port}/test.bin ({args.count} bytes)",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

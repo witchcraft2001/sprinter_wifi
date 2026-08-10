@@ -291,6 +291,9 @@ START_SEND_BUFFER
 ; - Data is binary; no zero terminator is appended.
 ; ------------------------------------------------------
 RECEIVE
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_RECORD_RECEIVE_CALL
+	ENDIF
 	; Reassert the profile-specific streaming trigger without flushing queued
 	; +IPD bytes. The 2.2.1 routine is a no-op and retains its proven trigger 8.
 	CALL	WIFI.UART_SET_DATA_RX_MODE
@@ -341,10 +344,19 @@ RECEIVE
 	; any later bytes are picked up by the next RECEIVE call.
 	LD	HL,TCP_CONT_TIMEOUT
 	LD	(RECV_TIMEOUT),HL
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_BEGIN_CONTINUATION
+	ENDIF
 	CALL	WAIT_IPD_HEADER
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_END_CONTINUATION
+	ENDIF
 	LD	HL,(RECV_FULL_TIMEOUT)
 	LD	(RECV_TIMEOUT),HL
 	JR	NC,.NEXT_ACTIVE
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_RECORD_CONTINUATION_MISS
+	ENDIF
 	LD	HL,(RECV_STORED)
 	LD	A,H
 	OR	L
@@ -2162,6 +2174,9 @@ READ_IPD_LEN
 .DONE
 	LD	(PAYLOAD_LEFT),HL
 	LD	(LAST_IPD_LEN),HL
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_RECORD_IPD
+	ENDIF
 	XOR	A
 	RET
 .TIMEOUT
@@ -2187,42 +2202,70 @@ READ_IPD_LEN
 ; new +IPD header.
 ; ------------------------------------------------------
 READ_PAYLOAD
+	; Keep the four per-payload values in registers. The old loop loaded and
+	; stored PAYLOAD_LEFT, RECV_REMAIN, RECV_PTR and RECV_STORED for every byte,
+	; in addition to the byte-reader's register save/restore. At 230400 baud that
+	; bookkeeping, not the UART or TCP stream, was the measured bottleneck.
+	PUSH	IY
 	LD	HL,(PAYLOAD_LEFT)
+	LD	BC,(RECV_REMAIN)
+	LD	DE,(RECV_PTR)
+	LD	IY,0			; bytes consumed by this invocation
 	LD	A,H
 	OR	L
 	JR	Z,.DONE
-
-	LD	HL,(RECV_REMAIN)
-	LD	A,H
-	OR	L
+	LD	A,B
+	OR	C
 	JR	Z,.DONE
 
-	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
+.LOOP
+	IFDEF ESP_TCP_TEST_READER
+	; Scripted host-side byte source. Preserve BC because its C return alias is
+	; part of the legacy reader contract, while the fast loop keeps capacity in
+	; BC across bytes.
+	PUSH	BC
+	CALL	@TEST_READ_BYTE
+	POP	BC
 	JR	C,.TIMEOUT
-	LD	E,A
-
-	LD	HL,(PAYLOAD_LEFT)
+	ELSE
+	; ISA is already open. Poll LSR and read RBR directly on the byte-ready hot
+	; path; only an empty FIFO falls back to the full timeout/cancel reader.
+	LD	A,(REG_LSR)
+	LD	(LAST_LSR),A
+	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+	CALL	NZ,ACCUM_PAYLOAD_LSR_ERROR
+	LD	A,(LAST_LSR)
+	AND	LSR_DR
+	JR	Z,.WAIT_BYTE
+	LD	A,(REG_RBR)
+	JR	.BYTE_READY
+.WAIT_BYTE
+	PUSH	BC
+	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
+	POP	BC
+	JR	C,.TIMEOUT
+	ENDIF
+.BYTE_READY
+	LD	(DE),A
+	INC	DE
 	DEC	HL
-	LD	(PAYLOAD_LEFT),HL
-
-	LD	HL,(RECV_REMAIN)
-	DEC	HL
-	LD	(RECV_REMAIN),HL
-
-	LD	HL,(RECV_PTR)
-	LD	(HL),E
-	INC	HL
-	LD	(RECV_PTR),HL
-
-	LD	HL,(RECV_STORED)
-	INC	HL
-	LD	(RECV_STORED),HL
-	JR	READ_PAYLOAD
+	DEC	BC
+	INC	IY
+	LD	A,H
+	OR	L
+	JR	Z,.DONE
+	LD	A,B
+	OR	C
+	JR	NZ,.LOOP
 .DONE
+	CALL	.COMMIT_STATE
+	POP	IY
 	LD	BC,(RECV_STORED)
 	XOR	A
 	RET
 .TIMEOUT
+	CALL	.COMMIT_STATE
+	POP	IY
 	LD	HL,(RECV_STORED)
 	LD	A,H
 	OR	L
@@ -2235,6 +2278,42 @@ READ_PAYLOAD
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+
+; Commit the register-cached payload state and fold this invocation's byte
+; count into the RECEIVE-wide total. Preserves the caller's saved IY on stack.
+.COMMIT_STATE
+	IFNDEF ESP_TCP_TEST_READER
+	; Errors are accumulated as soon as seen; fold in the final ordinary status
+	; once per payload run so diagnostics retain their historical full LSR mask
+	; without a memory OR on every byte.
+	LD	A,(LAST_LSR)
+	PUSH	HL
+	LD	HL,LSR_ACCUM
+	OR	(HL)
+	LD	(HL),A
+	POP	HL
+	ENDIF
+	LD	(PAYLOAD_LEFT),HL
+	LD	(RECV_REMAIN),BC
+	LD	(RECV_PTR),DE
+	PUSH	IY
+	POP	DE
+	LD	HL,(RECV_STORED)
+	ADD	HL,DE
+	LD	(RECV_STORED),HL
+	RET
+
+	IFNDEF ESP_TCP_TEST_READER
+; Rare path: reading LSR clears its sticky error bits, so retain them before
+; either consuming RBR or entering the slow timeout reader. In: A=error mask.
+ACCUM_PAYLOAD_LSR_ERROR
+	PUSH	HL
+	LD	HL,LSR_ACCUM
+	OR	(HL)
+	LD	(HL),A
+	POP	HL
+	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Read one UART byte with caller-provided timeout in BC.
@@ -2312,6 +2391,9 @@ READ_BYTE_TIMEOUT_OPEN
 	OR	C
 	JR	Z,.TIMEOUT
 	; Spin window elapsed with no byte: advance the ms timeout / cancel poll.
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_RECORD_WAIT_TICK
+	ENDIF
 	CALL	UTIL.DELAY_1MS
 	LD	HL,(RBT_CANCEL_TICK)
 	DEC	HL
@@ -2329,10 +2411,16 @@ READ_BYTE_TIMEOUT_OPEN
 	OR	C
 	JR	NZ,.MS_TICK
 .TIMEOUT
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_END_WAIT_RUN
+	ENDIF
 	SCF
 	POP	HL,DE,BC
 	RET
 .OK
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_END_WAIT_RUN
+	ENDIF
 	LD	HL,REG_RBR
 	LD	A,(HL)			; A = received byte
 	POP	HL,DE,BC
@@ -2341,6 +2429,9 @@ READ_BYTE_TIMEOUT_OPEN
 	RET
 .CANCEL
 	; User cancel: return as if timeout; WCOMMON.CANCELLED flag is set.
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_END_WAIT_RUN
+	ENDIF
 	SCF
 	POP	HL,DE,BC
 	RET
@@ -2348,6 +2439,186 @@ READ_BYTE_TIMEOUT_OPEN
 READ_BYTE_RECV_TIMEOUT_OPEN
 	LD	BC,(RECV_TIMEOUT)
 	JP	READ_BYTE_TIMEOUT_OPEN
+
+	IFDEF ESP_TCP_DIAGNOSTICS
+; ------------------------------------------------------
+; Optional low-overhead receive telemetry. DLSPEED enables this; normal TCP
+; clients do not carry the counters or the extra calls. No counter is touched
+; on the byte-ready hot path. DIAG_RECORD_WAIT_TICK runs only when the existing
+; receive loop is already about to pay a 1 ms delay.
+; ------------------------------------------------------
+DIAG_RESET
+	PUSH	AF,BC,DE,HL
+	LD	HL,DIAG_BASE
+	LD	DE,DIAG_BASE+1
+	LD	BC,DIAG_END-DIAG_BASE-1
+	XOR	A
+	LD	(HL),A
+	LDIR
+	POP	HL,DE,BC,AF
+	RET
+
+DIAG_RECORD_RECEIVE_CALL
+	PUSH	AF,HL
+	LD	HL,DIAG_RECEIVE_CALLS
+	CALL	DIAG_INC32
+	POP	HL,AF
+	RET
+
+; In: BC = successfully returned RECEIVE block size.
+DIAG_RECORD_RECV_BLOCK
+	PUSH	AF,BC,DE,HL
+	LD	HL,(DIAG_RECV_BLOCKS)
+	LD	A,H
+	OR	L
+	LD	HL,(DIAG_RECV_BLOCKS+2)
+	OR	H
+	OR	L
+	JR	NZ,.HAVE_BLOCK
+	LD	(DIAG_RECV_MIN),BC
+	LD	(DIAG_RECV_MAX),BC
+	JR	.BLOCK_COUNT
+.HAVE_BLOCK
+	LD	HL,(DIAG_RECV_MIN)
+	OR	A
+	SBC	HL,BC
+	JR	C,.BLOCK_MAX
+	JR	Z,.BLOCK_MAX
+	LD	(DIAG_RECV_MIN),BC
+.BLOCK_MAX
+	LD	HL,(DIAG_RECV_MAX)
+	OR	A
+	SBC	HL,BC
+	JR	NC,.BLOCK_COUNT
+	LD	(DIAG_RECV_MAX),BC
+.BLOCK_COUNT
+	LD	HL,DIAG_RECV_BLOCKS
+	CALL	DIAG_INC32
+	POP	HL,DE,BC,AF
+	RET
+
+; In: HL = parsed +IPD payload length. Preserves all registers and flags.
+DIAG_RECORD_IPD
+	PUSH	AF,BC,DE,HL
+	LD	B,H
+	LD	C,L
+	LD	HL,(DIAG_IPD_FRAMES)
+	LD	A,H
+	OR	L
+	LD	HL,(DIAG_IPD_FRAMES+2)
+	OR	H
+	OR	L
+	JR	NZ,.HAVE_IPD
+	LD	(DIAG_IPD_MIN),BC
+	LD	(DIAG_IPD_MAX),BC
+	JR	.IPD_TOTAL
+.HAVE_IPD
+	LD	HL,(DIAG_IPD_MIN)
+	OR	A
+	SBC	HL,BC
+	JR	C,.IPD_MAX
+	JR	Z,.IPD_MAX
+	LD	(DIAG_IPD_MIN),BC
+.IPD_MAX
+	LD	HL,(DIAG_IPD_MAX)
+	OR	A
+	SBC	HL,BC
+	JR	NC,.IPD_TOTAL
+	LD	(DIAG_IPD_MAX),BC
+.IPD_TOTAL
+	LD	HL,(DIAG_IPD_BYTES)
+	ADD	HL,BC
+	LD	(DIAG_IPD_BYTES),HL
+	LD	HL,(DIAG_IPD_BYTES+2)
+	LD	DE,0
+	ADC	HL,DE
+	LD	(DIAG_IPD_BYTES+2),HL
+	LD	HL,DIAG_IPD_FRAMES
+	CALL	DIAG_INC32
+	POP	HL,DE,BC,AF
+	RET
+
+; Mark the short look-ahead performed after a complete active +IPD frame.
+DIAG_BEGIN_CONTINUATION
+	PUSH	AF,HL
+	LD	A,1
+	LD	(DIAG_CONT_ACTIVE),A
+	LD	HL,DIAG_CONT_PROBES
+	CALL	DIAG_INC32
+	POP	HL,AF
+	RET
+
+; Preserves the carry/result returned by WAIT_IPD_HEADER.
+DIAG_END_CONTINUATION
+	PUSH	AF
+	XOR	A
+	LD	(DIAG_CONT_ACTIVE),A
+	POP	AF
+	RET
+
+DIAG_RECORD_CONTINUATION_MISS
+	PUSH	AF,HL
+	LD	HL,DIAG_CONT_MISSES
+	CALL	DIAG_INC32
+	POP	HL,AF
+	RET
+
+DIAG_RECORD_WAIT_TICK
+	PUSH	AF,HL
+	LD	HL,DIAG_WAIT_TICKS
+	CALL	DIAG_INC32
+	; The receive budgets used by this package fit in 16 bits. Saturate rather
+	; than wrap so a future maximum-budget timeout remains unambiguous.
+	LD	HL,(DIAG_WAIT_RUN)
+	LD	A,H
+	CP	0xFF
+	JR	NZ,.INC_RUN
+	LD	A,L
+	CP	0xFF
+	JR	Z,.RUN_READY
+.INC_RUN
+	INC	HL
+	LD	(DIAG_WAIT_RUN),HL
+.RUN_READY
+	LD	A,(DIAG_CONT_ACTIVE)
+	OR	A
+	JR	Z,.DONE
+	LD	HL,DIAG_CONT_WAIT_TICKS
+	CALL	DIAG_INC32
+.DONE
+	POP	HL,AF
+	RET
+
+; Finish one continuous no-data interval. Called only by the slow byte reader,
+; never by the FIFO-ready payload hot path. Preserves registers and flags.
+DIAG_END_WAIT_RUN
+	PUSH	AF,BC,DE,HL
+	LD	BC,(DIAG_WAIT_RUN)
+	LD	HL,(DIAG_WAIT_MAX)
+	OR	A
+	SBC	HL,BC
+	JR	NC,.RESET
+	LD	(DIAG_WAIT_MAX),BC
+.RESET
+	LD	HL,0
+	LD	(DIAG_WAIT_RUN),HL
+	POP	HL,DE,BC,AF
+	RET
+
+; Increment little-endian 32-bit integer at HL. Internal: trashes A,HL.
+DIAG_INC32
+	INC	(HL)
+	RET	NZ
+	INC	HL
+	INC	(HL)
+	RET	NZ
+	INC	HL
+	INC	(HL)
+	RET	NZ
+	INC	HL
+	INC	(HL)
+	RET
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -2427,6 +2698,28 @@ LSR_ACCUM	DB 0
 
 ; Periodic cancel-poll counter for byte read loop
 RBT_CANCEL_TICK	DW 0
+
+	IFDEF ESP_TCP_DIAGNOSTICS
+; DLSPEED-only receive telemetry. Kept in the compact loaded image: these are
+; small initialized scalars, not transfer buffers.
+DIAG_BASE
+DIAG_RECEIVE_CALLS	DS 4,0
+DIAG_RECV_BLOCKS	DS 4,0
+DIAG_RECV_MIN		DW 0
+DIAG_RECV_MAX		DW 0
+DIAG_IPD_FRAMES		DS 4,0
+DIAG_IPD_BYTES		DS 4,0
+DIAG_IPD_MIN		DW 0
+DIAG_IPD_MAX		DW 0
+DIAG_WAIT_TICKS		DS 4,0
+DIAG_WAIT_RUN		DW 0
+DIAG_WAIT_MAX		DW 0
+DIAG_CONT_PROBES	DS 4,0
+DIAG_CONT_MISSES	DS 4,0
+DIAG_CONT_WAIT_TICKS	DS 4,0
+DIAG_CONT_ACTIVE	DB 0
+DIAG_END
+	ENDIF
 
 LINE_REMAIN	DB 0
 

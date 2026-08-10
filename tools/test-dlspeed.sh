@@ -29,6 +29,22 @@ run_vector time "$script_dir/dlspeed_time_vectors.asm"
 
 sjasmplus --nologo --fullpath \
 	-I "$repo_root/src/include" -I "$repo_root/src/lib" \
+	--sym="$tmp_dir/diag.sym" --raw="$tmp_dir/diag.bin" \
+	"$script_dir/dlspeed_diag_vectors.asm" >/dev/null
+diag_start=$(awk '/^DLSPEED_DIAG_VECTORS\.TEST_START:/ {sub(/^0x0*/, "", $3); print $3}' "$tmp_dir/diag.sym")
+diag_end=$(awk '/^DLSPEED_DIAG_VECTORS\.TEST_DONE:/ {sub(/^0x0*/, "", $3); print $3}' "$tmp_dir/diag.sym")
+test -n "$diag_start"
+test -n "$diag_end"
+z88dk-ticks -l 16128 -pc "$diag_start" -end "$diag_end" \
+	-output "$tmp_dir/diag.ram" "$tmp_dir/diag.bin" >/dev/null
+diag_result=$(od -An -tu1 -j 49152 -N 1 "$tmp_dir/diag.ram" | tr -d ' ')
+if [ "$diag_result" != 0 ]; then
+	echo "DLSPEED diagnostic vector mismatch: case $diag_result" >&2
+	exit 1
+fi
+
+sjasmplus --nologo --fullpath \
+	-I "$repo_root/src/include" -I "$repo_root/src/lib" \
 	--sym="$tmp_dir/request.sym" --raw="$tmp_dir/request.bin" \
 	"$script_dir/dlspeed_request_vectors.asm" >/dev/null
 request_start=$(awk '/^DLSPEED_REQUEST_VECTORS\.TEST_START:/ {sub(/^0x0*/, "", $3); print $3}' "$tmp_dir/request.sym")
@@ -58,6 +74,8 @@ assemble_profile universal ""
 assemble_profile 221 -DESP_AT_FORCE_221
 assemble_profile 222 -DESP_AT_FORCE_222
 
+# Universal retains the real-hardware-proven trigger-8 path. Trigger 4 remains
+# isolated to an explicitly forced 2.2.2 experiment.
 grep -Eq '1E 83[[:space:]]+LD[[:space:]]+E,FCR_TR8 \| FCR_RESET_RX \| FCR_FIFO' "$tmp_dir/dlspeed-universal.lst"
 grep -Eq '1E 83[[:space:]]+LD[[:space:]]+E,FCR_TR8 \| FCR_RESET_RX \| FCR_FIFO' "$tmp_dir/dlspeed-221.lst"
 grep -Eq '1E 43[[:space:]]+LD[[:space:]]+E,FCR_TR4 \| FCR_RESET_RX \| FCR_FIFO' "$tmp_dir/dlspeed-222.lst"
@@ -76,6 +94,10 @@ for image in "$tmp_dir"/dlspeed-*.exe; do
 	fi
 	grep -a -q 'Accept-Encoding: identity' "$image"
 	grep -a -q 'Connection: keep-alive' "$image"
+	grep -a -q 'Receive result #' "$image"
+	grep -a -q 'peer closed the TCP connection' "$image"
+	grep -a -q 'stream idle timeout' "$image"
+	grep -a -q 'Max RX idle:' "$image"
 done
 
 if grep -Eq 'CALL[[:space:]]+WIFI\.ESP_RESET' "$tmp_dir"/dlspeed-*.lst; then
@@ -101,6 +123,17 @@ if grep -Eq 'CALL[[:space:]]+TCP\.CLOSE' "$repo_root/src/apps/dlspeed.asm"; then
 fi
 test "$(grep -Ec 'JP[[:space:]]+TCP\.OPEN' "$repo_root/src/apps/dlspeed.asm")" -eq 1
 grep -Eq 'JP[[:space:]]+WIFI\.UART_TX_STRING' "$repo_root/src/apps/dlspeed.asm"
+grep -A8 '^RECEIVE_ERROR' "$repo_root/src/apps/dlspeed.asm" | \
+	grep -q 'CALL[[:space:]]*ABORT_SOCKET'
+grep -a -q 'ESP receive stream drained after abort' "$tmp_dir/dlspeed-universal.exe"
+# 2.2.2 explicitly pauses RTS at every returned RECEIVE block; the forced
+# 2.2.1 image compiles this experiment out completely.
+grep -A12 'CALL[[:space:]]*TCP\.RECEIVE' "$repo_root/src/apps/dlspeed.asm" | \
+	grep -q 'CALL[[:space:]]*PAUSE_RX_222'
+if grep -Eq 'CD [0-9A-F]{2} [0-9A-F]{2}[[:space:]]+CALL[[:space:]]+PAUSE_RX_222' "$tmp_dir/dlspeed-221.lst"; then
+	echo "DLSPEED forced 2.2.1 unexpectedly contains the 2.2.2 RTS guard" >&2
+	exit 1
+fi
 
 python3 "$script_dir/test-dlspeed-server.py"
 echo "DLSPEED timing, HTTP and UART-profile vectors: OK"
