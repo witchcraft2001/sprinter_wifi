@@ -2304,6 +2304,13 @@ READ_BYTE_TIMEOUT_OPEN
 	LD	A,D
 	OR	E
 	JR	NZ,.SPIN
+	; A zero budget means a non-blocking poll: the initial spin window above is
+	; still allowed to catch an already arriving byte, but BC must never wrap to
+	; 0xFFFF. Public UNET RECV clamps IY=0 to one tick; this guard also protects
+	; direct TCP/UDP callers and future entry points.
+	LD	A,B
+	OR	C
+	JR	Z,.TIMEOUT
 	; Spin window elapsed with no byte: advance the ms timeout / cancel poll.
 	CALL	UTIL.DELAY_1MS
 	LD	HL,(RBT_CANCEL_TICK)
@@ -2321,6 +2328,7 @@ READ_BYTE_TIMEOUT_OPEN
 	LD	A,B
 	OR	C
 	JR	NZ,.MS_TICK
+.TIMEOUT
 	SCF
 	POP	HL,DE,BC
 	RET

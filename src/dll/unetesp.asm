@@ -11,13 +11,13 @@
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
 ; with the wrong command set. The L1 header name announces the target and full
-; DLL version (for example, "UNETESP v0.2.40") to consumers such as
+; DLL version (for example, "UNETESP v0.2.41") to consumers such as
 ; UNETTEST.
 ;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNETESP v0.2.40" --version 0.2 --no-compress \
+;     --name "UNETESP v0.2.41" --version 0.2 --no-compress \
 ;     -o build/UNETESP.DLL
 ;
 ; The L1 header has a compact, encoded major.minor version plus a 15-byte
@@ -693,6 +693,15 @@ F_RECV
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	LD	DE,(ARG_IY)
+	; IY=0 is the UNET non-blocking poll form. Keep it bounded even though the
+	; byte reader's internal millisecond budget uses zero as "no ticks left".
+	; One tick preserves the reader's initial UART spin window and matches the
+	; polling convention used by the RTL8019A backend.
+	LD	A,D
+	OR	E
+	JR	NZ,.timeout_ready
+	INC	DE
+.timeout_ready
 	LD	A,(ARG_CH)
 	CALL	TCP.RECEIVE_MUX
 	JR	C,.err

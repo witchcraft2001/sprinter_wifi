@@ -247,6 +247,9 @@ before sending when the peer may talk unprompted.
 ### Function 7 - RECV
 
 Reads up to `max` bytes from one channel with an `IY` millisecond timeout.
+`IY=0` is a bounded non-blocking poll: the ESP backend still performs its
+initial UART spin window and internally clamps the timeout to one millisecond;
+it never turns zero into a 65-second wait.
 Returns:
 
 - `A=NERR_OK, DE>0` - data received.

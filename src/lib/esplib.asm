@@ -586,6 +586,11 @@ UVR_NEXT
 	CALL	UART_READ
 	AND		LSR_DR
 	JR		NZ,UVR_OK
+	; BC=0 is a poll, not a 65536 ms timeout. Sample LSR once above so an
+	; already pending byte still succeeds, then stop before DELAY/DEC can wrap.
+	LD		A,B
+	OR		C
+	JR		Z,UVR_TO
 	CALL	UTIL.DELAY_1MS
 	DEC		BC
 	LD		A,B
@@ -626,6 +631,11 @@ UVR_NEXT_INT
 	POP		AF
 	AND		LSR_DR
 	JR		NZ,UVR_OK_INT
+	; Keep the interrupt/open-ISA reader's zero-budget semantics identical to
+	; UART_WAIT_RS: one LSR sample, no delay, and no BC underflow.
+	LD		A,B
+	OR		C
+	JR		Z,UVR_TO_INT
 	CALL	UTIL.DELAY_1MS
 	; Cancel poll every ~200ms (200 * ~0.5ms each = ~100ms wall, close enough).
 	LD		HL,(CANCEL_TICK)
@@ -643,6 +653,7 @@ UVR_NEXT_INT
 	LD		A,B
 	OR		C
 	JR		NZ,UVR_NEXT_INT
+UVR_TO_INT
 	SCF
 UVR_OK_INT
 	POP		HL,BC
