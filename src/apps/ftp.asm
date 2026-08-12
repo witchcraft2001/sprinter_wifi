@@ -11,7 +11,7 @@ FTP_FINAL_TIMEOUT	EQU 800				; short wait for post-transfer 226 / QUIT 221 repli
 FTP_BURST_TIMEOUT	EQU 120
 FTP_ACTIVE_IPD_MAX	EQU 3000
 ; WIN2 also holds the command-line/control strings. Keep a 1 KiB tail for that
-; runtime-only scratch, leaving a 15 KiB data area for streaming and the 8 KiB
+; runtime-only scratch, leaving a 15 KiB data area for streaming and the bounded
 ; retained FIN tail. This preserves the mandatory WIN1 stack margin.
 RECV_SIZE		EQU 15360
 ; Bytes handed to one AT+CIPSEND. The ESP does its own TCP segmentation, so this
@@ -32,10 +32,15 @@ PASS_SIZE		EQU 64
 PATH_SIZE		EQU 128
 ARG_SIZE		EQU 128
 CMD_SIZE		EQU 128
-; Retain the final 8 KiB of a sized download in RECV_BUFFER and flush it once
-; receive completes. This bounds disk-write pauses near the end without moving
-; an entire small transfer into one large deferred DSS_WRITE.
+; Reserve the final 8 KiB of a sized download from stream-mode writes. Hold mode
+; begins up to one complete maximum +IPD earlier (see FTP_HOLD_ENTER_MARGIN),
+; then flushes the retained bytes once receive completes.
 FTP_HOLD_TAIL_MARGIN	EQU 8192
+; Enter hold mode early enough that the preceding stream iteration never has
+; to accept only a prefix of the next maximum active +IPD. Real ESP-AT 2.2.2
+; hardware occasionally reports OE/FE/BI when RTS stops an eager frame at that
+; artificial mid-payload boundary, even though full-frame drains are stable.
+FTP_HOLD_ENTER_MARGIN	EQU FTP_HOLD_TAIL_MARGIN + FTP_ACTIVE_IPD_MAX
 ; FTP control replies used here (220/227/150/226/...) are short. Keeping this
 ; at 78 preserves the mandatory WIN1 stack margin while the common library
 ; stores the NET_ESP_FW-selected receive profile.
@@ -1849,7 +1854,7 @@ RECV_DATA_TRANSFER
 		XOR	A
 		LD	(TCP.LSR_ACCUM),A
 		; Enter retain-tail mode before the read once the file is within
-		; FTP_HOLD_TAIL_MARGIN of completion (see FTP_UPDATE_HOLD_MODE).
+		; FTP_HOLD_ENTER_MARGIN of completion (see FTP_UPDATE_HOLD_MODE).
 		CALL	FTP_UPDATE_HOLD_MODE
 		CALL	FTP_SETUP_RECV_DEST
 		LD	HL,(RECV_DEST)
@@ -2147,6 +2152,20 @@ ACCUMULATE_DATA_BURST
 			LD	(DATA_ACCUM_LEN),BC
 			XOR	A
 			LD	(PENDING_CONTROL_SEEN),A
+			; ESP-AT 2.2.2 has already coalesced complete frames in
+			; RECEIVE_ANY_LINK_BURST while ISA remained mapped. Do not start a
+			; second receive here: the former short final fill could stop inside a
+			; 2920-byte +IPD before the slow DSS write. Keep the proven 2.2.1
+			; one-frame accumulator unchanged.
+			IFDEF	ESP_AT_FORCE_222
+			JP	.DONE
+			ELSE
+			IFNDEF	ESP_AT_FORCE_221
+			LD	A,(WCOMMON.UART_ESP_PROFILE)
+			CP	UART_RX_PROFILE_222
+			JP	Z,.DONE
+			ENDIF
+			ENDIF
 .LOOP
 			; Ceiling is RECV_CAP, not RECV_SIZE: in stream mode it is clamped
 			; so the burst never crosses into the final retain-tail bytes.
@@ -2158,9 +2177,7 @@ ACCUMULATE_DATA_BURST
 			LD	A,H
 			OR	L
 			JR	Z,.DONE
-			; Limit every accumulation pass. Previously this only compared the
-			; capacity and still passed the whole RECV_CAP to RECEIVE_ANY_LINK,
-			; allowing a large directory listing to become one oversized burst.
+			; The 2.2.1 path retains its established bounded accumulator.
 			LD	DE,FTP_ACTIVE_IPD_MAX
 			OR	A
 			SBC	HL,DE
@@ -2215,7 +2232,7 @@ ACCUMULATE_DATA_BURST
 			LD	HL,(DATA_ACCUM_LEN)
 			ADD	HL,BC
 			LD	(DATA_ACCUM_LEN),HL
-			JR	.LOOP
+			JP	.LOOP
 .DONE
 			LD	BC,(DATA_ACCUM_LEN)
 			XOR	A
@@ -2401,10 +2418,12 @@ WRITE_DATA_BUFFER
 
 ; ------------------------------------------------------
 ; Enter retain-tail (hold) mode once a file download is within
-; FTP_HOLD_TAIL_MARGIN bytes of the server-announced size. Called at the loop
-; top before the read so the final bytes are accumulated, never written under
-; an RTS-off pause. Latches HOLD_MODE; never clears it mid-transfer. No-op for
-; directory listings or when the size is unknown.
+; FTP_HOLD_ENTER_MARGIN bytes of the server-announced size. The extra maximum
+; +IPD margin guarantees that the preceding stream iteration returns only at a
+; complete payload boundary. Called at the loop top before the read so the final
+; bytes are accumulated, never written under an RTS-off pause. Latches
+; HOLD_MODE; never clears it mid-transfer. No-op for directory listings or when
+; the size is unknown.
 ; ------------------------------------------------------
 FTP_UPDATE_HOLD_MODE
 		LD	A,(HOLD_MODE)
@@ -2422,7 +2441,7 @@ FTP_UPDATE_HOLD_MODE
 		OR	L
 		RET	Z				; remaining 0 -> done
 		EX	DE,HL				; DE = remaining
-		LD	HL,FTP_HOLD_TAIL_MARGIN
+		LD	HL,FTP_HOLD_ENTER_MARGIN
 		OR	A
 		SBC	HL,DE				; MARGIN - remaining; CF=1 -> MARGIN < remaining
 		RET	C
@@ -3481,6 +3500,10 @@ PASV_P2
 		INCLUDE "wcommon.asm"
 		INCLUDE "dss_error.asm"
 		INCLUDE "isa.asm"
+		; Real ESP-AT 2.2.2 emits active +IPD payloads up to 2920 bytes.
+		; Override the generic 1500-byte MTU guard so FTP never starts a frame
+		; that cannot finish before its slow DSS_WRITE pause.
+		DEFINE TCP_ACTIVE_IPD_MAX_OVERRIDE FTP_ACTIVE_IPD_MAX
 		INCLUDE "esp_tcp.asm"
 		DEFINE	ESP_TCP_MULTI_DIAGNOSTICS
 		INCLUDE "esp_tcp_multi.asm"

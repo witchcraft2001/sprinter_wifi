@@ -49,6 +49,21 @@ TEST_START
 	CALL	STRCMP
 	JP	C,FAILED
 
+	; A retry must request exactly the first missing byte as an open-ended Range.
+	LD	A,3
+	LD	(TEST_RESULT),A
+	LD	A,1
+	LD	(MAIN.RANGE_ACTIVE),A
+	LD	HL,0x7A60		; 1473120 = 0x00167A60
+	LD	(MAIN.TOTAL_RECEIVED),HL
+	LD	HL,0x0016
+	LD	(MAIN.TOTAL_RECEIVED+2),HL
+	CALL	MAIN.BUILD_HTTP_REQUEST
+	LD	HL,MAIN.REQ_BUFF
+	LD	DE,V_EXPECT_RANGE
+	CALL	STRCMP
+	JP	C,FAILED
+
 	XOR	A
 	LD	(TEST_RESULT),A
 FAILED
@@ -83,6 +98,13 @@ V_EXPECT_8080
 V_EXPECT_80
 	DB "GET /test.bin HTTP/1.1",13,10
 	DB "Host: 192.168.1.36",13,10
+	DB "Accept-Encoding: identity",13,10
+	DB "Connection: keep-alive",13,10,13,10,0
+
+V_EXPECT_RANGE
+	DB "GET /test.bin HTTP/1.1",13,10
+	DB "Host: 192.168.1.36",13,10
+	DB "Range: bytes=1473120-",13,10
 	DB "Accept-Encoding: identity",13,10
 	DB "Connection: keep-alive",13,10,13,10,0
 

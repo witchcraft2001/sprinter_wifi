@@ -12,23 +12,56 @@ class DLSpeedHandler(BaseHTTPRequestHandler):
     payload_count = 512 * 1024
     write_chunk = 16 * 1024
 
+    def range_start(self) -> int | None:
+        value = self.headers.get("Range")
+        if value is None:
+            return None
+        prefix = "bytes="
+        if not value.startswith(prefix) or not value.endswith("-"):
+            return -1
+        start_text = value[len(prefix) : -1]
+        if not start_text.isdecimal():
+            return -1
+        start = int(start_text)
+        if start < 0 or start >= self.payload_count:
+            return -1
+        return start
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path != "/test.bin":
             self.send_error(404)
             return
-        self.send_response(200)
+        start = self.range_start()
+        if start == -1:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{self.payload_count}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body_start = 0 if start is None else start
+        body_count = self.payload_count - body_start
+        self.send_response(200 if start is None else 206)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(self.payload_count))
+        self.send_header("Content-Length", str(body_count))
+        if start is not None:
+            self.send_header(
+                "Content-Range",
+                f"bytes {body_start}-{self.payload_count - 1}/{self.payload_count}",
+            )
         self.send_header("Content-Encoding", "identity")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        block = bytes(range(256)) * (self.write_chunk // 256)
-        left = self.payload_count
+        # One extra pattern period lets a resumed response begin at any byte
+        # offset while retaining the same deterministic 0..255 sequence.
+        block = bytes(range(256)) * (self.write_chunk // 256 + 1)
+        pattern_offset = body_start & 0xFF
+        left = body_count
         sent = 0
         try:
             while left:
-                piece = block[: min(left, len(block))]
+                piece_len = min(left, self.write_chunk)
+                piece = block[pattern_offset : pattern_offset + piece_len]
                 self.wfile.write(piece)
                 sent += len(piece)
                 left -= len(piece)
@@ -40,13 +73,16 @@ class DLSpeedHandler(BaseHTTPRequestHandler):
             self.log_message(
                 "send stopped after %d/%d bytes: %s",
                 sent,
-                self.payload_count,
+                body_count,
                 exc,
             )
             self.close_connection = True
             return
         self.log_message(
-            "sent %d/%d bytes; keeping connection open", sent, self.payload_count
+            "sent %d/%d bytes from offset %d; keeping connection open",
+            sent,
+            body_count,
+            body_start,
         )
         self.close_connection = False
 

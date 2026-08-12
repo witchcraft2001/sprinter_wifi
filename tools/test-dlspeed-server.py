@@ -29,6 +29,25 @@ try:
     assert response.getheader("Connection") == "keep-alive"
     assert len(body) == 12345
     assert body[:260] == bytes(range(256)) + bytes(range(4))
+
+    connection.request(
+        "GET",
+        "/test.bin",
+        headers={"Accept-Encoding": "identity", "Range": "bytes=1234-"},
+    )
+    response = connection.getresponse()
+    body = response.read()
+    assert response.status == 206
+    assert response.getheader("Content-Length") == str(12345 - 1234)
+    assert response.getheader("Content-Range") == "bytes 1234-12344/12345"
+    assert len(body) == 12345 - 1234
+    assert body[:260] == bytes(range(256))[210:] + bytes(range(214))
+
+    connection.request("GET", "/test.bin", headers={"Range": "bytes=12345-"})
+    response = connection.getresponse()
+    assert response.status == 416
+    assert response.getheader("Content-Range") == "bytes */12345"
+    assert response.read() == b""
     connection.close()
 finally:
     server.shutdown()

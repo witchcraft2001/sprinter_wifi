@@ -17,7 +17,11 @@ TCP_BUSY_DELAY		EQU 400				; ms between busy retries
 TCP_CMD_SIZE		EQU 192
 TCP_LINE_SIZE		EQU 64
 TCP_DEBUG_SIZE		EQU 12
+	IFDEF TCP_ACTIVE_IPD_MAX_OVERRIDE
+TCP_ACTIVE_IPD_MAX	EQU TCP_ACTIVE_IPD_MAX_OVERRIDE
+	ELSE
 TCP_ACTIVE_IPD_MAX	EQU 1500
+	ENDIF
 ; Busy-poll iterations spent waiting for the next UART byte before falling back
 ; to a 1 ms timeout tick. Sized to comfortably bridge the gap between FIFO
 ; bursts at 115200 baud across the Sprinter clock range; tune up if downloads

@@ -17,6 +17,14 @@ been counted, before closing the socket or printing the result. RTC resolution
 is one second, so use at least 512 KiB; a transfer contained in one reported
 second is rejected as "sample too short".
 
+If a clean TCP close or receive timeout occurs after part of the body has been
+verified, DLSPEED reconnects up to three times and requests the missing suffix
+with `Range: bytes=<offset>-`. The server must answer `206 Partial Content` and
+advertise exactly the remaining Content-Length; otherwise the run fails rather
+than silently counting duplicate bytes. The RTC timer and receive diagnostics
+remain continuous across reconnects, so the reported rate includes recovery.
+UART integrity errors are never resumed.
+
 Build (developer-only; DLSPEED is not in the package manifest):
 
   make dlspeed
@@ -26,6 +34,9 @@ Build (developer-only; DLSPEED is not in the package manifest):
 Start a deterministic LAN source on another computer:
 
   tools/dlspeed_server.py --port 8080 --count 524288
+
+This supplied server supports the Range continuation used after an intermittent
+connection close.
 
 Port 8080 is not implied by HTTP. It must also be present in the URL. Without
 ":8080" DLSPEED correctly tries TCP port 80, where this test server is not

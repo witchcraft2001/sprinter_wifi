@@ -190,10 +190,25 @@ if grep -Eq '(C3|CA) [0-9A-F]{2} [0-9A-F]{2}[[:space:]]+JP[[:space:]]+(Z,)?TCP\.
 	exit 1
 fi
 
-# Keep the bounded 8 KiB retained tail; moving a complete small download into
-# one deferred DSS_WRITE caused a real-hardware throughput regression.
+# Keep the bounded 8 KiB tail reservation; moving a complete small download
+# into one deferred DSS_WRITE caused a real-hardware throughput regression.
 grep -Eq '^FTP_HOLD_TAIL_MARGIN[[:space:]]+EQU[[:space:]]+8192$' \
 	"$repo_root/src/apps/ftp.asm"
+# Hold mode starts one maximum active +IPD earlier, and FTP overrides the
+# generic 1500-byte MTU assumption with the observed 2920-byte ESP frame size.
+grep -Eq '^FTP_HOLD_ENTER_MARGIN[[:space:]]+EQU[[:space:]]+FTP_HOLD_TAIL_MARGIN \+ FTP_ACTIVE_IPD_MAX$' \
+	"$repo_root/src/apps/ftp.asm"
+grep -Eq '^[[:space:]]*DEFINE[[:space:]]+TCP_ACTIVE_IPD_MAX_OVERRIDE[[:space:]]+FTP_ACTIVE_IPD_MAX$' \
+	"$repo_root/src/apps/ftp.asm"
+# Universal/forced-2.2.2 FTP returns the first in-window burst directly. Only
+# the field-proven 2.2.1 profile enters the legacy app-side accumulator.
+awk '
+	/^ACCUMULATE_DATA_BURST$/ { in_burst = 1 }
+	in_burst && /CP[[:space:]]+UART_RX_PROFILE_222/ { saw_profile = 1; next }
+	in_burst && saw_profile && /JP[[:space:]]+Z,\.DONE/ { bypass = 1 }
+	in_burst && /^\.LOOP$/ { exit }
+	END { if (!saw_profile || !bypass) exit 1 }
+' "$repo_root/src/apps/ftp.asm"
 grep -A5 '^\.ERROR$' "$repo_root/src/apps/ftp.asm" | \
 	grep -Eq 'CALL[[:space:]]+WIFI\.UART_RX_PAUSE'
 grep -A3 '^\.CLOSED$' "$repo_root/src/apps/ftp.asm" | \

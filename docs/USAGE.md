@@ -45,7 +45,11 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   prompting and `-r` resumes (appends, FTP `REST`) without prompting. `-d`
   replaces the in-place `<KB>KB / <KB>KB` counter with one dot per write, the
   output FTP had before the counter existed; use it to measure what the
-  console repaint costs on a given link.
+  console repaint costs on a given link. The final 8 KiB plus at most one
+  complete ESP `+IPD` frame is retained until receive closes, so FTP never
+  lowers RTS at an artificial mid-payload buffer boundary. FTP timing uses
+  whole RTC seconds; rates from very small one-second transfers are coarse and
+  should not be compared directly with a long DLSPEED run.
 - `FTP.EXE host[:port] PUT local-file [-o remote-name] [-u user] [-p pass]`
   uploads one file over passive FTP using `STOR`. Without `-o`, the remote name
   is the basename of the local file.
@@ -68,7 +72,11 @@ profile in the banner. The default transfer path remains active `+IPD`, because
   512 KiB and pair it with `tools/dlspeed_server.py --port 8080 --count 524288`.
   The port must also appear in the URL (`http://host:8080/test.bin`); omitting
   it selects normal HTTP port 80. There is intentionally no timed-region
-  progress output, so 512 KiB takes about 46 seconds at 115200 baud. After the
+  progress output, so 512 KiB takes about 46 seconds at 115200 baud. A clean
+  premature close/timeout is resumed up to three times with HTTP Range; the
+  supplied server supports this, and the end-to-end rate includes reconnect
+  time. A server that ignores Range or a UART integrity error still fails the
+  run. After the
   saved time/rate result it prints receive telemetry: the active UART/profile
   settings, successful `TCP.RECEIVE` block sizes, `+IPD` frame count and size
   range, receive-loop 1-ms waits, continuation probes/misses, and the UART LSR

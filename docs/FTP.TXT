@@ -26,8 +26,9 @@ Flags
             measure how much console work costs on a given link.
             Both progress modes keep that receive pause active until FTP is
             ready to drain the next ESP +IPD block.
-            The final 8 KiB of a sized download is retained in memory and
-            written after receive completes, limiting disk pauses near close.
+            The final 8 KiB plus at most one complete ESP +IPD frame is
+            retained in memory and written after receive completes. This
+            avoids both disk pauses near close and an RTS stop mid-payload.
   When the local file exists, FTP asks [R]esume / [O]verwrite / [C]ancel;
   -y (or -f) forces overwrite and -r forces resume, with no prompt.
 
@@ -39,6 +40,11 @@ Flags
 
 Run NETUP first. FTP.EXE uses the active network connection and does not join
 Wi-Fi by itself.
+
+The elapsed time is measured in whole RTC seconds. For very small files (for
+example 13 KiB completing in one displayed second), the reported KB/s is only
+a coarse estimate and may appear above the physical UART throughput. Use
+DLSPEED with a large test body for a representative link measurement.
 
 Examples
 --------
