@@ -1,7 +1,7 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [-l LISTENPORT] HOST [PORT]
 ;
 ; Loads a UNET DLL (default UNETESP.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
@@ -11,6 +11,13 @@
 ; -2 DATAPORT swaps it for the two-channel exercise (control on PORT, data on
 ; DATAPORT at the same time), which needs CAP_MULTICHAN and pairs with
 ; tools/race_server.py --dual. Backends without it report and skip.
+; -l LISTENPORT swaps it for the passive-open exercise (LISTEN/UNLISTEN,
+; UNET_CAP_LISTEN): arms LISTENPORT on channel 0, accepts and serves two
+; peers in a row to prove auto-re-arm on CLOSE, then UNLISTENs. Needs a
+; backend that reports CAP_LISTEN; one without it prints a note and stops,
+; which is not a failure. Drive it with a plain `nc HOST LISTENPORT` (or
+; tools/dev/unettest_listen_client.py from the sibling RTL project) run
+; twice from the host.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETRTL.DLL to exercise the RTL card.
 ;
@@ -224,11 +231,17 @@ START
 	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 .after_ping
-	; -u / -2 select an exercise other than the plain TCP one.
+	; -u / -2 / -l select an exercise other than the plain TCP one.
 	LD	A,(DUAL_MODE)
 	AND	A
-	JR	Z,.check_udp
+	JR	Z,.check_listen
 	CALL	DUAL_PHASE
+	JP	.teardown
+.check_listen
+	LD	A,(LISTEN_MODE)
+	AND	A
+	JR	Z,.check_udp
+	CALL	LISTEN_PHASE
 	JP	.teardown
 .check_udp
 	LD	A,(UDP_MODE)
@@ -472,6 +485,8 @@ ERR_UDPOPEN
 
 USAGE_EXIT
 	LD	HL,MSG_USAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_USAGE2
 	CALL	PUTS_LN
 	LD	B,1
 	JP	EXIT
@@ -1049,6 +1064,236 @@ UDP_ECHO_MATCH
 	RET
 
 ; ======================================================
+; LISTEN exercise (-l LISTENPORT): LISTEN -> accept -> SEND/RECV -> CLOSE,
+; run twice on channel 0 to verify the documented auto-re-arm-on-CLOSE
+; (docs/UNETAPI.md "Functions 18/19 - LISTEN/UNLISTEN"), then UNLISTEN.
+; Pair with a plain `nc HOST LISTENPORT`, run twice from the host, or
+; tools/dev/unettest_listen_client.py from the sibling RTL project.
+; ======================================================
+LISTEN_PHASE
+	LD	A,(CAPS)
+	AND	UNET_CAP_LISTEN
+	JR	NZ,.supported
+	LD	HL,MSG_LISTEN_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	HL,MSG_LISTEN
+	CALL	PUTS
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PUTS_LN
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PARSE_DEC_TOKEN			; -> HL=port (1..9999), CF=1 invalid
+	JP	C,ERR_LISTEN_PORT
+	EX	DE,HL				; DE = port, binary
+	XOR	A				; channel 0
+	LD	B,UNET_FN_LISTEN
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_LISTEN
+	LD	HL,MSG_LISTENING
+	CALL	PUTS_LN
+
+	LD	C,1				; ascending peer number for the log
+	LD	B,LISTEN_MAX_PEERS
+.peer_loop
+	PUSH	BC
+	LD	A,C
+	CALL	LISTEN_ACCEPT_SERVE
+	POP	BC
+	INC	C
+	DJNZ	.peer_loop
+
+	XOR	A				; the (still) listening channel
+	LD	B,UNET_FN_UNLISTEN
+	CALL	DO_CALL
+	LD	HL,MSG_UNLISTENED
+	CALL	PUTS_LN
+	RET
+
+ERR_LISTEN
+	LD	HL,MSG_ERR_LISTEN
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; LISTENPORT failed PARSE_DEC_TOKEN (non-digits, empty, zero, or >4 digits) -
+; a usage error, but caught late (after the DLL is up), so clean up like the
+; other mid-session error exits instead of jumping to USAGE_EXIT.
+ERR_LISTEN_PORT
+	LD	HL,MSG_USAGE
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,1
+	JP	EXIT
+
+; One accept-serve-close cycle on channel 0. In: A = peer number (for the
+; log only). Never propagates an error upward - always prints and returns
+; so LISTEN_PHASE can try the next peer (this is a diagnostic loop, not a
+; fatal-on-first-error client).
+LISTEN_ACCEPT_SERVE
+	PUSH	AF				; peer number: PUTS (RST DSS) trashes A
+	LD	HL,MSG_LISTEN_WAITING
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	LD	A,LISTEN_ACCEPT_TRIES
+	LD	(RECV_LEFT),A
+.wait
+	LD	A,(RECV_LEFT)
+	AND	A
+	JP	Z,.timeout
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,2000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got (progresses the accept)
+	OR	A
+	JP	NZ,.recv_err
+	LD	(LISTEN_RX_LEN),DE
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> A=0, DE=state bits
+	LD	A,E
+	AND	UNET_ST_ACCEPT
+	JR	Z,.wait
+	; accepted
+	LD	HL,MSG_LISTEN_ACCEPTED
+	CALL	PUTS_LN
+	LD	DE,(LISTEN_RX_LEN)
+	LD	A,D
+	OR	E
+	JR	Z,.reply
+	CALL	PRINT_RECV
+	CALL	CRLF
+.reply
+	XOR	A				; channel 0
+	LD	DE,LISTEN_REPLY
+	LD	IX,LISTEN_REPLY_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.send_err
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,1000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; drain once more, non-fatal
+	CP	NERR_CLOSED
+	JR	Z,.peer_closed
+	OR	A
+	JR	NZ,.recv_err_close
+	LD	A,D
+	OR	E
+	JR	Z,.close
+	CALL	PRINT_RECV
+	CALL	CRLF
+.close
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	LD	HL,MSG_LISTEN_CLOSED
+	CALL	PUTS_LN
+	RET
+; The peer read the reply and closed on its own (normal shutdown, not an
+; error): RECV's own NERR_CLOSED report has ALREADY re-armed LISTEN for us
+; (docs/UNETAPI.md: closing the accepted connection, including its own
+; natural NERR_CLOSED, automatically re-arms the listening channel).
+; Calling CLOSE again here would unarm the listener instead. Do not CLOSE
+; on this path.
+.peer_closed
+	LD	HL,MSG_LISTEN_PEER_CLOSED
+	CALL	PUTS_LN
+	RET
+.send_err
+	LD	HL,MSG_ERR_SEND
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+; Pre-accept RECV error: the channel is still just listening, so do NOT
+; CLOSE it (that would tear the listener down instead of re-arming it).
+.recv_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	JP	DUMP_LASTERR
+; Post-accept RECV error: CLOSE the accepted connection so LISTEN re-arms
+; and the next peer iteration still stands a chance.
+.recv_err_close
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+.timeout
+	LD	HL,MSG_LISTEN_TIMEOUT
+	CALL	PUTS_LN
+	RET
+
+; Parse a pure-decimal ASCIIZ token (1-4 digits, 1..9999) at (HL).
+; Out: HL = value; CF=1 if empty, contains a non-digit, > 4 digits, or 0.
+; Trashes A, BC, DE.
+PARSE_DEC_TOKEN
+	LD	DE,0
+	XOR	A
+	LD	(.DIGITS),A
+.loop
+	LD	A,(HL)
+	OR	A
+	JR	Z,.done
+	CP	'0'
+	JR	C,.bad
+	CP	'9'+1
+	JR	NC,.bad
+	LD	A,(.DIGITS)
+	CP	4
+	JR	NC,.bad				; more than 4 digits
+	INC	A
+	LD	(.DIGITS),A
+	LD	A,(HL)
+	SUB	'0'
+	LD	C,A
+	LD	B,0				; BC = digit (0..9)
+	PUSH	HL
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL				; x2
+	ADD	HL,HL				; x4
+	ADD	HL,DE				; x5
+	ADD	HL,HL				; x10
+	ADD	HL,BC				; +digit
+	EX	DE,HL				; DE = new value
+	POP	HL
+	INC	HL
+	JR	.loop
+.done
+	LD	A,(.DIGITS)
+	OR	A
+	JR	Z,.bad				; no digits consumed
+	LD	A,D
+	OR	E
+	JR	Z,.bad				; port 0 is not valid
+	EX	DE,HL
+	OR	A				; CF=0
+	RET
+.bad
+	SCF
+	RET
+.DIGITS	DB 0
+
+; ======================================================
 ; Build "HEAD / HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n"
 ; into REQ_BUF. Out: BC = length (no terminator sent).
 ; ======================================================
@@ -1097,6 +1342,7 @@ PARSE_ARGS
 	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
 	LD	(UDP_MODE),A			; default: TCP exercise
 	LD	(DUAL_MODE),A
+	LD	(LISTEN_MODE),A
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
@@ -1123,6 +1369,10 @@ PARSE_ARGS
 	LD	DE,STR_DASH_2
 	CALL	STREQ
 	JR	Z,.flag_2
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_L
+	CALL	STREQ
+	JR	Z,.flag_l
 	JP	USAGE_EXIT			; unknown flag
 .flag_d
 	LD	DE,DLL_NAME
@@ -1148,6 +1398,16 @@ PARSE_ARGS
 	LD	A,1
 	LD	(DUAL_MODE),A
 	JR	.next_flag
+.flag_l
+	; LISTENPORT is parsed later by PARSE_DEC_TOKEN (1..9999, ample for
+	; any test port), so just capture the raw token here like -u/-2 do.
+	LD	DE,LISTEN_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -l without a port
+	LD	A,1
+	LD	(LISTEN_MODE),A
+	JP	.next_flag
 .host_is_tok
 	LD	HL,TOKEN_BUF
 	LD	DE,HOST_BUFF
@@ -1440,7 +1700,8 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [HOST [PORT]]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT]",0
+MSG_USAGE2	DB "               [-l LISTENPORT] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -1516,6 +1777,18 @@ MSG_DUAL_CTRL_NONE DB "control channel returned nothing",0
 MSG_DUAL_CTRL_BAD DB "unexpected/late control reply",0
 MSG_DUAL_FAILED DB "dual channel test FAILED",0
 MSG_CANCELLED	DB "cancelled",0
+MSG_LISTEN	DB "listen on port ",0
+MSG_LISTEN_UNSUP DB "listen not supported by this backend",0
+MSG_LISTENING	DB "listening; connect a peer now (nc HOST PORT)",0
+MSG_LISTEN_WAITING DB "waiting for peer #",0
+MSG_LISTEN_TIMEOUT DB "no peer connected in time",0
+MSG_LISTEN_ACCEPTED DB "peer accepted",0
+MSG_LISTEN_CLOSED DB "closed (re-arms LISTEN automatically)",0
+MSG_LISTEN_PEER_CLOSED DB "peer closed after reading reply (re-armed)",0
+MSG_UNLISTENED	DB "unlisten done",0
+MSG_ERR_LISTEN	DB "Listen failed.",0
+LISTEN_REPLY	DB "UNETTEST LISTEN REPLY",13,10
+LISTEN_REPLY_LEN	EQU $ - LISTEN_REPLY
 DUAL_PROBE	DB "UNETTEST DUAL CONTROL",13,10
 DUAL_PROBE_LEN	EQU $ - DUAL_PROBE
 DUAL_EXPECT	DB "CONTROL REPLY DURING TRANSFER",13,10
@@ -1528,6 +1801,7 @@ DEF_PORT	DB "80",0
 STR_DASH_D	DB "-d",0
 STR_DASH_U	DB "-u",0
 STR_DASH_2	DB "-2",0
+STR_DASH_L	DB "-l",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
@@ -1581,7 +1855,9 @@ DUAL_FAIL	EQU DUAL_BAD + 1	; 1 = any fatal dual-test condition
 DUAL_CLOSED	EQU DUAL_FAIL + 1	; 1 = data peer close was observed
 DUAL_IDLE	EQU DUAL_CLOSED + 1	; consecutive real data timeouts left
 DUAL_TOTAL	EQU DUAL_IDLE + 1	; bytes received on the data channel
-DEC_BUF		EQU DUAL_TOTAL + 2
+LISTEN_MODE	EQU DUAL_TOTAL + 2	; 1 = -l given, run the passive-open exercise
+LISTEN_RX_LEN	EQU LISTEN_MODE + 1
+DEC_BUF		EQU LISTEN_RX_LEN + 2
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
@@ -1589,7 +1865,8 @@ HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
 UDP_PORT_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
 DUAL_PORT_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
-TOKEN_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
+LISTEN_PORT_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
+TOKEN_BUF	EQU LISTEN_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
@@ -1607,6 +1884,8 @@ RECV_MAX_BLOCKS	EQU 4
 UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
 DUAL_MAX_ROUNDS	EQU 200			; bounds the -2 data drain loop
 DUAL_MAX_IDLE	EQU 3			; 3 x 4 s without channel-1 data
+LISTEN_MAX_PEERS	EQU 2		; accept-serve-close twice: proves re-arm
+LISTEN_ACCEPT_TRIES	EQU 15		; 15 x 2000 ms before giving up on a peer
 
 	ASSERT STACK_TOP <= 0xC000
 

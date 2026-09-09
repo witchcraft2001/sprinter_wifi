@@ -11,13 +11,13 @@
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
 ; with the wrong command set. The L1 header name announces the target and full
-; DLL version (for example, "UNETESP v0.2.41") to consumers such as
+; DLL version (for example, "UNETESP v0.3.0") to consumers such as
 ; UNETTEST.
 ;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNETESP v0.2.41" --version 0.2 --no-compress \
+;     --name "UNETESP v0.3.0" --version 0.3 --no-compress \
 ;     -o build/UNETESP.DLL
 ;
 ; The L1 header has a compact, encoded major.minor version plus a 15-byte
@@ -51,6 +51,11 @@
 ; data on the other). Adds a second receive-defer stash so a frame for the
 ; channel not being read is buffered for it instead of lost. See esp_tcp.asm.
 	DEFINE	ESP_TCP_MUX
+; Marks this build as the DLL itself (as opposed to a stock single-file EXE
+; that happens to include util.asm/esp_tcp.asm). Gates library helpers that
+; only ever run stand-alone in a utility - never in the DLL - out of the
+; image; every stock app builds without it and stays byte-identical.
+	DEFINE	UNET_DLL
 
 	INCLUDE "dss.inc"
 	INCLUDE "sprinter.inc"
@@ -64,7 +69,7 @@ BUSY_MAX_RETRY		EQU 8
 MAX_HOST_LEN		EQU 128	; host/port length caps keep the fixed-size AT
 MAX_PORT_LEN		EQU 15	; command build buffers (CMDBUILD, TCP/UDP
 				; CMD_BUFFER) from overflowing
-UNETESP_CAPS		EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND
+UNETESP_CAPS		EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_RXFLOW | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND | UNET_CAP_LISTEN
 UNET_CHANNELS		EQU 2	; channels this build accepts; checked against
 				; TCP_MUX_CHANNELS after the library include
 
@@ -93,8 +98,8 @@ UNET_CHANNELS		EQU 2	; channels this build accepts; checked against
 	JP	F_GETINFO		; 15
 	JP	F_LASTERR		; 16
 	JP	F_SETOPT		; 17
-	JP	F_NOTSUP		; 18 reserved
-	JP	F_NOTSUP		; 19 reserved
+	JP	F_LISTEN		; 18
+	JP	F_UNLISTEN		; 19
 	JP	F_NOTSUP		; 20 reserved
 	JP	F_NOTSUP		; 21 reserved
 	JP	F_NOTSUP		; 22 reserved
@@ -209,6 +214,11 @@ F_NETINIT
 	LD	HL,CMD_CIPCLOSE_ONE
 	LD	BC,DEFAULT_TIMEOUT
 	CALL	SEND_AT
+	; A crashed/killed previous process could leave AT+CIPSERVER running with
+	; nothing left to track it; drop it too, best effort (ERROR = none was up).
+	LD	HL,CMD_CIPSERVER_OFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT
 	; the CIPCLOSE pair above really closed any leftover socket - forget
 	; stale channel state so a repeated NETINIT + CONNECT works
 	CALL	RESET_CHANNEL_STATE
@@ -249,6 +259,7 @@ F_NETINIT
 ; Function 8 - CLOSE (one channel)
 ; ======================================================
 F_CLOSE
+	CALL	SYNC_ACCEPT
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	CALL	CHECK_RX_ACTIVE
@@ -272,6 +283,28 @@ F_NETDONE
 	CALL	CLOSE_LINK
 	AND	A
 	RET	NZ			; do not inject CIPMUX while a close is unresolved
+	; CLOSE_LINK may have left an accepted channel re-armed at "listening"
+	; (CH_RELEASE deliberately keeps LISTEN alive across an ordinary CLOSE);
+	; NETDONE closes everything, so force the server down too. Every channel
+	; is 0 or 3 at this point - no live +IPD can race this plain AT command.
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CP	0xFF
+	JR	Z,.no_listen
+	PUSH	AF
+	LD	HL,CMD_CIPSERVER_OFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT_BUSY		; best effort; state is cleared either way
+	POP	AF			; A = the channel that was armed to listen
+	LD	HL,CH_STATE
+	ADD	A,L
+	LD	L,A
+	JR	NC,.idx_ok
+	INC	H
+.idx_ok
+	LD	(HL),0			; fully closed, not left at 3
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+.no_listen
 	LD	A,(MUX_ACTIVE)
 	AND	A
 	JR	Z,.done
@@ -339,6 +372,7 @@ F_CONNECT
 ; Function 6 - SEND (chunked at 2048 = ESP-AT CIPSEND cap)
 ; ======================================================
 F_SEND
+	CALL	SYNC_ACCEPT
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
@@ -351,7 +385,8 @@ F_SEND
 	CALL	CH_PEER_CLOSED		; sending on a closed link cannot succeed
 	JP	C,.closed_entry
 	LD	A,(ARG_CH)
-	LD	(TCP.LINK_ID),A		; the send routines address the link through it
+	CALL	TCP.SET_LINK_FROM_MAP	; the send routines address the link through it
+	JP	C,RET_STATE		; no mapped link: channel state is stale
 	CALL	SETUP_ASYNC_MODE	; arm/disarm suspendable mode from OPT_SLICE
 	; A suspended transaction resumes here; a fresh call while one is pending
 	; on the OTHER channel must not interleave AT text with it.
@@ -663,7 +698,28 @@ REBOOT_EVENT
 	XOR	A
 	CALL	TCP.MUX_LATCH_CLOSED
 	LD	A,1
-	JP	TCP.MUX_LATCH_CLOSED
+	CALL	TCP.MUX_LATCH_CLOSED
+	; The reboot also drops any AT+CIPSERVER and every link id it had handed
+	; out; forget LISTEN bookkeeping so a later STATUS/RECV does not report a
+	; channel as listening/accepted when nothing on the firmware side tracks
+	; it any more.
+	LD	HL,TCP.MUX_LINK_MAP
+	LD	(HL),0xFF
+	INC	HL
+	LD	(HL),0xFF
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CP	0xFF
+	RET	Z
+	LD	HL,CH_STATE
+	ADD	A,L
+	LD	L,A
+	JR	NC,.idx_ok
+	INC	H
+.idx_ok
+	LD	(HL),0
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	RET
 
 ; A bare CRLF is legitimately ignored by ESP-AT, so probe with a command that
 ; always answers when the module is listening at all.
@@ -675,6 +731,7 @@ MSG_CONN_SILENT	DB "connect failed: no ESP response",0
 ; Function 7 - RECV
 ; ======================================================
 F_RECV
+	CALL	SYNC_ACCEPT
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
@@ -738,8 +795,7 @@ F_RECV
 	LD	A,NERR_CANCEL
 	RET
 .closed
-	XOR	A
-	CALL	SET_CH_STATE
+	CALL	CH_RELEASE
 	CALL	BUILD_RECV_FLAGS
 	LD	DE,0
 	LD	A,NERR_CLOSED
@@ -791,6 +847,7 @@ BUILD_RECV_FLAGS
 ; Function 9 - STATUS
 ; ======================================================
 F_STATUS
+	CALL	SYNC_ACCEPT
 	CP	0xFF
 	JR	Z,.netstat
 	CALL	CHECK_CHANNEL
@@ -800,10 +857,21 @@ F_STATUS
 	CALL	GET_CH_STATE
 	AND	A
 	JR	Z,.notopen
+	CP	3
+	JR	Z,.listening		; armed, no peer yet: UNET_ST_LISTEN only
 	CALL	CH_PEER_CLOSED
 	JR	C,.notopen		; closed by the peer: no longer connected
 	LD	HL,RECV_FLAGS
 	SET	1,(HL)			; UNET_ST_CONN
+	CALL	GET_CH_STATE
+	CP	4
+	JR	NZ,.notopen
+	LD	HL,RECV_FLAGS
+	SET	3,(HL)			; UNET_ST_ACCEPT: inbound (LISTEN) connection
+	JR	.notopen
+.listening
+	LD	HL,RECV_FLAGS
+	SET	0,(HL)			; UNET_ST_LISTEN
 .notopen
 	; Report buffered-but-undelivered data so a consumer can tell "idle" from
 	; "there is something waiting on this channel". Memory only: STATUS never
@@ -1211,7 +1279,135 @@ F_SETOPT
 	RET
 
 ; ======================================================
-; Reserved slots 18..23
+; Function 18 - LISTEN (UNET_CAP_LISTEN)
+; A=channel, DE=local TCP port (binary, 1..65535). The channel must be closed
+; and no other channel already listening - the ESP has one server port at a
+; time. Starts AT+CIPSERVER and arms the channel to claim the next spontaneous
+; "<link>,CONNECT". STATUS is memory-only, so poll RECV on this channel to
+; progress the accept (see docs/UNETAPI.md).
+; ======================================================
+F_LISTEN
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	LD	(ARG_DE),DE
+	LD	A,(INITED)
+	AND	A
+	JP	Z,RET_STATE
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	SYNC_ACCEPT
+	CALL	GET_CH_STATE
+	AND	A
+	JP	NZ,RET_STATE		; channel must be closed
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CP	0xFF
+	JP	NZ,RET_STATE		; only one listening channel at a time
+	LD	HL,(ARG_DE)
+	LD	A,H
+	OR	L
+	JP	Z,RET_PARAM		; port 0 is not valid
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	CALL	ENSURE_MUX
+	JP	C,RET_BUSY
+	LD	A,(ARG_CH)
+	CALL	TCP.RX_DEFER_RESET_CH
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_CLEAR_CLOSED
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_LINK_MAP_ADDR
+	LD	(HL),0xFF
+	; Arm before transmitting: a peer can connect between AT+CIPSERVER=1's own
+	; OK and this function's return, and both wire parsers must be able to
+	; claim that CONNECT immediately, not just after this call unwinds.
+	LD	A,(ARG_CH)
+	LD	(TCP.MUX_LISTEN_CH),A
+	LD	HL,CMD_CIPSERVERMAXCONN
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	MUX_TX_COMMAND		; best effort: an ERROR here just leaves the
+					; firmware default (multiple concurrent accepts)
+	LD	HL,CMDBUILD
+	LD	DE,CMD_CIPSERVER_ON
+	CALL	APPEND_DE
+	PUSH	HL
+	LD	HL,(ARG_DE)
+	LD	DE,PORT_SCRATCH
+	CALL	UTIL.UTOA
+	POP	HL
+	LD	DE,PORT_SCRATCH
+	CALL	APPEND_DE
+	LD	DE,CMD_CRLF_STR
+	CALL	APPEND_DE
+	LD	HL,CMDBUILD
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	MUX_TX_COMMAND
+	JR	C,.fail
+	LD	HL,CMD_CIPSTO_0
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	MUX_TX_COMMAND		; best effort
+	LD	A,3
+	CALL	SET_CH_STATE
+	XOR	A
+	RET
+.fail
+	PUSH	AF
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	; A CONNECT racing the failed command may have claimed a link for this
+	; channel already; the channel stays closed, so forget that claim too
+	; (frames for the link then fall into the foreign-link discard path).
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_LINK_MAP_ADDR
+	LD	(HL),0xFF
+	CALL	CONSUME_CANCEL
+	JR	C,.cancelled
+	POP	AF
+	CP	RES_BUSY
+	JR	Z,.busy
+	LD	A,NERR_PROTO
+	RET
+.busy
+	LD	A,NERR_BUSY
+	OR	A
+	RET
+.cancelled
+	POP	AF
+	JP	RET_CANCEL
+
+; ======================================================
+; Function 19 - UNLISTEN (UNET_CAP_LISTEN)
+; A=channel, the currently listening one. Stops the server. An already
+; accepted connection (state 4) stays open as a normal channel - CLOSE closes
+; it for good; a still-waiting listener (state 3) returns to fully closed.
+; ======================================================
+F_UNLISTEN
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	CALL	SYNC_ACCEPT
+	LD	A,(TCP.MUX_LISTEN_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	JP	NZ,RET_STATE		; not the channel currently listening
+	CALL	CHECK_RX_ACTIVE
+	JP	C,RET_STATE
+	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
+	JP	C,RET_BUSY
+	LD	HL,CMD_CIPSERVER_OFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	MUX_TX_COMMAND		; best effort; state clears either way
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	CALL	GET_CH_STATE
+	CP	3
+	JR	NZ,.keep		; state 4 (accepted): leave the connection open
+	XOR	A
+	CALL	SET_CH_STATE
+.keep
+	XOR	A
+	RET
+
+; ======================================================
+; Reserved slots 20..23
 ; ======================================================
 F_NOTSUP
 	LD	A,NERR_NOTSUP
@@ -1303,17 +1499,82 @@ SET_CH_STATE
 	LD	(HL),A
 	RET
 
+; CH_STATE values: 0 closed, 1 TCP open, 2 UDP open, 3 listening (armed, no
+; peer yet), 4 accepted (an inbound peer is connected). 3/4 require
+; UNET_CAP_LISTEN; SYNC_ACCEPT promotes 3->4, CH_RELEASE demotes 4 back to 3.
+
+; Release the channel in ARG_CH back to closed - or, if it is the currently
+; armed listening channel, back to "listening" (state 3) instead of fully
+; closed, since the ESP-side AT+CIPSERVER is still running and will accept
+; another peer. Replaces the old unconditional "state = 0" on every close path.
+CH_RELEASE
+	LD	A,(ARG_CH)
+	CALL	TCP.MUX_LINK_MAP_ADDR
+	LD	(HL),0xFF		; this channel no longer owns a link
+	LD	A,(TCP.MUX_LISTEN_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	LD	A,0			; default: fully closed
+	JR	NZ,.set
+	LD	A,3			; the listening channel: re-arm, server still up
+.set
+	JP	SET_CH_STATE
+
+; Promote the listening channel (if any) from "listening" (state 3) to
+; "accepted" (state 4) once MUX_TRY_ACCEPT has claimed an inbound link for it.
+; Memory-only, matching the STATUS contract - it only reflects what the wire
+; parsers already recorded, never touches the UART. Called at the top of every
+; function that inspects or acts on channel state, so a CONNECT caught while
+; reading/sending on an unrelated channel is visible before that state is read.
+SYNC_ACCEPT
+	; Every caller reads A again right after this call (CHECK_CHANNEL, or
+	; F_STATUS's own CP 0xFF for the netstat form) - the whole function body
+	; runs behind one PUSH AF/POP AF so the caller's A always survives.
+	PUSH	AF
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CP	0xFF
+	JR	Z,.done			; nothing armed
+	CALL	.INDEX
+	LD	A,(HL)
+	CP	3
+	JR	NZ,.done		; already accepted, or state changed underneath
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CALL	TCP.MUX_LINK_MAP_ADDR
+	LD	A,(HL)
+	CP	0xFF
+	JR	Z,.done			; still waiting for a peer
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CALL	.INDEX
+	LD	(HL),4
+.done
+	POP	AF
+	RET
+.INDEX					; In: A = channel. Out: HL = &CH_STATE[A].
+	LD	HL,CH_STATE
+	ADD	A,L
+	LD	L,A
+	RET	NC
+	INC	H
+	RET
+
 ; Out: CF=1 when the peer already closed the selected channel.
 CH_PEER_CLOSED
 	LD	A,(ARG_CH)
 	JP	TCP.MUX_IS_CLOSED
 
 ; Forget every channel's state and buffered data. Used by NETINIT, where the
-; CIPCLOSE pair has really dropped any leftover socket.
+; CIPCLOSE (and CIPSERVER=0) pair above has really dropped any leftover
+; socket/server.
 RESET_CHANNEL_STATE
 	XOR	A
 	LD	(CH_STATE),A
 	LD	(CH_STATE+1),A
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	LD	HL,TCP.MUX_LINK_MAP
+	LD	(HL),0xFF
+	INC	HL
+	LD	(HL),0xFF
 	JP	TCP.RX_DEFER_RESET_ALL
 
 ; Re-arm AT+CIPMUX=1 if NETDONE handed the ESP back in single-connection mode.
@@ -1339,8 +1600,11 @@ CLOSE_CHANNEL
 	CALL	GET_CH_STATE
 	AND	A
 	RET	Z			; already closed: idempotent
+	CP	3
+	JR	Z,.close_listening	; armed, no peer yet: no link to CIPCLOSE
 	LD	A,(ARG_CH)
-	LD	(TCP.LINK_ID),A
+	CALL	TCP.SET_LINK_FROM_MAP
+	JR	C,.forget		; no mapped link: state was already stale
 	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
 	JR	C,.rx_busy		; never inject AT text into a partial +IPD payload
 	LD	HL,TCP.CMD_BUFFER
@@ -1366,12 +1630,21 @@ CLOSE_CHANNEL
 	LD	(TCP.MUX_ACCEPT_OK),A
 	LD	(TCP.MUX_ACCEPT_CLOSED),A
 .forget
-	XOR	A
-	CALL	SET_CH_STATE
+	CALL	CH_RELEASE
 	LD	A,(ARG_CH)
 	CALL	TCP.MUX_CLEAR_CLOSED
 	LD	A,(ARG_CH)
 	CALL	TCP.RX_DEFER_RESET_CH	; an explicit close discards buffered data
+	XOR	A
+	RET
+.close_listening
+	LD	HL,CMD_CIPSERVER_OFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	MUX_TX_COMMAND		; best effort; state clears either way
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	XOR	A
+	CALL	SET_CH_STATE
 	XOR	A
 	RET
 .tx_busy
@@ -1493,7 +1766,13 @@ OPEN_RETRY
 ; Out: CF=0 ok, CF=1 / A = ESP result code.
 MUX_OPEN
 	LD	A,(ARG_CH)
-	LD	(TCP.LINK_ID),A
+	; Prefers link==channel identity but yields it to an accepted inbound
+	; connection already squatting on that id (UNET_CAP_LISTEN); also sets
+	; TCP.LINK_ID.
+	CALL	TCP.MUX_ALLOC_LINK
+	; Reload: MUX_ALLOC_LINK returns A = the chosen link, not the channel
+	; (they usually match, but not when it fell back off identity).
+	LD	A,(ARG_CH)
 	CALL	TCP.RX_DEFER_RESET_CH	; a fresh link must not replay old data
 	LD	A,(ARG_CH)
 	CALL	TCP.MUX_CLEAR_CLOSED
@@ -2103,6 +2382,15 @@ CMD_CIPMUX1		DB "AT+CIPMUX=1",13,10,0
 CMD_CIPTCPOPT		DB "AT+CIPTCPOPT=5,-1,0,4000",13,10,0
 CMD_CIPCLOSE_ALL	DB "AT+CIPCLOSE=5",13,10,0
 CMD_CIPCLOSE_ONE	DB "AT+CIPCLOSE",13,10,0
+; LISTEN (UNET_CAP_LISTEN): AT+CIPSERVERMAXCONN caps concurrent inbound
+; connections at 1 - MUX_TRY_ACCEPT's own single-slot check is then a
+; defensive backstop, not the primary limit. CIPSTO=0 disables the server's
+; own inactivity close so an idle accepted connection is not torn down behind
+; the consumer's back.
+CMD_CIPSERVERMAXCONN	DB "AT+CIPSERVERMAXCONN=1",13,10,0
+CMD_CIPSERVER_ON	DB "AT+CIPSERVER=1,",0
+CMD_CIPSERVER_OFF	DB "AT+CIPSERVER=0",13,10,0
+CMD_CIPSTO_0		DB "AT+CIPSTO=0",13,10,0
 ; Multi-connection command fragments, assembled around the link digit.
 CMD_CIPSTART_PREFIX	DB "AT+CIPSTART=",0
 CMD_CIPCLOSE_PREFIX	DB "AT+CIPCLOSE=",0
@@ -2195,6 +2483,7 @@ PROBE_LEFT		DB 0
 PROBE_ROUNDS		EQU 5	; x (1.5 s wait + 0.5 s pause) = ~10 s patience
 PROBE_BYTE_TIMEOUT EQU 1500
 RECV_GOT		DW 0
+PORT_SCRATCH		DS 6,0		; decimal port digits for F_LISTEN's UTOA ("65535",0)
 	ENDMODULE
 
 ; ======================================================

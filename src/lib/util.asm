@@ -10,7 +10,13 @@
 
 	MODULE UTIL
 
+; dss_error.asm's message table is pulled in only for GET_CUR_DIR's error
+; reporting below; both are dead weight in the DLL build (UNET_DLL), which
+; never calls GET_CUR_DIR. Gating them together keeps every stock utility
+; that uses this file byte-identical.
+	IFNDEF UNET_DLL
 	include "dss_error.asm"
+	ENDIF
 
 ; ------------------------------------------------------
 ; Small delay
@@ -68,6 +74,7 @@ DELAY_100uS
 ;	Out: 	BC - length of string
 ; ------------------------------------------------------
 	;;IFUSED STRLEN
+	IFNDEF UNET_DLL
 STRLEN
 	PUSH	DE,HL,HL
 	LD		BC,MAX_BUFF_SIZE
@@ -83,6 +90,7 @@ STRLEN
 .STRL_NCOR
 	POP		HL,DE
 	RET
+	ENDIF
 	;ENDIF
 
 ; ------------------------------------------------------
@@ -114,6 +122,7 @@ STRCMP
 ; 	Inp: 	HL, DE - pointers to asciiz strings to compare
 ; 	Out: 	CF=0 - equal, CF=1 - not equal
 ; ------------------------------------------------------
+	IFNDEF UNET_DLL
 STRCMP_CI
 	PUSH	BC,DE,HL
 .NEXT
@@ -142,6 +151,7 @@ UPCASE
 	RET	NC
 	SUB	'a'-'A'
 	RET
+	ENDIF
 
 
 
@@ -152,6 +162,7 @@ UPCASE
 ; Out: ZF=0 - not equal, ZF=1 - equal
 ; ------------------------------------------------------
 	;IFUSED STRNCMP
+	IFNDEF UNET_DLL
 STRNCMP
 	PUSH	HL,DE,BC
 .STRN_NXT
@@ -170,6 +181,7 @@ STRNCMP
 .STRN_NE
 	POP 	BC,DE,HL
     RET
+	ENDIF
 	;ENDIF
 
 ; ------------------------------------------------------
@@ -203,6 +215,7 @@ STARTSWITH
 ; Out: HL - points to first non space symbol
 ; ------------------------------------------------------
 	;;IFUSED	LTRIM
+	IFNDEF UNET_DLL
 LTRIM
 	LD	A, (HL)
 	OR	A
@@ -211,6 +224,7 @@ LTRIM
 	RET P
 	INC HL
 	JR	LTRIM
+	ENDIF
 	;;ENDIF
 
 ; ------------------------------------------------------
@@ -308,6 +322,7 @@ DIV_10:
 ;	Out:	DE - address of strinf
 ; ------------------------------------------------------
 	;;IFUSED	FAST_UTOA
+	IFNDEF UNET_DLL
 FAST_UTOA
 	LD		BC,0+256
 	PUSH 	BC
@@ -379,6 +394,7 @@ FAST_UTOA
 	INC		DE
 
 	JR 		.LEADING_ZEROES
+	ENDIF
 	;;ENDIF
 
 ; ------------------------------------------------------
@@ -389,6 +405,7 @@ FAST_UTOA
 ;		  	CF=1 - Not found
 ; ------------------------------------------------------
 	;;IFUSED	STRCHR
+	IFNDEF UNET_DLL
 STRCHR
 	PUSH	BC
 .STCH_NEXT
@@ -405,6 +422,7 @@ STRCHR
 .STCH_FOUND
 	POP		BC
 	RET
+	ENDIF
 	;;ENDIF
 
 ; ------------------------------------------------------
@@ -413,6 +431,7 @@ STRCHR
 ;	Out: (DE)
 ; ------------------------------------------------------
 	;;IFUSED HEXB
+	IFNDEF UNET_DLL
 HEXB
 	LD		A,C
 	RRA
@@ -431,6 +450,7 @@ HEXB
 	LD		(DE), A
 	INC		DE
 	RET
+	ENDIF
 	;;ENDIF
 
 
@@ -439,6 +459,7 @@ HEXB
 ;  Inp: HP - pointer to buffer for path
 ; ----------------------------------------------------
 
+	IFNDEF UNET_DLL
 GET_CUR_DIR
 	PUSH    HL
 	LD      C, DSS_CURDISK
@@ -482,6 +503,7 @@ ADD_BACK_SLASH
     INC     HL
     LD      (HL),0x0
     RET
+	ENDIF
 
 	ENDMODULE
 

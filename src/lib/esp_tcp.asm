@@ -64,10 +64,21 @@ TCP_MUX_CHANNELS	EQU 2	; channels this build demultiplexes (ESP-AT allows 0..4)
 TCP_MUX_MAX_LINK	EQU 4	; highest link id accepted from an ESP-AT header
 RES_AGAIN		EQU 20	; send suspended on link silence (ASYNC_MODE only):
 				; resume with SEND_BUFFER_RESUME, nothing was lost
+RES_CONN_EVT		EQU 21	; WAIT_IPD_HEADER_MUX matched a spontaneous
+				; "<link>,CONNECT" while a channel is listening
+				; (UNET_CAP_LISTEN). MUX_CONNECT_LINK holds the
+				; link id (0xFF if no digit prefix was seen).
 	ENDIF
 
 	MODULE TCP
 
+; The single-connection OPEN/TX_CMD_BUSY_RETRY/CLOSE/RECEIVE/WAIT_IPD_HEADER/
+; READ_IPD_LEN/SKIP_IPD_FRAME family below is dead weight in an ESP_TCP_MUX
+; build: MUX_OPEN/MUX_WAIT_SEND_OK/RECEIVE_MUX/WAIT_IPD_HEADER_MUX replace it
+; end to end. Gating it here (rather than deleting it) keeps every
+; single-connection app (ftp/wget/tftp/etc, which never define ESP_TCP_MUX)
+; byte-identical while freeing image bytes for the mux-only UNETESP.DLL build.
+	IFNDEF ESP_TCP_MUX
 ; ------------------------------------------------------
 ; Open a single TCP connection.
 ; In: HL - host ASCIIZ, DE - port ASCIIZ.
@@ -149,6 +160,7 @@ CLOSE
 	RET	Z
 	SCF
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Send a raw TCP payload.
@@ -174,9 +186,11 @@ SEND_BUFFER
 ;   before ESP prints SEND OK. Waiting for SEND OK as text can consume +IPD
 ;   payload, so such callers should scan for +IPD themselves after this call.
 ; ------------------------------------------------------
+	IFNDEF ESP_TCP_MUX
 SEND_BUFFER_NO_WAIT
 	CALL	START_SEND_BUFFER
 	RET
+	ENDIF
 
 	IFDEF ESP_TCP_MUX
 ; ------------------------------------------------------
@@ -285,6 +299,7 @@ START_SEND_BUFFER
 	SCF
 	RET
 
+	IFNDEF ESP_TCP_MUX
 ; ------------------------------------------------------
 ; Receive one +IPD payload block.
 ; In: HL - destination buffer, BC - max stored bytes, DE - timeout ms.
@@ -388,6 +403,7 @@ RECEIVE
 .DONE
 	CALL	ISA.ISA_CLOSE
 	RET
+	ENDIF
 
 ; CF=0 when there is enough caller buffer left to consume another full
 ; ESP active +IPD block without returning to slow DSS/file code.
@@ -626,7 +642,8 @@ WAIT_SEND_OK
 	CALL	UTIL.STRCMP
 	JR	C,.NOT_CLOSED
 	LD	A,(MUX_LINE_LINK)
-	CALL	MUX_LATCH_CLOSED
+	CALL	MAP_LINK_TO_CH		; MUX_LATCH_CLOSED indexes MUX_CLOSED_MASK by
+	CALL	MUX_LATCH_CLOSED	; channel, not by raw firmware link id
 	LD	A,(MUX_ACCEPT_CLOSED)
 	AND	A
 	JP	Z,.RESTART
@@ -720,11 +737,17 @@ WAIT_SEND_OK
 	JP	.RESTART
 .MARK_CONNECT
 	; Only the requested link is evidence for this recovery/open. A foreign
-	; CONNECT must neither complete CIPSTART nor poison the recovery flag.
+	; CONNECT must neither complete CIPSTART nor poison the recovery flag -
+	; but it may be an inbound accept arriving in this command window, so
+	; offer it to LISTEN before restarting the line loop.
 	LD	A,(MUX_LINE_LINK)
 	LD	HL,LINK_ID
 	CP	(HL)
-	JP	NZ,.RESTART
+	JR	Z,.MARK_CONNECT_OWN
+	LD	A,(MUX_LINE_LINK)
+	CALL	MUX_TRY_ACCEPT
+	JP	.RESTART
+.MARK_CONNECT_OWN
 	LD	HL,WSO_FLAGS
 	SET	3,(HL)
 	LD	A,(MUX_ACCEPT_CONNECT)
@@ -819,6 +842,7 @@ WAIT_SEND_OK
 	SCF
 	RET
 
+	IFNDEF ESP_TCP_MUX
 ; ------------------------------------------------------
 ; SKIP_IPD_FRAME: consume the "<len>[,<ip>,<port>]:<payload>" suffix
 ; of a "+IPD," frame whose 5-byte prefix has already been read from
@@ -894,6 +918,7 @@ SKIP_IPD_FRAME
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+	ENDIF
 
 	IFDEF ESP_TCP_RX_DEFER
 ; ======================================================
@@ -1076,6 +1101,7 @@ DEFER_STORE_FRAME
 	SCF				; timeout while discarding
 	RET
 
+	IFNDEF ESP_TCP_MUX
 ; Capture a +IPD frame whose "+IPD," prefix was already consumed, parsing the
 ; "<len>[,ip,port]:" header exactly like SKIP_IPD_FRAME, then storing the
 ; payload. Called from the SEND-side prompt/SEND-OK waits.
@@ -1170,6 +1196,7 @@ CAPTURE_PENDING_PAYLOAD
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+	ENDIF
 
 ; Copy min(DEFER_FRAME_LEFT, RECV_REMAIN) bytes from the current defer read
 ; point into the caller buffer, updating all cursors. Pure memory move.
@@ -1401,7 +1428,9 @@ MUX_READ_DEC
 
 ; Parse "<link>,<len>:" (or "<link>,<len>,<ip>,<port>:" if CIPDINFO=1 was left
 ; on) after the "+IPD," prefix has been consumed.
-; Out: CF=0, MUX_FRAME_LINK / MUX_FRAME_LEN set. CF=1/A=result code on error.
+; Out: CF=0, MUX_FRAME_LINK = owning CHANNEL (already mapped through
+; MAP_LINK_TO_CH; 0xFF if the link belongs to neither channel) / MUX_FRAME_LEN
+; set. CF=1/A=result code on error.
 MUX_PARSE_IPD_HDR
 	CALL	MUX_READ_DEC
 	RET	C
@@ -1411,6 +1440,7 @@ MUX_PARSE_IPD_HDR
 	LD	A,L
 	CP	TCP_MUX_MAX_LINK+1
 	JR	NC,.BAD
+	CALL	MAP_LINK_TO_CH
 	LD	(MUX_FRAME_LINK),A
 	LD	A,(MUX_DELIM)
 	CP	','
@@ -1514,6 +1544,192 @@ RX_DEFER_RESET_ALL
 	LD	(MUX_CLOSED_MASK),A
 	LD	A,0xFF
 	LD	(MUX_PAYLOAD_LINK),A
+	RET
+
+; ------------------------------------------------------
+; LISTEN link<->channel mapping (UNET_CAP_LISTEN). Every wire-level "link"
+; parsed off the ESP is translated to a "channel" through here before it
+; reaches channel-space code (RECEIVE_MUX, MUX_LATCH_CLOSED, ...): normally
+; link==channel (the identity the rest of this file assumed before LISTEN
+; existed), but an accepted inbound connection can land on any free firmware
+; link id, so MUX_LINK_MAP records the actual mapping once one is chosen.
+; ------------------------------------------------------
+; In: A = channel (0..TCP_MUX_CHANNELS-1). Out: HL = &MUX_LINK_MAP[channel].
+MUX_LINK_MAP_ADDR
+	LD	HL,MUX_LINK_MAP
+	LD	D,0
+	LD	E,A
+	ADD	HL,DE
+	RET
+
+; In: A = firmware link id. Out: A = channel owning it, or 0xFF if none does.
+; A link present in MUX_LINK_MAP always resolves to its owner. A link absent
+; from the map falls back to identity (link==channel) when the link itself is
+; a valid channel index - the common case, since MUX_ALLOC_LINK keeps that
+; identity whenever it is free - and to 0xFF otherwise (a genuinely foreign
+; link, or a channel-range id some OTHER channel does not currently hold).
+MAP_LINK_TO_CH
+	PUSH	BC,DE,HL
+	LD	E,A			; E = link to find
+	LD	HL,MUX_LINK_MAP
+	LD	D,0			; D = channel index while scanning
+.scan
+	LD	A,D
+	CP	TCP_MUX_CHANNELS
+	JR	NC,.fallback
+	LD	A,(HL)
+	CP	E
+	JR	Z,.found
+	INC	HL
+	INC	D
+	JR	.scan
+.found
+	LD	A,D
+	POP	HL,DE,BC
+	RET
+.fallback
+	LD	A,E
+	CP	TCP_MUX_CHANNELS
+	JR	NC,.none
+	; Identity is only trustworthy while channel E itself is unmapped: if
+	; channel E is bound to a DIFFERENT link (its inbound accept landed on a
+	; foreign id), a stray wire id E must not resolve to that live channel.
+	CALL	MUX_LINK_MAP_ADDR	; A==E on entry; E itself survives the call
+	LD	A,(HL)
+	CP	0xFF
+	JR	NZ,.none
+	LD	A,E
+	POP	HL,DE,BC
+	RET				; A = E: identity, unclaimed by any channel
+.none
+	LD	A,0xFF
+	POP	HL,DE,BC
+	RET
+
+; Choose the firmware link id for a channel about to CIPSTART, preferring
+; identity (link==channel) and falling back to the first id 0..TCP_MUX_MAX_LINK
+; not already claimed by MUX_LINK_MAP (an accepted inbound connection may be
+; squatting on this channel's identity slot). Writes both MUX_LINK_MAP[channel]
+; and TCP.LINK_ID.
+; In: A = channel about to open (currently closed).
+MUX_ALLOC_LINK
+	PUSH	BC,DE,HL
+	; C, not D, holds "channel" here: MUX_LINK_MAP_ADDR clobbers D/E (it uses
+	; them as the 16-bit offset for ADD HL,DE), so D cannot survive a call to
+	; it. .claimed below preserves the whole BC pair around its own DJNZ use
+	; of B, so C survives every call in this routine.
+	LD	C,A			; C = channel
+	; Release whatever this channel held before opening (a stale identity
+	; left over from its own last open/close), so re-opening the same channel
+	; still prefers identity instead of tripping over its own old entry.
+	CALL	MUX_LINK_MAP_ADDR
+	LD	(HL),0xFF
+	LD	E,C			; E = candidate link, starts at identity
+	CALL	.claimed
+	JR	NC,.have		; identity is free
+	XOR	A
+.try
+	LD	E,A
+	CALL	.claimed
+	JR	NC,.have
+	INC	A
+	CP	TCP_MUX_MAX_LINK+1
+	JR	C,.try
+	; Exhausted 0..TCP_MUX_MAX_LINK (should not happen: CIPSERVERMAXCONN=1
+	; plus our own channel count bound the concurrent link count well under
+	; that range) - fall back to identity rather than leaving LINK_ID stale.
+	LD	E,C
+.have
+	LD	B,E			; B = chosen link: MUX_LINK_MAP_ADDR is about
+					; to clobber E (only visible off-identity,
+					; where E differs from the channel in C)
+	LD	A,C
+	CALL	MUX_LINK_MAP_ADDR
+	LD	(HL),B
+	LD	A,B
+	LD	(LINK_ID),A
+	POP	HL,DE,BC
+	RET
+; In: E = candidate link. Out: CF=1 if some channel's map entry already
+; equals E. Preserves BC (incl. the caller's C = channel), D/E.
+.claimed
+	PUSH	AF,BC,DE
+	LD	HL,MUX_LINK_MAP
+	LD	B,TCP_MUX_CHANNELS
+.cloop
+	LD	A,(HL)
+	CP	E
+	JR	Z,.yes
+	INC	HL
+	DJNZ	.cloop
+	POP	DE,BC,AF
+	OR	A			; CF=0
+	RET
+.yes
+	POP	DE,BC,AF
+	SCF
+	RET
+
+; In: A = channel (already validated open). Out: TCP.LINK_ID = the channel's
+; mapped link; CF=1/A=RES_ERROR if the channel has no mapped link (should not
+; happen for a channel MUX_ALLOC_LINK/MUX_TRY_ACCEPT actually opened, but an
+; AT+CIPCLOSE/CIPSEND must never fire with a stale/garbage link digit).
+SET_LINK_FROM_MAP
+	CALL	MUX_LINK_MAP_ADDR
+	LD	A,(HL)
+	CP	0xFF
+	JR	Z,.none
+	LD	(LINK_ID),A
+	XOR	A
+	RET
+.none
+	LD	A,RES_ERROR
+	SCF
+	RET
+
+; Claim a spontaneous "<link>,CONNECT" for the armed listening channel.
+; Silently ignored (not an error) when disarmed, the link looks wrong (no
+; digit prefix, or out of the firmware's id range), the link is already
+; claimed by some channel's map entry (a stray repeat, or a foreign link that
+; happens to share a digit), or this listening channel already has an
+; accepted connection (CIPSERVERMAXCONN=1 keeps this a defensive check, not
+; the primary limit).
+; In: A = link id claiming CONNECT (0xFF if no digit prefix was seen).
+MUX_TRY_ACCEPT
+	PUSH	AF,BC,HL
+	CP	0xFF
+	JR	Z,.done
+	CP	TCP_MUX_MAX_LINK+1
+	JR	NC,.done
+	LD	C,A			; C = candidate link
+	LD	A,(MUX_LISTEN_CH)
+	CP	0xFF
+	JR	Z,.done
+	LD	B,A			; B = listening channel
+	CALL	MUX_LINK_MAP_ADDR
+	LD	A,(HL)
+	CP	0xFF
+	JR	NZ,.done		; already has an accepted connection
+	LD	HL,MUX_LINK_MAP
+	LD	A,(HL)
+	CP	C
+	JR	Z,.done
+	INC	HL
+	LD	A,(HL)
+	CP	C
+	JR	Z,.done
+	LD	A,B
+	CALL	MUX_LINK_MAP_ADDR
+	LD	(HL),C
+	; A fresh accepted connection must not replay a previous one's stale
+	; peer-close latch or buffered payload (LISTEN can re-arm the same
+	; channel many times).
+	LD	A,B
+	CALL	MUX_CLEAR_CLOSED
+	LD	A,B
+	CALL	RX_DEFER_RESET_CH
+.done
+	POP	HL,BC,AF
 	RET
 
 ; ------------------------------------------------------
@@ -1782,15 +1998,19 @@ MUX_LINE_STRIP
 	RET
 
 ; ------------------------------------------------------
-; Scan the UART stream for "+IPD," or "<link>,CLOSED".
+; Scan the UART stream for "+IPD,", "<link>,CLOSED", or - only while a channel
+; is listening (UNET_CAP_LISTEN) - a spontaneous "<link>,CONNECT".
 ; Out: CF=0 on a +IPD header (prefix consumed).
 ;      CF=1/A=RES_NOT_CONN on a close notification, MUX_CLOSED_LINK = link id
 ;      (0xFF when the stream carried no "<digit>," prefix).
+;      CF=1/A=RES_CONN_EVT on an inbound CONNECT, MUX_CONNECT_LINK = link id.
 ;      CF=1/A=RES_RS_TIMEOUT on timeout.
 ; ------------------------------------------------------
 WAIT_IPD_HEADER_MUX
 	LD	IX,IPD_PREFIX
 	LD	IY,CLOSED_PREFIX
+	LD	HL,MSG_CONNECT_LN
+	LD	(MUX_CONN_PTR),HL
 	LD	A,0xFF
 	LD	(MUX_CAND),A
 	XOR	A
@@ -1798,12 +2018,17 @@ WAIT_IPD_HEADER_MUX
 	LD	(MUX_B2),A
 .NEXT
 	CALL	READ_BYTE_RECV_TIMEOUT_OPEN
-	JR	C,.TIMEOUT
+	JP	C,.TIMEOUT
 	LD	E,A
-	; "CLOSED" starts only at a 'C', so the link id, if any, is the digit two
-	; bytes back. Snapshot it there and keep a two-byte history.
+	; "CLOSED"/"CONNECT" both start only at a 'C', so the link id, if any, is
+	; the digit two bytes back. Compute that into the PENDING slot from the
+	; pre-shift history, then shift; a later fresh-start match commits it into
+	; MUX_CAND. Splitting compute (here, unconditional on every 'C') from
+	; commit (only at a confirmed match start) matters because "CONNECT" has
+	; a SECOND 'C' at position 5 ("conNECt") that must not recompute the
+	; candidate mid-match and clobber the one captured at the real start.
 	CP	'C'
-	CALL	Z,MUX_SNAP_CAND
+	CALL	Z,MUX_SNAP_PENDING
 	CALL	MUX_SHIFT_BYTES
 	LD	A,(IX+0)
 	CP	E
@@ -1824,18 +2049,69 @@ WAIT_IPD_HEADER_MUX
 	LD	A,(IY+0)
 	CP	E
 	JR	NZ,.CLOSED_RESET
+	; "CLOSED" has exactly one 'C', at position 0, so A==E=='C' here can only
+	; mean CLOSED itself is starting fresh - but this same byte can also be
+	; CONNECT's own internal 'C' (position 5, "conNECt") while a CONNECT match
+	; is genuinely in progress; MAYBE_COMMIT_CLOSED suppresses the commit then.
+	CP	'C'
+	CALL	Z,MAYBE_COMMIT_CLOSED
 	INC	IY
 	LD	A,(IY+0)
 	AND	A
 	JR	Z,.CLOSED
-	JR	.NEXT
+	JR	.CHECK_CONNECT
 .CLOSED_RESET
 	LD	IY,CLOSED_PREFIX
 	LD	A,E
 	CP	'C'
-	JR	NZ,.NEXT
+	JR	NZ,.CHECK_CONNECT
+	CALL	MAYBE_COMMIT_CLOSED
 	INC	IY
+	; fall through: CLOSED and CONNECT share their first letter, so both
+	; matchers must see this byte.
+.CHECK_CONNECT
+	; Disarmed is the overwhelmingly common case (every byte outside a
+	; LISTEN session): one flag test and back to .NEXT.
+	LD	A,(MUX_LISTEN_CH)
+	CP	0xFF
+	JR	Z,.NEXT
+	LD	HL,(MUX_CONN_PTR)
+	LD	A,(HL)
+	CP	E
+	JR	NZ,.CONN_RESET
+	; Unlike CLOSED, "CONNECT" has a SECOND 'C' at position 5 ("conNECt"), so
+	; "byte == 'C'" alone cannot tell a fresh start from mid-match progress:
+	; compare the pointer itself against the string's own first byte.
+	LD	A,H
+	CP	HIGH MSG_CONNECT_LN
+	JR	NZ,.CONN_ADVANCE
+	LD	A,L
+	CP	LOW MSG_CONNECT_LN
+	JR	NZ,.CONN_ADVANCE
+	CALL	MUX_COMMIT_CAND
+.CONN_ADVANCE
+	INC	HL
+	LD	(MUX_CONN_PTR),HL
+	LD	A,(HL)
+	AND	A
+	JR	Z,.CONNECT_HIT
 	JR	.NEXT
+.CONN_RESET
+	LD	HL,MSG_CONNECT_LN
+	LD	A,E
+	CP	'C'
+	JR	NZ,.CONN_STORE
+	CALL	MUX_COMMIT_CAND
+	INC	HL
+.CONN_STORE
+	LD	(MUX_CONN_PTR),HL
+	JP	.NEXT
+.CONNECT_HIT
+	LD	A,(MUX_CAND)
+	LD	(MUX_CONNECT_LINK),A
+	LD	A,RES_CONN_EVT
+	SCF
+	RET
 .OK
 	XOR	A
 	RET
@@ -1850,8 +2126,13 @@ WAIT_IPD_HEADER_MUX
 	SCF
 	RET
 
-; Preserve E, IX and IY: both helpers run inside the scan loop.
-MUX_SNAP_CAND
+; Compute the digit two bytes back from the 'C' just read (pre-shift history)
+; into MUX_PENDING_CAND. Called unconditionally on every 'C', including
+; "CONNECT"'s internal one at position 5 - MUX_COMMIT_CAND is what actually
+; publishes a value to MUX_CAND, only at a confirmed match start, so an
+; internal 'C' recomputing PENDING here is harmless: nothing has read it yet.
+; Preserve E, IX and IY: this runs inside the scan loop.
+MUX_SNAP_PENDING
 	LD	A,(MUX_B2)
 	CP	','
 	JR	NZ,.NONE
@@ -1861,12 +2142,35 @@ MUX_SNAP_CAND
 	CP	'9'+1
 	JR	NC,.NONE
 	SUB	'0'
-	LD	(MUX_CAND),A
+	LD	(MUX_PENDING_CAND),A
 	RET
 .NONE
 	LD	A,0xFF
+	LD	(MUX_PENDING_CAND),A
+	RET
+
+; Publish the last computed PENDING candidate as MUX_CAND. Called only where
+; a match is confirmed to be starting fresh at position 0.
+MUX_COMMIT_CAND
+	LD	A,(MUX_PENDING_CAND)
 	LD	(MUX_CAND),A
 	RET
+
+; CLOSED's own fresh-start detection ("IY at position 0 and this byte is 'C'")
+; cannot by itself tell a real "<link>,CLOSED" start from CONNECT's internal
+; 'C' at position 5, because IY keeps returning to position 0 on every byte
+; that fails to continue "CLOSED" (which every byte of "CONNECT" does). Only
+; commit when CONNECT is not genuinely mid-match, i.e. MUX_CONN_PTR is still
+; sitting at its own start.
+MAYBE_COMMIT_CLOSED
+	LD	HL,(MUX_CONN_PTR)
+	LD	A,H
+	CP	HIGH MSG_CONNECT_LN
+	RET	NZ
+	LD	A,L
+	CP	LOW MSG_CONNECT_LN
+	RET	NZ
+	JP	MUX_COMMIT_CAND
 
 MUX_SHIFT_BYTES
 	LD	A,(MUX_B2)
@@ -1951,7 +2255,7 @@ RECEIVE_MUX
 	JR	Z,.OWN_FRAME
 	CALL	MUX_STASH_FRAME
 	JP	C,.FAIL_STORED
-	JR	.RETURN_STORED		; hand control back; caller switches channel
+	JP	.RETURN_STORED		; hand control back; caller switches channel
 .OWN_FRAME
 	LD	HL,(MUX_FRAME_LEN)
 	LD	(PAYLOAD_LEFT),HL
@@ -1959,7 +2263,7 @@ RECEIVE_MUX
 	LD	(MUX_PAYLOAD_LINK),A
 .CONTINUE_PAYLOAD
 	CALL	READ_PAYLOAD
-	JR	C,.FAIL_STORED
+	JP	C,.FAIL_STORED
 	LD	HL,(PAYLOAD_LEFT)
 	LD	A,H
 	OR	L
@@ -1989,8 +2293,15 @@ RECEIVE_MUX
 	PUSH	AF
 	CP	RES_NOT_CONN
 	JR	Z,.SCAN_FAIL_CLOSED
+	CP	RES_CONN_EVT
+	JR	Z,.SCAN_FAIL_CONNECT
 	POP	AF
 	JR	.FAIL_STORED
+.SCAN_FAIL_CONNECT
+	POP	AF
+	LD	A,(MUX_CONNECT_LINK)
+	CALL	MUX_TRY_ACCEPT
+	JP	.SCAN			; resume scanning; RECV_TIMEOUT already restored
 .SCAN_FAIL_CLOSED
 	POP	AF
 	; fall through
@@ -2000,7 +2311,11 @@ RECEIVE_MUX
 	JR	NZ,.HAVE_LINK
 	LD	A,(RECV_CH)		; unlabelled CLOSED: assume it is ours
 	LD	(MUX_CLOSED_LINK),A
+	JR	.LATCH
 .HAVE_LINK
+	CALL	MAP_LINK_TO_CH		; wire-level link -> channel-space, so the
+	LD	(MUX_CLOSED_LINK),A	; RECV_CH compare below matches correctly
+.LATCH
 	CALL	MUX_LATCH_CLOSED
 	LD	A,(MUX_CLOSED_LINK)
 	LD	HL,RECV_CH
@@ -2041,6 +2356,7 @@ RECEIVE_MUX
 	RET
 	ENDIF
 
+	IFNDEF ESP_TCP_MUX
 ; ------------------------------------------------------
 ; Read one CR/LF-terminated line into LINE_BUFFER.
 ; ------------------------------------------------------
@@ -2198,6 +2514,7 @@ READ_IPD_LEN
 	LD	A,RES_ERROR
 	SCF
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Consume payload bytes and store up to RECV_REMAIN bytes.
@@ -2346,9 +2663,15 @@ SEND_STATE_RESET
 	RET
 	ENDIF
 
+; Dead code with no caller left in either build (single-conn RECEIVE used it;
+; RECEIVE_MUX reads through READ_BYTE_RECV_TIMEOUT_OPEN instead). Kept behind
+; the same gate as its former only caller rather than deleted outright, so a
+; future single-connection addition can still find it here.
+	IFNDEF ESP_TCP_MUX
 READ_BYTE_RECV_TIMEOUT
 	LD	BC,(RECV_TIMEOUT)
 	JP	READ_BYTE_TIMEOUT
+	ENDIF
 
 ; Read one UART byte while the ISA window is open, with a caller-supplied
 ; millisecond timeout in BC.
@@ -2647,14 +2970,18 @@ APPEND_IX_STR
 	INC	IX
 	JR	APPEND_IX_STR
 
+	IFNDEF ESP_TCP_MUX
 CMD_CIPSTART_PREFIX
 	DB	"AT+CIPSTART=",34,"TCP",34,",",34,0
 CMD_CIPSTART_MIDDLE
 	DB	34,",",0
+	ENDIF
 CMD_CIPSEND_PREFIX
 	DB	"AT+CIPSEND=",0
+	IFNDEF ESP_TCP_MUX
 CMD_CIPCLOSE
 	DB	"AT+CIPCLOSE",13,10,0
+	ENDIF
 CMD_CRLF
 	DB	13,10,0
 	IFDEF ESP_TCP_MUX
@@ -2683,8 +3010,10 @@ MSG_ERROR
 MSG_FAIL
 	DB	"FAIL",0
 
+	IFNDEF ESP_TCP_MUX
 PTR_HOST	DW 0
 PTR_PORT	DW 0
+	ENDIF
 SEND_PTR	DW 0
 SEND_LEN	DW 0
 RECV_PTR	DW 0
@@ -2693,10 +3022,12 @@ RECV_TIMEOUT	DW 0
 RECV_FULL_TIMEOUT DW 0
 RECV_STORED	DW 0
 PAYLOAD_LEFT	DW 0
+	IFNDEF ESP_TCP_MUX
 LAST_IPD_LEN	DW 0
 IPD_REMOTE_LEN	DW 0
 IPD_HAVE_REMOTE_LEN DB 0
 IPD_BAD_CHAR	DB 0
+	ENDIF
 LAST_LSR	DB 0
 LSR_ACCUM	DB 0
 
@@ -2727,10 +3058,12 @@ DIAG_END
 
 LINE_REMAIN	DB 0
 
+	IFNDEF ESP_TCP_MUX
 ; TX_CMD_BUSY_RETRY state
 BUSY_CMD	DW 0
 BUSY_TIMEOUT	DW 0
 BUSY_LEFT	DB 0
+	ENDIF
 
 ; Pointer into IPD_PREFIX while WAIT_SEND_OK is incrementally checking
 ; whether the line being accumulated starts with "+IPD,". Set to zero
@@ -2770,8 +3103,9 @@ MUX_FRAME_LEN	DW 0		; payload length of that header
 MUX_PAYLOAD_LINK DB 0xFF	; owner of the live, partially read payload
 MUX_CLOSED_LINK	DB 0xFF		; link id from the last CLOSED notification
 MUX_CLOSED_MASK	DB 0		; latched peer closes, one bit per channel
-MUX_CAND	DB 0xFF		; link digit seen just before a candidate CLOSED
-MUX_B1		DB 0		; two-byte history feeding MUX_CAND
+MUX_CAND	DB 0xFF		; link digit committed at the last confirmed match start
+MUX_PENDING_CAND DB 0xFF	; MUX_SNAP_PENDING's scratch; see MUX_COMMIT_CAND
+MUX_B1		DB 0		; two-byte history feeding MUX_SNAP_PENDING
 MUX_B2		DB 0
 MUX_LINE_PTR	DW 0		; response line with any "<link>," prefix removed
 MUX_LINE_LINK	DB 0xFF		; link id of that prefix (0xFF when absent)
@@ -2791,6 +3125,13 @@ ASYNC_PEND	DB 0		; 0 idle / 1 awaiting '>' / 2 awaiting SEND OK
 PROMPT_RESUME	DB 0		; WAIT_PROMPT must restore PROMPT_STATE on entry
 PROMPT_STATE	DW 0		; saved "+IPD," prefix-match pointer
 WSO_RESUME	DB 0		; WAIT_SEND_OK must resume its partial line
+; LISTEN state (UNET_CAP_LISTEN). A firmware link id is not the same number
+; space as our channel index once an inbound connection can land on any free
+; id 0..TCP_MUX_MAX_LINK; MUX_LINK_MAP is the one place that reconciles them.
+MUX_LINK_MAP	DS TCP_MUX_CHANNELS,0xFF	; channel -> firmware link id
+MUX_LISTEN_CH	DB 0xFF		; channel currently armed to accept, 0xFF = none
+MUX_CONNECT_LINK DB 0xFF	; link id from the last scanner CONNECT match
+MUX_CONN_PTR	DW 0		; WAIT_IPD_HEADER_MUX's "CONNECT" match cursor
 	ENDIF
 
 	IFNDEF	ESP_TCP_BSS_BASE_OVERRIDE

@@ -2211,7 +2211,6 @@ TN_PEER_SEEN	DB 0			; peer emitted IAC: Telnet rather than raw TCP/PTY
 TN_BINARY_SENT	DB 0			; binary negotiation queued once after first peer IAC
 NEG_LEN		DB 0
 TX_BUF		DB 0,0
-NEG_BUF		DS NEG_BUF_SIZE,0
 
 ; --- ANSI emulator state ---
 CUR_ROW		DB 0			; cursor row 0..TERM_ROWS-1
@@ -2254,6 +2253,14 @@ NETCFG_BSS_BASE	EQU WIN2_BASE
 	DEFINE ESP_TCP_BSS_BASE_OVERRIDE
 ESP_TCP_BSS_BASE	EQU WIN2_BASE
 
+	; TELNET's AT vocabulary is narrow (AT/ATE0/CIPMUX/CIPSTART/CIPMODE and a
+	; handful of recover/cleanup commands) - short OK/ERROR/CONNECT replies
+	; only, never a CWLAP-style scan - so the shared 192-byte RS_BUFF is more
+	; than this client ever needs. Halving it reclaims WIN1 space for the
+	; larger Y/Zmodem code (see TELNET_BSS_END below).
+	DEFINE RS_BUFF_SIZE_OVERRIDE
+RS_BUFF_SIZE	EQU 96
+
 	DEFINE WCOMMON_USE_NETCFG
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
@@ -2273,7 +2280,13 @@ ESP_TCP_BSS_BASE	EQU WIN2_BASE
 HOST_BUFF	EQU WIFI.RS_BUFF + RS_BUFF_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_SIZE
 RECV_BUFFER	EQU PORT_BUFF + PORT_SIZE
-TELNET_BSS_END	EQU RECV_BUFFER + RECV_BUFFER_SIZE
+; NEG_BUF used to be a `DS NEG_BUF_SIZE,0` embedded in the code image (both
+; wasting 96 bytes of EXE file and pushing WIFI.RS_BUFF, and everything
+; chained after it, 96 bytes higher). Its content past NEG_LEN is never read
+; (QUEUE_CMD/QUEUE_BYTES/NEG_PUT_BYTE always write before FLUSH_NEG reads),
+; so it needs no zero-fill: a runtime-only label here is enough.
+NEG_BUF		EQU RECV_BUFFER + RECV_BUFFER_SIZE
+TELNET_BSS_END	EQU NEG_BUF + NEG_BUF_SIZE
 	ASSERT	TELNET_BSS_END < STACK_TOP - 0x0100
 
 	ENDMODULE

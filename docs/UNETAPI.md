@@ -145,7 +145,9 @@ Register discipline for every UNET function:
 | 15 | GETINFO | A=field, DE=dest, IX=max | A |
 | 16 | LASTERR | DE=dest, IX=max | A=0 |
 | 17 | SETOPT | A=option, DE=value | A |
-| 18-23 | (reserved) | - | A=NERR_NOTSUP |
+| 18 | LISTEN | A=chan, DE=local port (binary) | A |
+| 19 | UNLISTEN | A=chan | A |
+| 20-23 | (reserved) | - | A=NERR_NOTSUP |
 
 `host` and `port` are NUL-terminated ASCII strings (e.g. `"example.com",0` and
 `"80",0`).
@@ -169,10 +171,11 @@ the DLL was not loaded into window 3; FINI closes any still-open link.
 
 Returns the capability bitmask in DE and the ABI version (`major<<8|minor`) in
 IX. Callable before `NETINIT`. Check the ABI major byte before relying on the
-numbered functions. UNETESP 0.4 reports `0x031F` =
-`TCP | UDP | RESOLVE | PING | RXFLOW | MULTICHAN | ASYNCSEND` (0.3 reported
-`0x011F`, 0.2 `0x010F`). The ABI version stays `0x0100`: two channels and
-suspendable sends are discovered through capability bits, not version bumps.
+numbered functions. UNETESP 0.3.0 reports `0x033F` =
+`TCP | UDP | RESOLVE | PING | RXFLOW | MULTICHAN | ASYNCSEND | LISTEN`
+(0.2.41 and earlier reported `0x031F`, without LISTEN). The ABI version stays
+`0x0100`: two channels, suspendable sends and inbound sockets are all
+discovered through capability bits, not version bumps.
 
 ### Function 3 - NETINIT
 
@@ -277,12 +280,17 @@ With `A` = a channel number, returns that channel's state in DE:
 
 | bit | meaning |
 |-----|---------|
+| 0 (`0x01`) | channel is listening: `LISTEN` armed it, no peer has connected yet (`CAP_LISTEN`, UNETESP >= 0.3.0; UNETRTL: never) |
 | 1 (`0x02`) | channel is connected (last known state) |
 | 2 (`0x04`) | received data is buffered for it and not delivered yet (optional; only backends with `CAP_MULTICHAN` set it, so treat "clear" as "unknown" rather than "empty") |
+| 3 (`0x08`) | the connection was accepted from a remote peer via `LISTEN` (inbound); always set together with bit 1 (`CAP_LISTEN`, UNETESP >= 0.3.0; UNETRTL: never) |
 
 STATUS reads memory only - it never touches the UART, so it is cheap enough to
 poll between other work. A channel whose peer has closed reports the pending bit
 without the connected bit, which is the cue to keep reading until `NERR_CLOSED`.
+Bit 0 belongs only to this per-channel form; the `A=0xFF` network-status form
+below uses bit 0 for something unrelated (env configured) - the two forms do
+not share a bit namespace.
 
 With `A = 0xFF`, returns network status **without touching the hardware**:
 `A = NERR_OK` / `NERR_NONET`, and DE bit0 = the network is configured (env
@@ -364,6 +372,52 @@ probing.
   a SEND suspends with `NERR_AGAIN` instead of blocking. 0 (the default)
   keeps sends fully blocking; non-zero values are clamped to >= 50. Gate on
   `UNET_CAP_ASYNCSEND`. See "Non-blocking SEND" below.
+
+### Functions 18 / 19 - LISTEN / UNLISTEN (CAP_LISTEN, UNETESP >= 0.3.0)
+
+`LISTEN` (A=channel, DE=local TCP port as a **binary** 16-bit value, not an
+ASCIIZ string) starts the backend's one server socket and arms the given
+channel - which must be closed - to claim the next inbound connection. Only
+one channel may listen at a time; a second `LISTEN` call while one is already
+armed returns `NERR_STATE`. Port 0 returns `NERR_PARAM`.
+
+There is no separate "accept" call. `STATUS` is memory-only by contract (see
+above), so it cannot itself trigger a scan of the wire for an incoming peer -
+**poll `RECV` on the listening channel** (a zero-timeout poll is enough) to
+give the DLL a chance to see the peer's connect notification. Once a peer has
+connected, `STATUS` on that channel reports `UNET_ST_CONN|UNET_ST_ACCEPT`, and
+`RECV`/`SEND`/`CLOSE` behave exactly as for an outbound `CONNECT`.
+
+`CLOSE` (or the peer closing first) on an accepted connection returns the
+channel to **listening** on the same port rather than fully closing it - the
+server is still up and will accept the next peer. This is the intended
+rendezvous pattern for a game that repeatedly accepts short-lived connections
+on one port. `UNLISTEN` (A=channel, must be the currently listening one) stops
+the server for good: a listening-but-unconnected channel becomes fully closed;
+an already-accepted connection stays open as a normal channel until the
+consumer explicitly `CLOSE`s it.
+
+```
+    ld   a,0                 ; channel 0
+    ld   de,7777             ; port 7777, binary
+    ld   b,UNET_FN_LISTEN
+    call l_call
+    or   a
+    jp   nz,listen_failed
+
+.poll_accept
+    ld   a,0
+    ld   de,recv_buf
+    ld   ix,recv_max
+    ld   iy,0                 ; non-blocking poll
+    ld   b,UNET_FN_RECV
+    call l_call
+    ; A=NERR_OK/DE=0 while still listening; once a peer connects, later
+    ; RECV calls behave like any other channel (DE>0 or NERR_CLOSED).
+```
+
+Gate on `UNET_CAP_LISTEN` before calling either function - UNETRTL does not
+implement it (`GETCAPS` bit stays clear; slots 18/19 return `NERR_NOTSUP`).
 
 ### Non-blocking SEND (CAP_ASYNCSEND, UNETESP >= 0.4)
 
@@ -491,8 +545,36 @@ care. Notes:
 
 The RTL backend has no such window (the card buffers receive independently), so
 its consumers behave identically. (An ESP-only raw transparent pipe could still
-be added behind the reserved `CAP_TRANSPARENT` bit and slots 18-23, but the
-portable, now-lossless path is SEND/RECV.)
+be added behind the reserved `CAP_TRANSPARENT` bit and slots 20-23 (18/19 are
+now `LISTEN`/`UNLISTEN`), but the portable, now-lossless path is SEND/RECV.)
+
+### Game rendezvous / inbound server (CAP_LISTEN)
+
+A two-player game (or any host-a-session workflow) needs one side to accept
+an incoming connection instead of always dialling out. On a backend with
+`CAP_LISTEN`, `LISTEN` plus a polled `RECV` is the whole accept path - see
+"Functions 18 / 19 - LISTEN / UNLISTEN" above for the full contract. Sketch
+for a host that repeatedly accepts guests on one port:
+
+```
+    GETCAPS                            ; DE bit5 (0x0020) = CAP_LISTEN
+    LISTEN    chan 0, 7777             ; binary port, not ASCIIZ
+session:
+    RECV      chan 0, buf, max, 0      ; non-blocking poll drives the accept
+    ; A=NERR_OK/DE=0, STATUS bit0 set: still waiting for a guest
+    ; A=NERR_OK, STATUS bit1|bit3 set: a guest connected - play the session
+    ; A=NERR_CLOSED: guest left; channel 0 is listening again - jr session
+    jr session
+```
+
+For a rendezvous where either side may connect (no dedicated "server"
+machine), `UDPOPEN` with an explicit local port and the default mode-2 remote
+(peer may change) is often simpler than `LISTEN` and works on both backends
+today: send a datagram to announce presence, then treat whichever peer answers
+first as the session - see `UNET_FN_UDPOPEN` in
+[unet.inc](../src/include/unet.inc). `LISTEN` is for the TCP case: a
+guaranteed-ordered, guaranteed-delivered stream with an unknown/late-joining
+peer.
 
 ### Two channels
 
@@ -614,3 +696,14 @@ for the sprinter-rtl8019a project:
   data delivered before `NERR_CLOSED`, and - if the backend can buffer per
   channel - the optional `STATUS` pending bit and RECV flag bit3. Existing
   consumers are unaffected either way.
+- **LISTEN / UNLISTEN:** not implemented; `CAP_LISTEN` stays clear and slots
+  18/19 return `NERR_NOTSUP`. RTL's TCP stack only ever initiates connections
+  (`BUILD_SYN` sends `TF_SYN` alone and `WAIT_SYN_ACK` only accepts a
+  `SYN+ACK` reply to it); a passive-open path - new `ST_LISTEN` state, a TCB
+  created from an unsolicited SYN, a `SYN+ACK` builder, demux by the full
+  `(local_port, remote_ip, remote_port)` tuple - is a separate project tracked
+  in the sprinter-rtl8019a feature request. Follow the same semantics as
+  UNETESP when it lands: `LISTEN` arms a closed channel for one inbound peer,
+  `STATUS` reports `UNET_ST_LISTEN` until accepted and
+  `UNET_ST_CONN|UNET_ST_ACCEPT` after, and `CLOSE` on an accepted connection
+  re-arms the same port rather than fully closing it.
