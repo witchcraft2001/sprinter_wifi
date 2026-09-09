@@ -15,7 +15,8 @@ Purpose
   A UNETRTL.DLL (RTL8019A) would be firmware-independent.
 
 Usage
-  UNETTEST [-d FILE.DLL] [-u udpport] [-2 dataport] [host [port]]
+  UNETTEST [-d FILE.DLL] [-u udpport] [-2 dataport] [-l listenport]
+           [host [port]]
 
   -d FILE.DLL   Load this DLL instead of the default UNETESP.DLL. The name is
                 used exactly as typed and may include a path
@@ -34,13 +35,27 @@ Usage
                 The server discards a control half that receives no data
                 connection within --pair-timeout (10 seconds by default), so
                 an aborted run cannot steal a channel from the next run.
-  host          Host name or IP address to test (default example.com).
+  -l listenport Run the passive-open (LISTEN/UNLISTEN) exercise instead of the
+                TCP one: arms listenport on channel 0, accepts and serves two
+                peers in a row to prove auto-re-arm on CLOSE, then UNLISTENs.
+                Needs a backend that reports CAP_LISTEN (UNETESP 0.3 and
+                later); one without it prints a note and stops, which is not a
+                failure. Connect a peer with a plain `nc host listenport`, run
+                twice from another machine on the same network (host and port
+                here are still the network target, unused by this exercise -
+                the listener is the DSS side).
+  host          Host name or IP address to test (default example.com). Still
+                used for the RESOLVE/PING steps that run before any exercise,
+                including -l; give a reachable host or expect those two
+                steps alone to fail/report unsupported.
   port          TCP port for the connect/send/receive step (default 80),
-                unused when -u is given. With -2 this is the control port.
+                unused when -u or -l is given. With -2 this is the control
+                port.
 
   Flags may appear in any order but must precede host. An unknown flag, or
-  -d/-u/-2 without their required argument, prints this usage line and exits
-  with status 1. -u and -2 are alternatives; if both are given, -2 wins.
+  -d/-u/-2/-l without their required argument, prints this usage line and
+  exits with status 1. -u, -2 and -l are alternatives; if more than one is
+  given, -2 wins over -l, which wins over -u.
 
 DLL search order
   Without -d, UNETTEST first looks for UNETESP.DLL in the directory that holds
@@ -66,6 +81,7 @@ Examples
   UNETTEST example.com 80
   UNETTEST -u 9000 192.168.1.20
   UNETTEST -2 9100 192.168.1.20 9099
+  UNETTEST -l 2345 192.168.1.20
 
 Behavior
   Brings up nothing itself - run NETUP (Sprinter-WiFi) or NETCFG -i / IFUP
@@ -98,17 +114,31 @@ Behavior
                  Three consecutive real data timeouts stop the test after
                  about 12 seconds; Esc cancels it without entering the later
                  control-receive phase.
+  -l             Calls LISTEN(0, listenport), then twice in a row: waits for
+                 an inbound peer (polling RECV, up to 30 seconds), prints
+                 "peer accepted" once STATUS reports UNET_ST_ACCEPT, echoes
+                 back a fixed reply, and either observes the peer's own close
+                 (which auto-re-arms the listener) or CLOSEs the accepted
+                 connection itself (which also re-arms it, as long as the
+                 channel is still the listening one). After both peers it
+                 calls UNLISTEN. A LISTEN/UNLISTEN failure, or a RECV error
+                 after a peer was accepted, is reported and is a test failure
+                 (exit status 3); a timeout waiting for a peer is reported but
+                 does not stop the run - the next peer iteration (or UNLISTEN)
+                 still executes, since a human running `nc` by hand may be
+                 slow to connect.
   Before SETOPT it also verifies ABI 0x0100 and the mandatory TCP capability.
   If these are invalid, it prints the loaded L1 image sizes plus the relocated
   GETCAPS bytes and exits instead of jumping farther through a damaged DLL.
 
 Exit status
   0  The full sequence completed (including a backend that reports UDP
-     unsupported with -u, or no CAP_MULTICHAN with -2: these are capability
-     gaps, not failures).
+     unsupported with -u, no CAP_MULTICHAN with -2, or no CAP_LISTEN with -l:
+     these are capability gaps, not failures).
   1  Invalid command line.
   2  Network hardware not found, or the DLL could not be loaded.
-  3  ESP/driver communication, connect, send or UDPOPEN error.
+  3  ESP/driver communication, connect, send, UDPOPEN, or LISTEN/UNLISTEN
+     error.
   4  Network not configured - run NETUP (or NETCFG -i / IFUP) first.
 
 Notes

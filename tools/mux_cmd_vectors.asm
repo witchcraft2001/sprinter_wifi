@@ -29,9 +29,9 @@ TEST_START
 
 	; Stub the steps that would talk to the UART with "XOR A / RET", i.e. a
 	; successful transfer: the builders and the call flow are the subject
-	; here, the transport is not.
-	LD	HL,TCP.TX_CMD_BUSY_RETRY
-	CALL	STUB_OK
+	; here, the transport is not. TCP.TX_CMD_BUSY_RETRY is single-connection-only
+	; and gated out of the ESP_TCP_MUX build this harness assembles (MUX_OPEN
+	; goes through MUX_TX_COMMAND instead), so there is nothing to stub here.
 	; Unlike the other transport stubs, record UART_TX_STRING's input pointer.
 	; MUX_TX_COMMAND performs parser setup before transmit, so a test that only
 	; inspects CMD_BUFFER misses a clobbered HL and a command sent from 0x0000.
