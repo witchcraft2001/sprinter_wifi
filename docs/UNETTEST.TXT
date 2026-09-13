@@ -15,7 +15,7 @@ Purpose
   A UNETRTL.DLL (RTL8019A) would be firmware-independent.
 
 Usage
-  UNETTEST [-d FILE.DLL] [-u udpport] [-2 dataport] [-l listenport]
+  UNETTEST [-d FILE.DLL] [-u udpport] [-2 dataport] [-l listenport] [-a]
            [host [port]]
 
   -d FILE.DLL   Load this DLL instead of the default UNETESP.DLL. The name is
@@ -44,6 +44,11 @@ Usage
                 twice from another machine on the same network (host and port
                 here are still the network target, unused by this exercise -
                 the listener is the DSS side).
+  -a            Run a suspendable 1200-byte TCP SEND (SETOPT SENDSLICE) to
+                exercise NERR_AGAIN and peer-FIN handling during SEND. After
+                SEND it drains the peer response, prints LASTERR after the
+                first successful RECV, and reports the RECV-side close. Pair
+                it with tools/dev/unettest_fin_during_send.py on the host.
   host          Host name or IP address to test (default example.com). Still
                 used for the RESOLVE/PING steps that run before any exercise,
                 including -l; give a reachable host or expect those two
@@ -92,6 +97,10 @@ Behavior
   It prints each result so a failing step is easy to spot.
 
   TCP (default)  connect, an HTTP HEAD request and a short reply read.
+  -a             SETOPT SENDSLICE, connect and send a generated 1200-byte
+                 pattern; prints the returned SEND status and confirmed count,
+                 drains the peer response/close, and displays LASTERR after a
+                 successful RECV.
 
   -u             UDPOPEN, SEND one probe datagram, then RECV until an echo
                  arrives (or up to 3 timeouts). A byte-for-byte mismatch is

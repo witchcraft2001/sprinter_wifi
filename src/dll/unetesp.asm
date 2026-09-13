@@ -11,13 +11,13 @@
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
 ; with the wrong command set. The L1 header name announces the target and full
-; DLL version (for example, "UNETESP v0.3.0") to consumers such as
+; DLL version (for example, "UNETESP v0.3.1") to consumers such as
 ; UNETTEST.
 ;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNETESP v0.3.0" --version 0.3 --no-compress \
+;     --name "UNETESP v0.3.1" --version 0.3 --no-compress \
 ;     -o build/UNETESP.DLL
 ;
 ; The L1 header has a compact, encoded major.minor version plus a 15-byte
@@ -82,28 +82,107 @@ UNET_CHANNELS		EQU 2	; channels this build accepts; checked against
 ; ------------------------------------------------------
 	JP	INIT			; 0  load hook
 	JP	FINI			; 1  free hook
-	JP	F_GETCAPS		; 2
-	JP	F_NETINIT		; 3
-	JP	F_NETDONE		; 4
-	JP	F_CONNECT		; 5
-	JP	F_SEND			; 6
-	JP	F_RECV			; 7
-	JP	F_CLOSE			; 8
-	JP	F_STATUS		; 9
-	JP	F_UDPOPEN		; 10
-	JP	F_RESOLVE		; 11
-	JP	F_PING			; 12
-	JP	F_RXPAUSE		; 13
-	JP	F_RXRESUME		; 14
-	JP	F_GETINFO		; 15
-	JP	F_LASTERR		; 16
-	JP	F_SETOPT		; 17
-	JP	F_LISTEN		; 18
-	JP	F_UNLISTEN		; 19
-	JP	F_NOTSUP		; 20 reserved
-	JP	F_NOTSUP		; 21 reserved
-	JP	F_NOTSUP		; 22 reserved
-	JP	F_NOTSUP		; 23 reserved
+	JP	API_GETCAPS		; 2
+	JP	API_NETINIT		; 3
+	JP	API_NETDONE		; 4
+	JP	API_CONNECT		; 5
+	JP	API_SEND		; 6
+	JP	API_RECV		; 7
+	JP	API_CLOSE		; 8
+	JP	API_STATUS		; 9
+	JP	API_UDPOPEN		; 10
+	JP	API_RESOLVE		; 11
+	JP	API_PING			; 12
+	JP	API_RXPAUSE		; 13
+	JP	API_RXRESUME		; 14
+	JP	API_GETINFO		; 15
+	JP	API_LASTERR		; 16
+	JP	API_SETOPT		; 17
+	JP	API_LISTEN		; 18
+	JP	API_UNLISTEN		; 19
+	JP	API_NOTSUP		; 20 reserved
+	JP	API_NOTSUP		; 21 reserved
+	JP	API_NOTSUP		; 22 reserved
+	JP	API_NOTSUP		; 23 reserved
+
+; API wrappers take one snapshot of the ESP response at every non-zero return.
+; The public function bodies keep their existing register/status contracts;
+; API_RETURN preserves those values while freezing LASTERR once.
+API_GETCAPS
+	CALL	F_GETCAPS
+	JR	API_RETURN
+API_NETINIT
+	CALL	F_NETINIT
+	JR	API_RETURN
+API_NETDONE
+	CALL	F_NETDONE
+	JR	API_RETURN
+API_CONNECT
+	CALL	F_CONNECT
+	JR	API_RETURN
+API_SEND
+	CALL	F_SEND
+	JR	API_RETURN
+API_RECV
+	CALL	F_RECV
+	JR	API_RETURN
+API_CLOSE
+	CALL	F_CLOSE
+	JR	API_RETURN
+API_STATUS
+	CALL	F_STATUS
+	JR	API_RETURN
+API_UDPOPEN
+	CALL	F_UDPOPEN
+	JR	API_RETURN
+API_RESOLVE
+	CALL	F_RESOLVE
+	JR	API_RETURN
+API_PING
+	CALL	F_PING
+	JR	API_RETURN
+API_RXPAUSE
+	CALL	F_RXPAUSE
+	JR	API_RETURN
+API_RXRESUME
+	CALL	F_RXRESUME
+	JR	API_RETURN
+API_GETINFO
+	CALL	F_GETINFO
+	JR	API_RETURN
+API_LASTERR
+	CALL	F_LASTERR
+	JR	API_RETURN
+API_SETOPT
+	CALL	F_SETOPT
+	JR	API_RETURN
+API_LISTEN
+	CALL	F_LISTEN
+	JR	API_RETURN
+API_UNLISTEN
+	CALL	F_UNLISTEN
+	JR	API_RETURN
+API_NOTSUP
+	CALL	F_NOTSUP
+
+API_RETURN
+	OR	A
+	RET	Z
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	PUSH	IX
+	PUSH	IY
+	CALL	FREEZE_LASTERR
+	POP	IY
+	POP	IX
+	POP	HL
+	POP	DE
+	POP	BC
+	POP	AF
+	OR	A			; every UNET function returns CF=0
+	RET
 
 ; ======================================================
 ; Function 0 - INIT (libman load hook)
@@ -467,6 +546,12 @@ F_SEND
 	CALL	TCP.SEND_BUFFER
 	JR	C,.senderr
 .chunk_done
+	; WAIT_SEND_OK may have consumed CLOSED after SEND OK. The chunk remains
+	; confirmed, but keep the channel visibly connected until RECV reports the
+	; deferred close (or CLOSE explicitly releases it).
+	LD	A,(ARG_CH)
+	CALL	CH_PEER_CLOSED
+	CALL	C,MARK_SEND_CLOSE
 	LD	HL,(SEND_DONE)
 	LD	BC,(CHUNK_LEN)
 	ADD	HL,BC
@@ -493,6 +578,9 @@ F_SEND
 	CALL	CLEAR_PEND		; any real outcome ends the transaction
 	CALL	CONSUME_CANCEL
 	JR	C,.cancelled_de
+	LD	A,(ARG_CH)
+	CALL	CH_PEER_CLOSED
+	JR	C,.closed_fail		; do not spend the recovery ladder on a known FIN
 	; Only silence after the complete payload left the host is safe to probe.
 	; Before the '>' prompt, an AT probe can itself become CIPSEND payload if the
 	; prompt was merely late. While a +IPD payload is incomplete, its remaining
@@ -540,10 +628,24 @@ F_SEND
 	OR	A
 	RET
 .fail
+	LD	A,(ARG_CH)
+	CALL	CH_PEER_CLOSED
+	JR	C,.closed_fail
 	CALL	NOTE_SEND_FAILURE
 	LD	DE,(SEND_DONE)
 	LD	A,NERR_SEND
 	OR	A			; clear CF (reached via JR C from SEND_BUFFER)
+	RET
+.closed_fail
+	; WAIT_SEND_OK has latched this channel's orderly <id>,CLOSED event.
+	; SEND OK is the only ESP-AT acknowledgement we can count, so SEND_DONE
+	; remains the confirmed prefix and the per-channel +IPD defer queue stays
+	; untouched for RECV.
+	CALL	MARK_SEND_CLOSE
+	CALL	NOTE_SEND_FAILURE
+	LD	DE,(SEND_DONE)
+	LD	A,NERR_CLOSED
+	OR	A
 	RET
 .cancelled_de
 	LD	DE,(SEND_DONE)
@@ -556,8 +658,16 @@ F_SEND
 	LD	A,(PEND_CH)
 	LD	HL,ARG_CH
 	CP	(HL)
-	CALL	Z,CLEAR_PEND
-	JP	RET_CLOSED
+	JR	NZ,.fresh_closed
+	CALL	CLEAR_PEND
+	LD	DE,(SEND_DONE)
+	JR	.closed_return
+.fresh_closed
+	LD	DE,0
+.closed_return
+	LD	A,NERR_CLOSED
+	OR	A
+	RET
 
 ; Arm or disarm the suspendable-send machinery for this call from OPT_SLICE.
 SETUP_ASYNC_MODE
@@ -860,7 +970,10 @@ F_STATUS
 	CP	3
 	JR	Z,.listening		; armed, no peer yet: UNET_ST_LISTEN only
 	CALL	CH_PEER_CLOSED
-	JR	C,.notopen		; closed by the peer: no longer connected
+	JR	NC,.connected
+	CALL	SEND_CLOSE_PENDING
+	JR	Z,.notopen		; ordinary RECV close: not connected
+.connected
 	LD	HL,RECV_FLAGS
 	SET	1,(HL)			; UNET_ST_CONN
 	CALL	GET_CH_STATE
@@ -1164,7 +1277,8 @@ F_GETINFO
 	RET
 
 ; ======================================================
-; Function 16 - LASTERR (tail of last AT/driver response)
+; Function 16 - LASTERR (live response until first non-zero return,
+; then the frozen response captured by API_RETURN)
 ; ======================================================
 F_LASTERR
 	LD	(ARG_DE),DE
@@ -1177,9 +1291,17 @@ F_LASTERR
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
-	; copy the TAIL of the response: the final ERROR/CLOSED line is the
-	; useful diagnostic when the response is longer than the caller buffer
+	; Before the first non-zero API result use live state. Afterwards successful
+	; calls may overwrite RS_BUFF, so report the saved response instead.
 	LD	HL,WIFI.RS_BUFF
+	LD	A,(LASTERR_FROZEN)
+	AND	A
+	JR	Z,.source
+	LD	HL,LASTERR_BUF
+.source
+	LD	(LASTERR_SRC),HL
+	; copy the TAIL of the selected response: the final ERROR/CLOSED line is
+	; the useful diagnostic when the response is longer than the caller buffer
 	LD	BC,0
 	LD	DE,RS_BUFF_SIZE		; global EQU; hard stop if unterminated
 .len
@@ -1201,16 +1323,41 @@ F_LASTERR
 	SBC	HL,DE			; HL = length - capacity
 	JR	C,.head
 	JR	Z,.head
-	LD	DE,WIFI.RS_BUFF
+	LD	DE,(LASTERR_SRC)
 	ADD	HL,DE			; skip to the last <capacity> bytes
 	JR	.copy
 .head
-	LD	HL,WIFI.RS_BUFF
+	LD	HL,(LASTERR_SRC)
 .copy
 	LD	DE,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	COPY_LIMITED
 	XOR	A
+	RET
+
+; Snapshot the tail source as it exists at the failing API return. Keep the
+; full bounded RS_BUFF content so LASTERR can still apply caller-sized tail
+; truncation after later successful UART exchanges have reused RS_BUFF.
+FREEZE_LASTERR
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,LASTERR_BUF
+	LD	BC,RS_BUFF_SIZE-1
+.copy
+	LD	A,(HL)
+	AND	A
+	JR	Z,.done
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.copy
+.done
+	XOR	A
+	LD	(DE),A
+	INC	A
+	LD	(LASTERR_FROZEN),A
 	RET
 
 ; ======================================================
@@ -1509,6 +1656,15 @@ SET_CH_STATE
 ; another peer. Replaces the old unconditional "state = 0" on every close path.
 CH_RELEASE
 	LD	A,(ARG_CH)
+	AND	A
+	LD	A,0xFE
+	JR	Z,.clear_send_close
+	LD	A,0xFD
+.clear_send_close
+	LD	HL,SEND_CLOSE_MASK
+	AND	(HL)
+	LD	(HL),A
+	LD	A,(ARG_CH)
 	CALL	TCP.MUX_LINK_MAP_ADDR
 	LD	(HL),0xFF		; this channel no longer owns a link
 	LD	A,(TCP.MUX_LISTEN_CH)
@@ -1562,6 +1718,34 @@ CH_PEER_CLOSED
 	LD	A,(ARG_CH)
 	JP	TCP.MUX_IS_CLOSED
 
+; Mark a close observed by the SEND parser so STATUS keeps UNET_ST_CONN set
+; until RECV consumes queued peer data and reports NERR_CLOSED.
+MARK_SEND_CLOSE
+	LD	A,(ARG_CH)
+	AND	A
+	LD	A,1
+	JR	Z,.mask_ready
+	LD	A,2
+.mask_ready
+	LD	B,A
+	LD	A,(SEND_CLOSE_MASK)
+	OR	B
+	LD	(SEND_CLOSE_MASK),A
+	RET
+
+; Out: Z if this channel's latched close was first observed outside SEND.
+SEND_CLOSE_PENDING
+	LD	A,(ARG_CH)
+	AND	A
+	JR	NZ,.channel1
+	LD	A,(SEND_CLOSE_MASK)
+	AND	1
+	RET
+.channel1
+	LD	A,(SEND_CLOSE_MASK)
+	AND	2
+	RET
+
 ; Forget every channel's state and buffered data. Used by NETINIT, where the
 ; CIPCLOSE (and CIPSERVER=0) pair above has really dropped any leftover
 ; socket/server.
@@ -1569,6 +1753,7 @@ RESET_CHANNEL_STATE
 	XOR	A
 	LD	(CH_STATE),A
 	LD	(CH_STATE+1),A
+	LD	(SEND_CLOSE_MASK),A
 	LD	A,0xFF
 	LD	(TCP.MUX_LISTEN_CH),A
 	LD	HL,TCP.MUX_LINK_MAP
@@ -2455,6 +2640,7 @@ ENVN_TZ			DB "NET_TZ",0
 WIN_BASE		DB 0	; high byte (top 2 bits) of our window base
 INITED			DB 0	; NETINIT completed
 CH_STATE		DB 0,0	; per channel: 0 closed, 1 TCP open, 2 UDP open
+SEND_CLOSE_MASK	DB 0	; orderly close consumed by SEND; keep STATUS connected until RECV close
 MUX_ACTIVE		DB 0	; AT+CIPMUX=1 currently in force
 ARG_CH			DB 0	; channel argument of the call in progress
 RECV_FLAGS		DW 0	; RECV flag / STATUS state accumulator
@@ -2570,7 +2756,10 @@ ENV_STAGE	EQU TCP.TCP_BSS_END
 ENV_STAGE_SIZE	EQU 192	; DSS ENV_GET has no length cap; headroom for long values
 CMDBUILD	EQU ENV_STAGE + ENV_STAGE_SIZE
 CMDBUILD_SIZE	EQU 160
-DLL_BSS_END	EQU CMDBUILD + CMDBUILD_SIZE
+LASTERR_FROZEN	EQU CMDBUILD + CMDBUILD_SIZE
+LASTERR_SRC	EQU LASTERR_FROZEN + 1
+LASTERR_BUF	EQU LASTERR_SRC + 2
+DLL_BSS_END	EQU LASTERR_BUF + RS_BUFF_SIZE
 
 	ENDMODULE
 

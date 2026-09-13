@@ -1,7 +1,7 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [-l LISTENPORT] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [-l LISTENPORT] [-a] HOST [PORT]
 ;
 ; Loads a UNET DLL (default UNETESP.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
@@ -18,6 +18,9 @@
 ; which is not a failure. Drive it with a plain `nc HOST LISTENPORT` (or
 ; tools/dev/unettest_listen_client.py from the sibling RTL project) run
 ; twice from the host.
+; -a swaps it for a suspendable SEND test: SETOPT SENDSLICE, CONNECT, then
+; SEND a 1200-byte pattern while the peer stalls its TCP receive window.
+; Use tools/dev/unettest_fin_during_send.py to exercise peer FIN during SEND.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETRTL.DLL to exercise the RTL card.
 ;
@@ -231,7 +234,13 @@ START
 	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 .after_ping
-	; -u / -2 / -l select an exercise other than the plain TCP one.
+	; -a / -u / -2 / -l select an exercise other than the plain TCP one.
+	LD	A,(ASYNC_MODE)
+	AND	A
+	JR	Z,.check_dual
+	CALL	ASYNC_PHASE
+	JP	.teardown
+.check_dual
 	LD	A,(DUAL_MODE)
 	AND	A
 	JR	Z,.check_listen
@@ -646,6 +655,201 @@ PRINT_HEX_BYTES
 	LD	A,' '
 	CALL	PUT_CHAR
 	JR	PRINT_HEX_BYTES
+
+; ======================================================
+; ASYNCSEND exercise (-a): SETOPT SENDSLICE, CONNECT to HOST:PORT, then
+; SEND a 1200-byte generated pattern. A stalling/FIN peer can force the DLL's
+; resumable path and FIN-during-SEND handling.
+; ======================================================
+ASYNC_PHASE
+	LD	A,(CAPS+1)
+	AND	HIGH UNET_CAP_ASYNCSEND
+	JR	NZ,.supported
+	LD	HL,MSG_ASYNC_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	A,UNET_OPT_SENDSLICE
+	LD	DE,ASYNC_SLICE_MS
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+	OR	A
+	JR	Z,.slice_ok
+	LD	HL,MSG_ASYNC_SETOPT_FAIL
+	CALL	PUTS_LN
+	JP	DUMP_LASTERR
+.slice_ok
+	LD	HL,MSG_ASYNC_CONNECT
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_CONNECT
+	LD	DE,PATTERN_BUF
+	LD	BC,ASYNC_PAYLOAD_LEN
+	CALL	FILL_PATTERN
+	XOR	A
+	LD	(ASYNC_AGAIN_COUNT),A
+.send_attempt
+	XOR	A				; channel 0
+	LD	DE,PATTERN_BUF
+	LD	IX,ASYNC_PAYLOAD_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL			; -> A, DE=confirmed bytes so far
+	CP	NERR_AGAIN
+	JR	NZ,.settled
+	LD	HL,ASYNC_AGAIN_COUNT
+	INC	(HL)
+	LD	A,(HL)
+	CP	ASYNC_MAX_AGAIN
+	JR	NC,.stuck
+	LD	HL,MSG_ASYNC_AGAIN
+	CALL	PUTS
+	PUSH	DE
+	POP	HL
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	JR	.send_attempt			; resume with same buffer and length
+.stuck
+	LD	HL,MSG_ASYNC_STUCK
+	CALL	PUTS_LN
+	LD	A,NERR_TIMEOUT
+	JP	ERR_SEND
+.settled
+	LD	(ASYNC_RESULT),A
+	LD	(ASYNC_SENT),DE
+	LD	HL,MSG_ASYNC_RESULT
+	CALL	PUTS
+	LD	A,(ASYNC_RESULT)
+	CALL	PUT_DEC_A
+	LD	HL,MSG_ASYNC_CONFIRMED
+	CALL	PUTS
+	LD	HL,(ASYNC_SENT)
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	LD	A,(ASYNC_RESULT)
+	CP	NERR_CLOSED
+	JR	Z,.send_closed
+	OR	A
+	JP	NZ,ERR_SEND
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	JR	.after_send_status
+.send_closed
+	LD	HL,MSG_ASYNC_SEND_CLOSED
+	CALL	PUTS_LN
+	; A SEND-observed FIN must leave the channel connected until RECV drains
+	; its queued response. Print STATUS before the first RECV consumes it.
+	LD	HL,MSG_ASYNC_STATUS
+	CALL	PUTS
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> DE=state bits
+	CALL	PUT_HEX16
+	CALL	CRLF
+.after_send_status
+	LD	HL,MSG_ASYNC_AGAIN_COUNT
+	CALL	PUTS
+	LD	A,(ASYNC_AGAIN_COUNT)
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	CALL	ASYNC_DRAIN_RESPONSE
+	RET
+
+; Drain a response that raced SEND, then observe the orderly close. LASTERR is
+; deliberately queried after the first successful RECV: a frozen SEND failure
+; must survive that success. Empty RECVs are bounded so a silent peer cannot
+; hang the diagnostic indefinitely.
+ASYNC_DRAIN_RESPONSE
+	LD	HL,MSG_ASYNC_RECV
+	CALL	PUTS_LN
+	LD	A,ASYNC_RECV_TRIES
+	LD	(RECV_LEFT),A
+.recv
+	LD	A,(RECV_LEFT)
+	AND	A
+	JP	Z,.no_reply
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,ASYNC_RECV_TIMEOUT
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got
+	CP	NERR_CLOSED
+	JR	Z,.closed
+	OR	A
+	JR	NZ,.recv_error
+	LD	A,D
+	OR	E
+	JR	Z,.recv				; timeout with no data
+	LD	(ASYNC_RECV_LEN),DE
+	LD	HL,MSG_ASYNC_RECV_BYTES
+	CALL	PUTS
+	LD	HL,(ASYNC_RECV_LEN)
+	CALL	PUT_DEC_HL
+	LD	HL,MSG_ASYNC_DATA
+	CALL	PUTS
+	LD	DE,(ASYNC_RECV_LEN)
+	CALL	PRINT_RECV
+	CALL	CRLF
+	CALL	DUMP_LASTERR			; must still describe SEND if it failed
+	JR	.recv
+.closed
+	LD	(ASYNC_RECV_LEN),DE
+	LD	HL,MSG_ASYNC_PEER_CLOSED
+	CALL	PUTS
+	LD	A,NERR_CLOSED
+	CALL	PUT_DEC_A
+	LD	HL,MSG_ASYNC_RECV_BYTES
+	CALL	PUTS
+	LD	HL,(ASYNC_RECV_LEN)
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	LD	HL,(ASYNC_RECV_LEN)
+	LD	A,H
+	OR	L
+	RET	Z
+	LD	HL,MSG_ASYNC_DATA
+	CALL	PUTS
+	LD	DE,(ASYNC_RECV_LEN)
+	CALL	PRINT_RECV
+	JP	CRLF
+	RET
+.recv_error
+	PUSH	AF
+	LD	HL,MSG_ASYNC_RECV_ERROR
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	JP	DUMP_LASTERR
+.no_reply
+	LD	HL,MSG_ASYNC_NO_REPLY
+	JP	PUTS_LN
+
+; Fill (DE) with BC bytes of pattern byte[i] = i & 0xFF.
+FILL_PATTERN
+	LD	HL,0
+.loop
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	INC	HL
+	DEC	BC
+	JR	.loop
 
 ; ======================================================
 ; UDP exercise (-u PORT): UDPOPEN -> SEND -> RECV -> verify echo.
@@ -1324,7 +1528,7 @@ APPEND
 	JR	APPEND
 
 ; ======================================================
-; Command-line parsing:  [-d FILE.DLL] [-u UDPPORT] HOST [PORT]
+; Command-line parsing:  [-d FILE.DLL] [-u UDPPORT] [-a] HOST [PORT]
 ; Flags may appear in any order but must precede HOST.
 ; ======================================================
 PARSE_ARGS
@@ -1343,6 +1547,7 @@ PARSE_ARGS
 	LD	(UDP_MODE),A			; default: TCP exercise
 	LD	(DUAL_MODE),A
 	LD	(LISTEN_MODE),A
+	LD	(ASYNC_MODE),A
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
@@ -1356,7 +1561,7 @@ PARSE_ARGS
 	RET	C				; no more args -> defaults
 	LD	A,(TOKEN_BUF)
 	CP	'-'
-	JR	NZ,.host_is_tok
+	JP	NZ,.host_is_tok
 	LD	HL,TOKEN_BUF
 	LD	DE,STR_DASH_D
 	CALL	STREQ				; trashes C
@@ -1373,6 +1578,10 @@ PARSE_ARGS
 	LD	DE,STR_DASH_L
 	CALL	STREQ
 	JR	Z,.flag_l
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_A
+	CALL	STREQ
+	JR	Z,.flag_a
 	JP	USAGE_EXIT			; unknown flag
 .flag_d
 	LD	DE,DLL_NAME
@@ -1381,7 +1590,7 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -d without a file name
 	LD	A,1
 	LD	(DLL_ARG_FLAG),A		; use DLL_NAME verbatim (may hold a path)
-	JR	.next_flag
+	JP	.next_flag
 .flag_u
 	LD	DE,UDP_PORT_BUF
 	LD	C,PORT_BUFF_SIZE
@@ -1389,7 +1598,7 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -u without a port
 	LD	A,1
 	LD	(UDP_MODE),A
-	JR	.next_flag
+	JP	.next_flag
 .flag_2
 	LD	DE,DUAL_PORT_BUF
 	LD	C,PORT_BUFF_SIZE
@@ -1397,7 +1606,7 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -2 without a data port
 	LD	A,1
 	LD	(DUAL_MODE),A
-	JR	.next_flag
+	JP	.next_flag
 .flag_l
 	; LISTENPORT is parsed later by PARSE_DEC_TOKEN (1..9999, ample for
 	; any test port), so just capture the raw token here like -u/-2 do.
@@ -1407,6 +1616,10 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -l without a port
 	LD	A,1
 	LD	(LISTEN_MODE),A
+	JP	.next_flag
+.flag_a
+	LD	A,1
+	LD	(ASYNC_MODE),A
 	JP	.next_flag
 .host_is_tok
 	LD	HL,TOKEN_BUF
@@ -1700,7 +1913,7 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [-a]",0
 MSG_USAGE2	DB "               [-l LISTENPORT] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
@@ -1750,6 +1963,22 @@ MSG_ERR_NONET	DB "Network not configured - run NETUP first.",0
 MSG_ERR_HW	DB "Network hardware not found.",0
 MSG_ERR_CONNECT	DB "Connect failed.",0
 MSG_ERR_SEND	DB "Send failed.",0
+MSG_ASYNC_UNSUP DB "ASYNCSEND not supported by this backend",0
+MSG_ASYNC_SETOPT_FAIL DB "SETOPT SENDSLICE failed",0
+MSG_ASYNC_CONNECT DB "connect ",0
+MSG_ASYNC_AGAIN DB "SEND suspended (NERR_AGAIN), confirmed so far: ",0
+MSG_ASYNC_AGAIN_COUNT DB "resumes needed: ",0
+MSG_ASYNC_RESULT DB "SEND result A=",0
+MSG_ASYNC_CONFIRMED DB " confirmed=",0
+MSG_ASYNC_STUCK DB "gave up after too many NERR_AGAIN resumes",0
+MSG_ASYNC_SEND_CLOSED DB "SEND saw peer close; draining queued response",0
+MSG_ASYNC_STATUS DB "STATUS after SEND: 0x",0
+MSG_ASYNC_RECV DB "RECV: waiting for peer response/close",0
+MSG_ASYNC_RECV_BYTES DB "RECV bytes=",0
+MSG_ASYNC_DATA DB " data=",0
+MSG_ASYNC_PEER_CLOSED DB "RECV close A=",0
+MSG_ASYNC_RECV_ERROR DB "RECV error A=",0
+MSG_ASYNC_NO_REPLY DB "no peer response/close before timeout",0
 MSG_ERR_UDPOPEN	DB "UDPOPEN failed.",0
 MSG_UDP		DB "udp ",0
 MSG_UDP_REPLY	DB "udp reply: len=",0
@@ -1802,6 +2031,7 @@ STR_DASH_D	DB "-d",0
 STR_DASH_U	DB "-u",0
 STR_DASH_2	DB "-2",0
 STR_DASH_L	DB "-l",0
+STR_DASH_A	DB "-a",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
@@ -1823,6 +2053,7 @@ UDP_PAYLOAD_LEN	EQU $ - UDP_PAYLOAD
 	MODULE MAIN
 
 RECV_BUF_SIZE	EQU 512
+ASYNC_PAYLOAD_LEN EQU 1200
 STR_BUF_SIZE	EQU 96
 REQ_BUF_SIZE	EQU 160
 TOKEN_BUF_SIZE	EQU 64
@@ -1857,7 +2088,12 @@ DUAL_IDLE	EQU DUAL_CLOSED + 1	; consecutive real data timeouts left
 DUAL_TOTAL	EQU DUAL_IDLE + 1	; bytes received on the data channel
 LISTEN_MODE	EQU DUAL_TOTAL + 2	; 1 = -l given, run the passive-open exercise
 LISTEN_RX_LEN	EQU LISTEN_MODE + 1
-DEC_BUF		EQU LISTEN_RX_LEN + 2
+ASYNC_MODE	EQU LISTEN_RX_LEN + 2	; 1 = -a suspendable-send exercise
+ASYNC_AGAIN_COUNT EQU ASYNC_MODE + 1
+ASYNC_RESULT	EQU ASYNC_AGAIN_COUNT + 1
+ASYNC_SENT	EQU ASYNC_RESULT + 1
+ASYNC_RECV_LEN	EQU ASYNC_SENT + 2
+DEC_BUF		EQU ASYNC_RECV_LEN + 2
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
@@ -1870,7 +2106,8 @@ TOKEN_BUF	EQU LISTEN_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
-DLL_BASE_H	EQU RECV_BUF + RECV_BUF_SIZE
+PATTERN_BUF	EQU RECV_BUF + RECV_BUF_SIZE
+DLL_BASE_H	EQU PATTERN_BUF + ASYNC_PAYLOAD_LEN
 SNAPSHOT_OLD_WIN	EQU DLL_BASE_H + 1
 SNAPSHOT_DSS_ERROR	EQU SNAPSHOT_OLD_WIN + 1
 DLL_PROBE	EQU SNAPSHOT_DSS_ERROR + 1
@@ -1886,6 +2123,10 @@ DUAL_MAX_ROUNDS	EQU 200			; bounds the -2 data drain loop
 DUAL_MAX_IDLE	EQU 3			; 3 x 4 s without channel-1 data
 LISTEN_MAX_PEERS	EQU 2		; accept-serve-close twice: proves re-arm
 LISTEN_ACCEPT_TRIES	EQU 15		; 15 x 2000 ms before giving up on a peer
+ASYNC_SLICE_MS	EQU 150		; SETOPT SENDSLICE quantum
+ASYNC_MAX_AGAIN	EQU 20		; bounded NERR_AGAIN resume loop
+ASYNC_RECV_TRIES EQU 3		; bounded wait for response and orderly close
+ASYNC_RECV_TIMEOUT EQU 2000		; milliseconds per RECV attempt
 
 	ASSERT STACK_TOP <= 0xC000
 

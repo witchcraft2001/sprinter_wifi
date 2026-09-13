@@ -241,11 +241,29 @@ Sends `len` bytes. On a TCP channel the payload is split internally into
 2048-byte chunks (the ESP-AT `CIPSEND` maximum), so callers pass the whole
 buffer in one call. On a UDP channel each SEND is **one datagram**; lengths
 over 1472 (the ESP-AT UDP payload cap) return `NERR_PARAM`. DE returns the
-number of bytes actually sent, even on `NERR_SEND`/`NERR_CANCEL`.
+number of bytes confirmed so far, even on `NERR_SEND`/`NERR_CLOSED`/
+`NERR_CANCEL`. A backend must never report more than its acknowledgement
+evidence supports. UNETRTL reports its cumulative TCP ACK count; UNETESP can
+count only complete CIPSEND chunks that received `SEND OK`.
 
-Note: data arriving from the peer **while** a SEND is in flight may be dropped
-by the ESP backend (see the interactive-stream pattern below); drain RECV
-before sending when the peer may talk unprompted.
+If an orderly peer close arrives before the current TCP chunk is fully
+acknowledged, SEND returns `NERR_CLOSED` with DE equal to the confirmed prefix.
+The channel remains open to RECV/CLOSE: RECV first returns peer data already
+delivered by the backend, then returns `NERR_CLOSED` with DE=0 and releases the
+channel. A close after a complete chunk acknowledgement does not invalidate
+that acknowledgement; remaining bytes are still attempted on the half-closed
+stream. If the full call is acknowledged, SEND succeeds and RECV reports the
+close. `NERR_SEND` is for a send failure where no acknowledgement completed
+and no peer close was observed.
+
+UNETESP preserves link-scoped `+IPD` frames that its UART reader parses while
+the CIPSEND prompt/result is in flight, using a bounded defer queue per channel.
+Queue overflow is reported by the usual RECV loss flag. ESP-AT firmware may
+withhold peer bytes until the command exchange finishes; bytes the module has
+not emitted on UART cannot be queued by the DLL and become available only if
+the firmware delivers them later. This is a firmware delivery limitation, not
+an ABI rule. Draining RECV before a send remains useful for interactive
+protocols where the peer may speak without prompting.
 
 ### Function 7 - RECV
 
@@ -286,8 +304,11 @@ With `A` = a channel number, returns that channel's state in DE:
 | 3 (`0x08`) | the connection was accepted from a remote peer via `LISTEN` (inbound); always set together with bit 1 (`CAP_LISTEN`, UNETESP >= 0.3.0; UNETRTL: never) |
 
 STATUS reads memory only - it never touches the UART, so it is cheap enough to
-poll between other work. A channel whose peer has closed reports the pending bit
-without the connected bit, which is the cue to keep reading until `NERR_CLOSED`.
+poll between other work. A peer-close marker may be reported with the pending
+bit before the channel is released. In UNETESP, a close first detected during
+SEND deliberately keeps `UNET_ST_CONN` set until RECV has delivered queued data
+and returned `NERR_CLOSED`; STATUS then reports the channel closed. `CLOSE` can
+release it earlier and discards any queued data.
 Bit 0 belongs only to this per-channel form; the `A=0xFF` network-status form
 below uses bit 0 for something unrelated (env configured) - the two forms do
 not share a bit namespace.
@@ -330,7 +351,11 @@ values come from the `NET_*` environment variables published by NETUP.
 Copies the **tail** of the last raw AT/driver response into `dest`: when the
 response is longer than the buffer, the final bytes (the `ERROR`/`CLOSED`
 line - the useful part) survive the truncation. `max=0` returns `NERR_PARAM`.
-A diagnostic aid, like the ESP debug tail in the fido binkp client.
+Before the first non-zero API return, each query reports the live response.
+At every non-zero return the DLL snapshots the response available at that
+moment; subsequent successful calls, including RECV/CLOSE, do not replace it.
+The snapshot remains valid until the next non-zero return. UNETESP stores a
+bounded copy of `RS_BUFF` in its DLL image.
 
 After a failed SEND the buffer instead holds
 
@@ -338,7 +363,7 @@ After a failed SEND the buffer instead holds
 send failed <n>: <line>
 ```
 
-because every transport failure maps to the single public status `NERR_SEND`.
+because transport failures can map to `NERR_SEND` or `NERR_CLOSED`.
 `n` is the internal transport result (1 = ESP replied `ERROR`, 2 = `FAIL`,
 3 = transmit timeout, 4 = no response); the optional line is the last complete
 ESP response or recovery-probe line. The recovery probe still detects a late

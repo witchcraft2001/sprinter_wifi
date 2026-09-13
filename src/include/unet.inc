@@ -58,8 +58,13 @@ UNET_FN_CONNECT		EQU 5	; A=channel, DE=host ASCIIZ, IX=port ASCIIZ  ->  A
 UNET_FN_SEND		EQU 6	; A=channel, DE=buffer, IX=length  ->  A, DE=bytes sent
 				;   TCP: chunked internally at 2048 (ESP-AT CIPSEND cap).
 				;   UDP: one datagram per call, length > 1472 -> NERR_PARAM.
-				;   Peer data arriving DURING a send may be dropped by the ESP
-				;   backend - drain RECV before sending (see docs/UNETAPI.md).
+				;   A=NERR_CLOSED: the peer closed before the current chunk was
+				;   fully acknowledged. DE is the confirmed byte prefix.
+				;   Received peer data remains queued: RECV returns it, then
+				;   NERR_CLOSED. A close after a full chunk ACK is not an error
+				;   for that chunk; remaining bytes are still attempted, and a
+				;   fully acknowledged SEND succeeds before RECV reports close.
+				;   NERR_SEND: no acknowledgement and no peer close was observed.
 				;   With UNET_OPT_SENDSLICE > 0 may return NERR_AGAIN:
 				;   repeat the same call to continue the transaction.
 UNET_FN_RECV		EQU 7	; A=channel, DE=buffer, IX=max, IY=timeout_ms  ->  A, DE=received, IX=flags
@@ -84,7 +89,8 @@ UNET_FN_RXRESUME	EQU 14	; raise RTS to resume receive  ->  A (NERR_STATE before 
 UNET_FN_GETINFO		EQU 15	; A=field id, DE=dest, IX=max(incl NUL)  ->  A; empty string if
 				;   unset. IX=0 -> NERR_PARAM.
 UNET_FN_LASTERR		EQU 16	; DE=dest, IX=max  ->  A=0; copies the TAIL of the last AT/driver
-				;   response (the final ERROR/CLOSED line survives truncation)
+				;   response. Before the first non-zero API return this is live;
+				;   afterwards it is frozen until the next non-zero return.
 UNET_FN_SETOPT		EQU 17	; A=option id, DE=value  ->  A
 UNET_FN_LISTEN		EQU 18	; A=channel, DE=local TCP port (binary, 1..65535)  ->  A
 				;   Requires UNET_CAP_LISTEN. Starts the backend's single
