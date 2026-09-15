@@ -741,6 +741,288 @@ TEST_START
 	LD	(TCP.MUX_ACCEPT_OK),A
 	LD	(TCP.MUX_ACCEPT_CONNECT),A
 
+; ------------------------------------------------------------------
+; Vector 23: a partial +IPD for channel 1 goes silent; a read of channel 0
+; tries to stash its tail and times out having captured NOTHING. That is a
+; pause, not a gap: no empty record is queued, DEFER_LOST stays clear, the
+; exact remainder stays live and the next channel-1 read resumes it.
+; ------------------------------------------------------------------
+	LD	A,23
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET_ALL
+	LD	HL,IN_PART8_CH1
+	LD	BC,IN_PART8_CH1_LEN
+	CALL	SET_INPUT
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 4			; "ABCD" of 8
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 4
+	ASSERT_B TCP.MUX_PAYLOAD_LINK, 1
+	LD	HL,IN_EMPTY
+	LD	BC,0
+	CALL	SET_INPUT
+	LD	A,0				; the other channel polls into silence
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 4		; remainder intact
+	ASSERT_B TCP.MUX_PAYLOAD_LINK, 1
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 0		; no empty record
+	ASSERT_B TCP.DEFER_LOST, 0
+	SELECT_CH 0
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	A,1
+	CALL	TCP.MUX_HAS_PENDING
+	JP	NC,FAILED			; MORE is still reported
+	LD	HL,IN_TAIL_THEN_IJ
+	LD	BC,IN_TAIL_THEN_IJ_LEN
+	CALL	SET_INPUT
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 4			; "EFGH": the tail, once, in order
+	LD	HL,RECV_DEST
+	LD	DE,EXP_EFGH
+	LD	B,4
+	CALL	CMP_MEM
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 2			; then the next frame "IJ"
+	LD	HL,RECV_DEST
+	LD	DE,EXP_IJ
+	LD	B,2
+	CALL	CMP_MEM
+	SELECT_CH 1
+	ASSERT_B TCP.DEFER_LOST, 0
+
+; ------------------------------------------------------------------
+; Vector 24: the mirror switch (0 -> 1) with a NON-empty prefix captured
+; before the silence: the prefix is queued for channel 0 with its real
+; length, still no loss, and channel 0 gets prefix then tail, no duplicate.
+; ------------------------------------------------------------------
+	LD	A,24
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET_ALL
+	LD	HL,IN_PART8_CH0
+	LD	BC,IN_PART8_CH0_LEN
+	CALL	SET_INPUT
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 2			; "AB" of 8
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 6
+	LD	HL,IN_CD
+	LD	BC,IN_CD_LEN
+	CALL	SET_INPUT
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 4
+	ASSERT_B TCP.MUX_PAYLOAD_LINK, 0
+	SELECT_CH 0
+	ASSERT_W16 TCP.DEFER_W, 4		; {2,"CD"}: patched length
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	HL,TCP.DEFER_BUF0
+	LD	DE,EXP_FRAME_CD
+	LD	B,4
+	CALL	CMP_MEM
+	LD	HL,IN_EFGH
+	LD	BC,IN_EFGH_LEN
+	CALL	SET_INPUT
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 2			; the queued prefix first
+	LD	HL,RECV_DEST
+	LD	DE,EXP_CD
+	LD	B,2
+	CALL	CMP_MEM
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 4			; then the live tail
+	LD	HL,RECV_DEST
+	LD	DE,EXP_EFGH
+	LD	B,4
+	CALL	CMP_MEM
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	SELECT_CH 0
+	ASSERT_B TCP.DEFER_LOST, 0
+
+; ------------------------------------------------------------------
+; Vector 25: a stash of a live tail that does not fit the window is still a
+; real loss (drained, DEFER_LOST set on the owner only).
+; ------------------------------------------------------------------
+	LD	A,25
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET_ALL
+	LD	HL,IN_BIG_FOREIGN
+	LD	BC,IN_BIG_FOREIGN_LEN
+	CALL	SET_INPUT
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,1				; read one byte, 39 stay live
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 39
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	NC,FAILED			; idle after the drain
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 0		; 39+2 > 32: dropped
+	ASSERT_B TCP.DEFER_LOST, 1
+	SELECT_CH 0
+	ASSERT_B TCP.DEFER_LOST, 0
+
+; ------------------------------------------------------------------
+; Vector 26: the CLOSE/SEND-side rescue (MUX_CAPTURE_PENDING_PAYLOAD) keeps
+; the payload boundary across repeated timeouts - cancel and a repeated CLOSE
+; go through it - without queueing empty records or flagging a loss.
+; ------------------------------------------------------------------
+	LD	A,26
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET_ALL
+	LD	HL,5
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	A,1
+	LD	(TCP.MUX_PAYLOAD_LINK),A
+	LD	HL,IN_AB
+	LD	BC,IN_AB_LEN
+	CALL	SET_INPUT
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	JP	NC,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 3
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 4		; {2,"AB"}
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	HL,IN_EMPTY
+	LD	BC,0
+	CALL	SET_INPUT
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD	; e.g. the repeated CLOSE
+	JP	NC,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 3		; boundary unchanged
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 4		; no empty record
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	HL,IN_CDE
+	LD	BC,IN_CDE_LEN
+	CALL	SET_INPUT
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	JP	C,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 9		; {2,"AB"} {3,"CDE"}
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 5
+	LD	HL,RECV_DEST
+	LD	DE,EXP_ABCDE
+	LD	B,5
+	CALL	CMP_MEM
+
+; ------------------------------------------------------------------
+; Vector 27: a FOREIGN frame met while scanning goes silent mid-payload. Its
+; owner and tail are now tracked like any partial +IPD, so the next scan does
+; not mistake the binary tail for text, and channel 1 gets the whole frame.
+; ------------------------------------------------------------------
+	LD	A,27
+	LD	(STAGE),A
+	CALL	TCP.RX_DEFER_RESET_ALL
+	LD	HL,IN_PART6_CH1
+	LD	BC,IN_PART6_CH1_LEN
+	CALL	SET_INPUT
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 3
+	ASSERT_B TCP.MUX_PAYLOAD_LINK, 1
+	SELECT_CH 1
+	ASSERT_W16 TCP.DEFER_W, 5		; {3,"ABC"}
+	ASSERT_B TCP.DEFER_LOST, 0
+	LD	HL,IN_DEF_THEN_OWN
+	LD	BC,IN_DEF_THEN_OWN_LEN
+	CALL	SET_INPUT
+	LD	A,0
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 2			; "OK" for channel 0
+	LD	HL,RECV_DEST
+	LD	DE,EXP_OK
+	LD	B,2
+	CALL	CMP_MEM
+	ASSERT_W16 TCP.PAYLOAD_LEFT, 0
+	LD	A,1
+	LD	HL,RECV_DEST
+	LD	BC,100
+	LD	DE,1000
+	CALL	TCP.RECEIVE_MUX
+	JP	C,FAILED
+	LD	(LAST_BC),BC
+	ASSERT_W16 LAST_BC, 6			; "ABC"+"DEF", no gap, no repeat
+	LD	HL,RECV_DEST
+	LD	DE,EXP_ABCDEF
+	LD	B,6
+	CALL	CMP_MEM
+	SELECT_CH 1
+	ASSERT_B TCP.DEFER_LOST, 0
+
 	JP	PASSED
 
 FAILED
@@ -854,6 +1136,26 @@ IN_ALREADY_CONNECTED DB "ALREADY CONNECTED",13,10,"ERROR",13,10
 IN_ALREADY_CONNECTED_LEN EQU $-IN_ALREADY_CONNECTED
 IN_FOREIGN_CONNECT_ERROR DB "0,CONNECT",13,10,"ERROR",13,10
 IN_FOREIGN_CONNECT_ERROR_LEN EQU $-IN_FOREIGN_CONNECT_ERROR
+; Partial-payload pauses.
+IN_EMPTY	EQU $
+IN_PART8_CH1	DB "+IPD,1,8:ABCD"
+IN_PART8_CH1_LEN EQU $-IN_PART8_CH1
+IN_TAIL_THEN_IJ	DB "EFGH+IPD,1,2:IJ"
+IN_TAIL_THEN_IJ_LEN EQU $-IN_TAIL_THEN_IJ
+IN_PART8_CH0	DB "+IPD,0,8:AB"
+IN_PART8_CH0_LEN EQU $-IN_PART8_CH0
+IN_CD		DB "CD"
+IN_CD_LEN	EQU $-IN_CD
+IN_EFGH		DB "EFGH"
+IN_EFGH_LEN	EQU $-IN_EFGH
+IN_AB		DB "AB"
+IN_AB_LEN	EQU $-IN_AB
+IN_CDE		DB "CDE"
+IN_CDE_LEN	EQU $-IN_CDE
+IN_PART6_CH1	DB "+IPD,1,6:ABC"
+IN_PART6_CH1_LEN EQU $-IN_PART6_CH1
+IN_DEF_THEN_OWN	DB "DEF+IPD,0,2:OK"
+IN_DEF_THEN_OWN_LEN EQU $-IN_DEF_THEN_OWN
 
 ; Expected payloads and buffer contents ({len16le, payload}).
 EXP_HELLO	DB "HELLO"
@@ -863,6 +1165,12 @@ EXP_TAIL	DB "TAIL"
 EXP_FRAME_ABC	DB 3,0,"ABC"
 EXP_FRAME_WXYZ	DB 4,0,"WXYZ"
 EXP_FRAME_QQ	DB 2,0,"QQ"
+EXP_EFGH	DB "EFGH"
+EXP_IJ		DB "IJ"
+EXP_CD		DB "CD"
+EXP_FRAME_CD	DB 2,0,"CD"
+EXP_ABCDE	DB "ABCDE"
+EXP_OK		DB "OK"
 EXP_FRAME_ZZ	DB 2,0,"ZZ"
 EXP_FRAME_UVW	DB 3,0,"UVW"
 EXP_ABCDEF	DB "ABCDEF"

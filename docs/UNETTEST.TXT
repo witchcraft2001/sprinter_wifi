@@ -136,6 +136,12 @@ Behavior
                  does not stop the run - the next peer iteration (or UNLISTEN)
                  still executes, since a human running `nc` by hand may be
                  slow to connect.
+  Every exercise ends with CLOSE and NETDONE. A non-zero NETDONE status is
+  printed as "netdone failed: <n>" followed by LASTERR (for example 12 =
+  NERR_TIMEOUT, 8 = NERR_CANCEL after Esc, 13 = NERR_BUSY: the teardown
+  itself did not finish and would need another NETDONE) and makes the run
+  exit with status 3; the channels are released either way, so an immediate
+  rerun must still connect.
   Before SETOPT it also verifies ABI 0x0100 and the mandatory TCP capability.
   If these are invalid, it prints the loaded L1 image sizes plus the relocated
   GETCAPS bytes and exits instead of jumping farther through a damaged DLL.
@@ -147,7 +153,7 @@ Exit status
   1  Invalid command line.
   2  Network hardware not found, or the DLL could not be loaded.
   3  ESP/driver communication, connect, send, UDPOPEN, or LISTEN/UNLISTEN
-     error.
+     error, or NETDONE reported a failed close.
   4  Network not configured - run NETUP (or NETCFG -i / IFUP) first.
 
 Notes

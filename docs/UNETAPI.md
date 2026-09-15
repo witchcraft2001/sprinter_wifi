@@ -131,7 +131,7 @@ Register discipline for every UNET function:
 | 1 | FINI | - | (libman free hook; closes link) |
 | 2 | GETCAPS | - | A=0, DE=caps, IX=ABI version |
 | 3 | NETINIT | - | A |
-| 4 | NETDONE | - | A=0 |
+| 4 | NETDONE | - | A |
 | 5 | CONNECT | A=chan, DE=host, IX=port | A |
 | 6 | SEND | A=chan, DE=buf, IX=len | A, DE=sent |
 | 7 | RECV | A=chan, DE=buf, IX=max, IY=timeout_ms | A, DE=got, IX=flags |
@@ -207,10 +207,47 @@ response) or `NERR_BUSY` (ESP IP stack still warming up after join).
 `CLOSE` closes **one** channel and is idempotent. Data still buffered for that
 channel is discarded: to shut down gracefully, read until `NERR_CLOSED` first.
 
+The channel is released **whatever `A` says** - a following `CONNECT` on it is
+accepted. `A` tells the caller what the peer can be known to have learned
+(UNETESP >= 0.3.2; the same contract as UNETRTL, see `unet.inc`):
+
+| A | Meaning | UNETESP cause |
+|---|---------|---------------|
+| `NERR_OK` | the peer acknowledged, or there was nothing to close | `AT+CIPCLOSE=<link>` answered `OK`, or `ERROR` (the link was already gone); channel already closed; listening channel with no peer |
+| `NERR_HW` | nothing reached the wire | the 16550 never accepted the command |
+| `NERR_TIMEOUT` | the close went out unanswered | the ESP stayed silent (for example during a firmware stall) |
+| `NERR_CANCEL` | the user ended the wait early | Esc during the wait for the reply |
+| `NERR_BUSY` | UNETESP extension: the close could not be issued or was rejected | `busy p...`, or a partially received `+IPD` payload still occupied the UART so no AT text could be sent |
+
+After a non-zero status the ESP may still hold that firmware link open. UNETESP
+remembers it, never reuses its link id for a later `CONNECT` (channels then open
+on another free id), and sweeps it with `AT+CIPCLOSE=5` at the next `NETDONE`
+or `NETINIT`, or at the next `CONNECT`/`UDPOPEN`/`LISTEN` issued while no
+channel is open. So a plain "close failed, reconnect" sequence cleans the ESP
+by itself. Repeating `CLOSE` is harmless and returns `NERR_OK`.
+
+One `NERR_BUSY` is different and leaves the channel **open**: the one returned
+while a suspended SEND is pending (see "Non-blocking SEND"), because no AT text
+may interleave that transaction. Finish the SEND, then `CLOSE` again.
+
 `NETDONE` closes every channel and hands the ESP back in single-connection mode
 (`AT+CIPMUX=0`), which is what the stock utilities (WGET, FTP, TELNET, ...)
 expect to find. The network itself stays up, so a later `CONNECT` still works -
 it re-arms multi-connection mode by itself.
+
+`NETDONE` returns `NERR_OK` only when every channel closed cleanly and the
+teardown completed; otherwise it returns a failing channel's `CLOSE` status
+(channel 1's when both failed) and freezes `LASTERR` on the ESP's last
+response. Both channels are closed and released regardless, and the teardown
+still runs: a listener is dropped (`AT+CIPSERVER=0`), stale links are swept
+(`AT+CIPCLOSE=5`) and `AT+CIPMUX=0` is sent. It is idempotent, so a consumer
+may simply call it again. `NERR_BUSY` from `NETDONE` means the teardown itself
+could not finish - an unread `+IPD` tail still occupied the UART (its reply
+could not be told from payload bytes), or the ESP did not answer the stale-link
+sweep (those ids stay reserved) - and another `NETDONE` is needed; UNETESP
+never reports success while either is outstanding. Before 0.3.2, UNETESP's
+`NETDONE` could report a wrong status (a false success or a false `NERR_HW`)
+and left a channel open after a `NERR_BUSY` close.
 
 ### Function 5 - CONNECT
 
@@ -291,6 +328,16 @@ IX returns status flags, all scoped to the channel just read:
 | 1 | more data is already buffered for this channel; call RECV again |
 | 2 | data was lost since the last RECV on this channel: a UART overrun (16550 LSR) or a buffered frame dropped on overflow |
 | 3 | data is pending on the **other** channel (optional; UNETESP 0.3 and later) |
+
+Bit2 means a real gap and nothing else. A frame that merely **pauses** - the
+peer stops mid-`+IPD` and the UART goes silent - is not a loss, even when the
+silence hits while you are reading the *other* channel: UNETESP keeps the bytes
+that did arrive queued for their owner with their real length, keeps the exact
+unread remainder live, reports bit1 for the owner, and the owner's next RECVs
+return prefix and tail once each, in order. A consumer may therefore treat bit2
+as "resync required" without fearing false alarms from an idle link. (UNETESP
+0.3.1 and earlier raised bit2 on such a pause; a file transfer with a slow
+sender and a control-channel poll then restarted needlessly.)
 
 ### Function 9 - STATUS
 

@@ -40,7 +40,10 @@ TCP_CONT_TIMEOUT	EQU 120
 ; instead captured into a small buffer and handed to the next RECEIVE, closing
 ; the full-duplex race documented in docs/UNETAPI.md. One MTU-sized frame fits
 ; with headroom; a frame that would overflow is dropped (old behaviour) and the
-; sticky DEFER_LOST flag is raised. Only the UNET DLL enables this; every stock
+; sticky DEFER_LOST flag is raised. A UART timeout mid-frame is NOT a loss by
+; itself: the bytes that arrived are kept and the exact unread tail stays live
+; (PAYLOAD_LEFT), so the stream resumes without a gap; only a caller that
+; cannot resume raises DEFER_LOST. Only the UNET DLL enables this; every stock
 ; app builds without it and its .EXE stays byte-identical.
 	IFDEF ESP_TCP_RX_DEFER
 	IFNDEF TCP_RX_DEFER_SIZE
@@ -982,9 +985,11 @@ DEFER_COMPACT
 
 ; Store one frame of DE payload bytes read from the UART into the defer buffer.
 ; Compacts first. On overflow the payload is drained and discarded and
-; DEFER_LOST is set. On a UART timeout the partial frame is committed with its
-; actual length, DEFER_LOST is set, and CF=1 is returned. In: DE=len.
-; Out: CF=0 ok / CF=1 UART timeout. Clobbers A,BC,DE,HL (caller saves).
+; DEFER_LOST is set. On a UART timeout the bytes that did arrive are committed
+; as a shorter frame (nothing is queued when none arrived), DEFER_NEED holds
+; the unread tail and CF=1 is returned - DEFER_LOST is NOT set: the caller
+; decides whether it can resume that tail (see the ESP_TCP_RX_DEFER note).
+; In: DE=len. Out: CF=0 ok / CF=1 UART timeout. Clobbers A,BC,DE,HL.
 DEFER_STORE_FRAME
 	LD	A,D
 	OR	E
@@ -1051,6 +1056,20 @@ DEFER_STORE_FRAME
 	RET
 .timeout
 	LD	HL,(DEFER_WPTR)
+	LD	DE,(DEFER_FHDR)
+	OR	A
+	SBC	HL,DE
+	DEC	HL
+	DEC	HL			; HL = actual bytes captured
+	LD	A,H
+	OR	L
+	JR	Z,.timeout_empty	; DEFER_W untouched: no empty record queued
+	EX	DE,HL
+	LD	HL,(DEFER_FHDR)
+	LD	(HL),E			; patch header length lo
+	INC	HL
+	LD	(HL),D			; patch header length hi
+	LD	HL,(DEFER_WPTR)
 	IFDEF ESP_TCP_MUX
 	LD	DE,(DEFER_BASE)
 	ELSE
@@ -1058,20 +1077,8 @@ DEFER_STORE_FRAME
 	ENDIF
 	OR	A
 	SBC	HL,DE
-	LD	(DEFER_W),HL		; commit partial frame
-	LD	HL,(DEFER_WPTR)
-	LD	DE,(DEFER_FHDR)
-	OR	A
-	SBC	HL,DE
-	DEC	HL
-	DEC	HL			; HL = actual bytes captured
-	EX	DE,HL
-	LD	HL,(DEFER_FHDR)
-	LD	(HL),E			; patch header length lo
-	INC	HL
-	LD	(HL),D			; patch header length hi
-	LD	A,1
-	LD	(DEFER_LOST),A
+	LD	(DEFER_W),HL		; commit the partial frame
+.timeout_empty
 	SCF
 	RET
 .overflow
@@ -1159,10 +1166,15 @@ CAPTURE_IPD_FRAME
 .len_done
 	EX	DE,HL			; DE = payload length
 	CALL	DEFER_STORE_FRAME
-	JR	C,.fail
+	JR	C,.store_fail
 	POP	HL,DE,BC
 	XOR	A
 	RET
+.store_fail
+	; The header is gone and this path does not keep the unread tail live,
+	; so the rest of the frame really is a gap.
+	LD	A,1
+	LD	(DEFER_LOST),A
 .fail
 	POP	HL,DE,BC
 	LD	A,RES_RS_TIMEOUT
@@ -1654,6 +1666,14 @@ MUX_ALLOC_LINK
 ; equals E. Preserves BC (incl. the caller's C = channel), D/E.
 .claimed
 	PUSH	AF,BC,DE
+	; A link whose CIPCLOSE went unconfirmed may still be open on the ESP:
+	; CIPSTART on it would fail with ALREADY CONNECTED, so skip it too.
+	LD	A,E
+	CALL	MUX_LINK_BIT
+	LD	B,A
+	LD	A,(MUX_STALE_LINKS)
+	AND	B
+	JR	NZ,.yes
 	LD	HL,MUX_LINK_MAP
 	LD	B,TCP_MUX_CHANNELS
 .cloop
@@ -1668,6 +1688,34 @@ MUX_ALLOC_LINK
 .yes
 	POP	DE,BC,AF
 	SCF
+	RET
+
+; Remember a link whose AT+CIPCLOSE was not confirmed: the channel is released
+; locally, but the ESP may still hold the link open. MUX_ALLOC_LINK avoids it
+; until a CIPCLOSE=5 sweep (NETDONE, NETINIT, or the next open while no
+; channel is up) clears MUX_STALE_LINKS, or an inbound CONNECT lands on it.
+; In: A = firmware link id. Preserves every register.
+MUX_MARK_STALE_LINK
+	PUSH	AF,BC
+	CALL	MUX_LINK_BIT
+	LD	B,A
+	LD	A,(MUX_STALE_LINKS)
+	OR	B
+	LD	(MUX_STALE_LINKS),A
+	POP	BC,AF
+	RET
+
+; The ESP proved link A is free again (it announced "<link>,CONNECT" on it).
+; In: A = firmware link id. Preserves every register.
+MUX_CLEAR_STALE_LINK
+	PUSH	AF,BC
+	CALL	MUX_LINK_BIT
+	CPL
+	LD	B,A
+	LD	A,(MUX_STALE_LINKS)
+	AND	B
+	LD	(MUX_STALE_LINKS),A
+	POP	BC,AF
 	RET
 
 ; In: A = channel (already validated open). Out: TCP.LINK_ID = the channel's
@@ -1721,6 +1769,10 @@ MUX_TRY_ACCEPT
 	LD	A,B
 	CALL	MUX_LINK_MAP_ADDR
 	LD	(HL),C
+	; The firmware only hands out a free id: an unconfirmed close of this
+	; link (if any) evidently went through after all.
+	LD	A,C
+	CALL	MUX_CLEAR_STALE_LINK
 	; A fresh accepted connection must not replay a previous one's stale
 	; peer-close latch or buffered payload (LISTEN can re-arm the same
 	; channel many times).
@@ -1816,15 +1868,20 @@ MUX_HAS_PENDING
 ; Stash helpers. Bytes are read from the UART through the selected reader, so
 ; the payload is consumed either way; only its destination differs.
 ; ------------------------------------------------------
-; Stash the payload of the frame just parsed by MUX_PARSE_IPD_HDR.
+; Stash the payload of the frame just parsed by MUX_PARSE_IPD_HDR. It becomes
+; the live payload first, so a mid-frame timeout leaves its owner and exact
+; unread tail behind (like any other partial +IPD) instead of an untracked
+; binary tail the next scan would mistake for text.
 MUX_STASH_FRAME
 	LD	A,(MUX_FRAME_LINK)
+	LD	(MUX_PAYLOAD_LINK),A
 	LD	HL,(MUX_FRAME_LEN)
-	JR	MUX_STASH_LEN
-
+	LD	(PAYLOAD_LEFT),HL
+	; fall through
 ; Stash the unread tail of the live payload. Forget it only after the complete
 ; tail was consumed; otherwise preserve the exact remainder so no later AT
-; command can be injected into binary +IPD data.
+; command can be injected into binary +IPD data. The stored prefix is a
+; pause, not a gap: DEFER_LOST stays clear.
 MUX_STASH_PARTIAL
 	LD	HL,(PAYLOAD_LEFT)
 	LD	A,H
@@ -1901,20 +1958,12 @@ MUX_CAPTURE_IPD_FRAME
 .ALREADY_OPEN
 	CALL	MUX_PARSE_IPD_HDR
 	JR	C,.PARSE_FAIL
-	CALL	MUX_STASH_FRAME
-	JR	C,.PAYLOAD_FAIL
+	CALL	MUX_STASH_FRAME		; a timeout leaves the exact live tail behind
+	JR	C,.PARSE_FAIL
 	CALL	.CLOSE_READER
 	POP	HL,DE,BC
 	XOR	A
 	RET
-.PAYLOAD_FAIL
-	; The +IPD header is already gone, so remember exactly which live payload
-	; and how many bytes still own the UART stream. Clearing this would let the
-	; next command text be mistaken for peer data (or vice versa).
-	LD	HL,(DEFER_NEED)
-	LD	(PAYLOAD_LEFT),HL
-	LD	A,(MUX_FRAME_LINK)
-	LD	(MUX_PAYLOAD_LINK),A
 .PARSE_FAIL
 	CALL	.CLOSE_READER
 	POP	HL,DE,BC
@@ -3075,8 +3124,9 @@ IPD_STATE_PTR	DW 0
 ; DEFER_W/DEFER_R are byte offsets into DEFER_BUF; the buffered region holds a
 ; sequence of {2-byte LE length, payload} frames. DEFER_FRAME_LEFT is the
 ; not-yet-delivered tail of the frame a RECEIVE was in the middle of returning.
-; DEFER_LOST is sticky: a captured frame was dropped on overflow or truncated
-; by a UART timeout, so the peer stream has a gap.
+; DEFER_LOST is sticky: a captured frame was dropped on overflow (or, single-
+; link SEND-side only, truncated with its tail untracked), so the peer stream
+; has a gap. A mux-side timeout keeps the tail live and does not set it.
 ; DEFER_W..DEFER_LOST must stay contiguous and in this order: ESP_TCP_MUX swaps
 ; the whole block in and out of the per-channel contexts with one LDIR.
 DEFER_W		DW 0
@@ -3130,6 +3180,7 @@ WSO_RESUME	DB 0		; WAIT_SEND_OK must resume its partial line
 ; id 0..TCP_MUX_MAX_LINK; MUX_LINK_MAP is the one place that reconciles them.
 MUX_LINK_MAP	DS TCP_MUX_CHANNELS,0xFF	; channel -> firmware link id
 MUX_LISTEN_CH	DB 0xFF		; channel currently armed to accept, 0xFF = none
+MUX_STALE_LINKS	DB 0		; bit n: link n closed locally, CIPCLOSE unconfirmed
 MUX_CONNECT_LINK DB 0xFF	; link id from the last scanner CONNECT match
 MUX_CONN_PTR	DW 0		; WAIT_IPD_HEADER_MUX's "CONNECT" match cursor
 	ENDIF

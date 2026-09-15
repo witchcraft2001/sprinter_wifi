@@ -338,12 +338,29 @@ START
 	CALL	DO_CALL
 	LD	B,UNET_FN_NETDONE
 	CALL	DO_CALL
+	AND	A
+	JR	NZ,.netdone_failed
 	LD	HL,(HANDLE)
 	CALL	LIBMAN.l_free
 
 	LD	HL,MSG_DONE
 	CALL	PUTS_LN
 	LD	B,0
+	JP	EXIT
+.netdone_failed
+	; NETDONE names the channel close that failed (NERR_TIMEOUT/CANCEL/HW, or
+	; NERR_BUSY on UNETESP); the channels are released either way, but a
+	; hidden failure here is exactly what broke the next reconnect before.
+	PUSH	AF
+	LD	HL,MSG_NETDONE_FAILED
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	CALL	DUMP_LASTERR
+	LD	HL,(HANDLE)
+	CALL	LIBMAN.l_free
+	LD	B,3
 	JP	EXIT
 
 ; ======================================================
@@ -1934,6 +1951,7 @@ MSG_SENT	DB "request sent",0
 MSG_REPLY	DB "--- reply ---",0
 MSG_CLOSED	DB "--- closed ---",0
 MSG_DONE	DB "done.",0
+MSG_NETDONE_FAILED DB "netdone failed: ",0
 MSG_FAILED	DB "failed",0
 MSG_RECV_ERR	DB "receive error",0
 MSG_LASTERR	DB "lasterr: ",0

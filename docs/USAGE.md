@@ -280,7 +280,8 @@ Current utility-specific notes:
 - `UNETTEST.EXE` (diagnostic; ships on the floppy, not the ZIP) returns `0`
   after the full DLL walk, `1` for invalid command line, `2` when hardware is
   not found or the DLL cannot load, `3` on communication/connect/send errors
-  and `4` when the network is not configured.
+  or when NETDONE reports a failed close, and `4` when the network is not
+  configured.
 
 ## UNET network DLL
 

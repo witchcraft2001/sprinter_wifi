@@ -224,7 +224,7 @@ TEST_START
 	ASSERT_B WIFI.TX_STRING_COUNT, 0
 	ASSERT_W16 TCP.PAYLOAD_LEFT, 3
 	ASSERT_W16 TCP.DEFER_W, 4	; patched header + "AB"
-	ASSERT_B TCP.DEFER_LOST, 1	; the split is visible diagnostically
+	ASSERT_B TCP.DEFER_LOST, 0	; a pause with the tail still live is no gap
 	LD	HL,IN_PART_B
 	LD	BC,IN_PART_B_LEN
 	CALL	SET_INPUT

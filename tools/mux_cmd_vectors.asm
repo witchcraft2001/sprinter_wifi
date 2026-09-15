@@ -545,7 +545,655 @@ TEST_START
 	LD	A,135
 	LD	(STAGE),A
 
+; ------------------------------------------------------------------
+; Vector 14: the real CLOSE_CHANNEL always releases the channel and reports
+; what the peer can be known to have learned (UNET CLOSE contract). Every
+; unconfirmed close marks its firmware link stale, and MUX_ALLOC_LINK must not
+; hand that link to the next CIPSTART.
+; ------------------------------------------------------------------
+	LD	A,14
+	LD	(STAGE),A
+	LD	HL,TCP.MUX_WAIT_SEND_OK
+	LD	DE,FAKE_WAIT
+	CALL	STUB_JP
+	LD	HL,TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	LD	DE,FAKE_CAPTURE
+	CALL	STUB_JP
+	XOR	A
+	LD	(UNET.CH_STATE),A
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+	LD	(TCP.MUX_LINK_MAP),A
+
+	; 14.1: CIPCLOSE went out, the ESP stayed silent -> NERR_TIMEOUT.
+	LD	A,141
+	LD	(STAGE),A
+	LD	A,RES_RS_TIMEOUT
+	LD	B,1			; link 1
+	CALL	CLOSE_CH1_WITH
+	CP	NERR_TIMEOUT
+	JP	NZ,FAILED
+	LD	DE,EXP_CLOSE1
+	CALL	CHECK_CMD		; the command really was transmitted
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	; The stale link 1 is skipped: channel 1 reopens on link 0, not identity.
+	LD	A,1
+	CALL	TCP.MUX_ALLOC_LINK
+	LD	A,(TCP.LINK_ID)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_LINK_MAP+1)
+	AND	A
+	JP	NZ,FAILED
+	; Two stale links (0,1) and channel 0 unmapped: the next free id is 2.
+	LD	A,0x03
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	A,1
+	CALL	TCP.MUX_ALLOC_LINK
+	LD	A,(TCP.LINK_ID)
+	CP	2
+	JP	NZ,FAILED
+
+	; 14.2: CLOSE on an already closed channel is idempotent: 0, no UART.
+	LD	A,142
+	LD	(STAGE),A
+	XOR	A
+	LD	(UNET.CH_STATE+1),A
+	LD	HL,0
+	LD	(UART_CALL_PTR),HL
+	LD	A,1
+	CALL	SET_CHANNEL
+	CALL	UNET.CLOSE_CHANNEL
+	JP	C,FAILED
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,(UART_CALL_PTR)
+	LD	A,H
+	OR	L
+	JP	NZ,FAILED
+
+	; 14.3: "busy p..." rejected CIPCLOSE -> NERR_BUSY, channel still released,
+	; stale bit taken from the mapped link (3), not from the channel number.
+	LD	A,143
+	LD	(STAGE),A
+	LD	A,RES_BUSY
+	LD	B,3
+	CALL	CLOSE_CH1_WITH
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x08
+	JP	NZ,FAILED
+
+	; 14.4: the user cancelled the wait -> NERR_CANCEL, cancel flag consumed.
+	LD	A,144
+	LD	(STAGE),A
+	LD	A,1
+	LD	(WCOMMON.CANCELLED),A
+	LD	A,RES_RS_TIMEOUT
+	LD	B,4
+	CALL	CLOSE_CH1_WITH
+	CP	NERR_CANCEL
+	JP	NZ,FAILED
+	LD	A,(WCOMMON.CANCELLED)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x10
+	JP	NZ,FAILED
+
+	; 14.5: the command never left the 16550 -> NERR_HW.
+	LD	A,145
+	LD	(STAGE),A
+	LD	A,1
+	LD	(FAKE_TX_FAIL),A
+	XOR	A
+	LD	B,1
+	CALL	CLOSE_CH1_WITH
+	CP	NERR_HW
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	XOR	A
+	LD	(FAKE_TX_FAIL),A
+
+	; 14.6: an explicit ERROR is an answer (the link is already gone) -> 0,
+	; nothing stale.
+	LD	A,146
+	LD	(STAGE),A
+	LD	A,RES_ERROR
+	LD	B,1
+	CALL	CLOSE_CH1_WITH
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	AND	A
+	JP	NZ,FAILED
+
+	; 14.7: a partial +IPD payload still on the wire: no AT text may be sent,
+	; the channel is released anyway and reports NERR_BUSY.
+	LD	A,147
+	LD	(STAGE),A
+	LD	A,1
+	LD	(FAKE_CAPTURE_FAIL),A
+	LD	HL,0
+	LD	(UART_CALL_PTR),HL
+	XOR	A
+	LD	B,1
+	CALL	CLOSE_CH1_WITH
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	HL,(UART_CALL_PTR)
+	LD	A,H
+	OR	L
+	JP	NZ,FAILED		; CIPCLOSE was not transmitted
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	XOR	A
+	LD	(FAKE_CAPTURE_FAIL),A
+	LD	(TCP.MUX_STALE_LINKS),A
+
+; ------------------------------------------------------------------
+; Vector 15: CLOSE_LINK closes both channels in order 0,1 whatever the first
+; one returned, reports the second channel's status when non-zero, else the
+; first one's, and restores ARG_CH. CLOSE_CHANNEL is mocked from here on.
+; ------------------------------------------------------------------
+	LD	A,15
+	LD	(STAGE),A
+	LD	HL,UNET.CLOSE_CHANNEL
+	LD	DE,MOCK_CLOSE
+	CALL	STUB_JP
+	LD	HL,CLOSE_LINK_CASES
+	LD	B,CLOSE_LINK_CASE_COUNT
+	LD	C,151
+.close_link_case
+	PUSH	BC
+	LD	A,C
+	LD	(STAGE),A
+	CALL	CLOSE_LINK_CASE
+	POP	BC
+	INC	C
+	DJNZ	.close_link_case
+
+; ------------------------------------------------------------------
+; Vector 16: NETDONE returns the close status and still completes the
+; teardown: the stale-link sweep precedes CIPMUX=0, a forced listener is
+; dropped, and a non-zero status freezes LASTERR through API_RETURN.
+; ------------------------------------------------------------------
+	LD	A,16
+	LD	(STAGE),A
+	LD	HL,WIFI.UART_TX_CMD
+	LD	DE,UART_CMD_SPY
+	CALL	STUB_JP
+	LD	A,1
+	LD	(UNET.INITED),A
+	XOR	A
+	LD	(UNET.RX_PAUSED),A
+	LD	(UNET.CH_STATE),A
+	LD	(UNET.CH_STATE+1),A
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	HL,0
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	A,0xFF
+	LD	(UNET.PEND_CH),A
+	LD	(TCP.MUX_LISTEN_CH),A
+
+	; 16.1: the SNC report case - first close BUSY, second OK. The old code
+	; returned the saved ARG_CH (0) here, i.e. a false success.
+	LD	A,161
+	LD	(STAGE),A
+	LD	DE,NERR_BUSY		; D = ch1 status, E = ch0 status
+	CALL	NETDONE_WITH
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG1
+	LD	A,(UNET.MUX_ACTIVE)
+	AND	A
+	JP	NZ,FAILED
+
+	; 16.2: both closes OK with ARG_CH=1 - the old code reported NERR_HW.
+	LD	A,162
+	LD	(STAGE),A
+	LD	A,1
+	LD	(UNET.ARG_CH),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(UNET.ARG_CH)
+	CP	1
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG1
+
+	; 16.3: an unconfirmed close left link 1 stale: CIPCLOSE=5 first, then
+	; CIPMUX=0; the failing channel's status is still returned.
+	LD	A,163
+	LD	(STAGE),A
+	LD	A,0x02
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	DE,NERR_TIMEOUT << 8
+	CALL	NETDONE_WITH
+	CP	NERR_TIMEOUT
+	JP	NZ,FAILED
+	LD	HL,(CMD_LOG_PTR)
+	LD	DE,CMD_LOG+4
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,(CMD_LOG)
+	LD	DE,UNET.CMD_CIPCLOSE_ALL
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG+2
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG_AT
+	LD	A,(TCP.MUX_STALE_LINKS)
+	AND	A
+	JP	NZ,FAILED
+
+	; 16.4: an unread +IPD tail that an earlier CLOSE could not rescue is
+	; retried by NETDONE itself. While it cannot be read: no AT text at all,
+	; CIPMUX stays armed and NETDONE says NERR_BUSY even though both channels
+	; are already closed (a repeated NETDONE must not claim success).
+	LD	A,164
+	LD	(STAGE),A
+	LD	A,1
+	LD	(FAKE_CAPTURE_FAIL),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	HL,(CMD_LOG_PTR)
+	LD	DE,CMD_LOG
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	A,(UNET.MUX_ACTIVE)
+	AND	A
+	JP	Z,FAILED
+	; Once the tail is rescued the same NETDONE completes normally.
+	XOR	A
+	LD	(FAKE_CAPTURE_FAIL),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG1
+
+	; 16.7: a sweep the ESP does not answer keeps the stale mask (the ids
+	; must stay off-limits) and reports NERR_BUSY; an ERROR answer (nothing
+	; was open) counts as done.
+	LD	A,167
+	LD	(STAGE),A
+	LD	A,0x02
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	A,RES_RS_TIMEOUT
+	LD	(FAKE_CMD_RES),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPCLOSE_ALL
+	CALL	CHECK_LOG1		; and no CIPMUX=0 after it
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	LD	A,(UNET.MUX_ACTIVE)
+	AND	A
+	JP	Z,FAILED
+	LD	A,RES_ERROR
+	LD	(FAKE_CMD_RES),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG+2
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG_AT
+	XOR	A
+	LD	(FAKE_CMD_RES),A
+
+	; 16.5: an armed listener is forced down before CIPMUX=0.
+	LD	A,165
+	LD	(STAGE),A
+	XOR	A
+	LD	(TCP.MUX_LISTEN_CH),A
+	LD	A,3
+	LD	(UNET.CH_STATE),A
+	LD	DE,0
+	CALL	NETDONE_WITH
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPSERVER_OFF
+	CALL	CHECK_LOG_AT
+	LD	HL,CMD_LOG+2
+	LD	DE,UNET.CMD_CIPMUX0
+	CALL	CHECK_LOG_AT
+	LD	A,(UNET.CH_STATE)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_LISTEN_CH)
+	CP	0xFF
+	JP	NZ,FAILED
+
+	; 16.6: through the public entry a failing NETDONE freezes LASTERR.
+	LD	A,166
+	LD	(STAGE),A
+	XOR	A
+	LD	(UNET.LASTERR_FROZEN),A
+	LD	A,1
+	LD	(UNET.MUX_ACTIVE),A
+	LD	HL,MOCK_LOG
+	LD	(MOCK_LOG_PTR),HL
+	LD	HL,CMD_LOG
+	LD	(CMD_LOG_PTR),HL
+	LD	HL,NERR_CANCEL
+	LD	(MOCK_STATUS),HL
+	CALL	UNET.API_NETDONE
+	JP	C,FAILED
+	CP	NERR_CANCEL
+	JP	NZ,FAILED
+	LD	A,(UNET.LASTERR_FROZEN)
+	AND	A
+	JP	Z,FAILED
+
+; ------------------------------------------------------------------
+; Vector 17: a leaked link is swept by the next open while nothing is up
+; (CIPCLOSE=5 before CIPMUX=1), never while a channel is live, and the
+; allocator steers around it until then.
+; ------------------------------------------------------------------
+	LD	A,17
+	LD	(STAGE),A
+	LD	A,0x02
+	LD	(TCP.MUX_STALE_LINKS),A
+	XOR	A
+	LD	(UNET.MUX_ACTIVE),A
+	; The ESP stays silent on the sweep: CONNECT is refused as busy, the
+	; channel stays closed and the stale id is still remembered.
+	LD	A,RES_RS_TIMEOUT
+	LD	(FAKE_CMD_RES),A
+	LD	HL,CMD_LOG
+	LD	(CMD_LOG_PTR),HL
+	XOR	A
+	LD	DE,HOST_STR
+	LD	IX,PORT_STR
+	CALL	UNET.F_CONNECT
+	CP	NERR_BUSY
+	JP	NZ,FAILED
+	LD	A,(UNET.CH_STATE)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPCLOSE_ALL
+	CALL	CHECK_LOG1
+	XOR	A
+	LD	(FAKE_CMD_RES),A
+	LD	HL,CMD_LOG
+	LD	(CMD_LOG_PTR),HL
+	XOR	A
+	LD	DE,HOST_STR
+	LD	IX,PORT_STR
+	CALL	UNET.F_CONNECT
+	AND	A
+	JP	NZ,FAILED
+	LD	A,171
+	LD	(STAGE),A
+	LD	HL,(CMD_LOG_PTR)
+	LD	DE,CMD_LOG+4
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,CMD_LOG
+	LD	DE,UNET.CMD_CIPCLOSE_ALL
+	CALL	CHECK_LOG_AT
+	LD	HL,CMD_LOG+2
+	LD	DE,UNET.CMD_CIPMUX1
+	CALL	CHECK_LOG_AT
+	LD	A,(TCP.MUX_STALE_LINKS)
+	AND	A
+	JP	NZ,FAILED
+	LD	DE,EXP_TCP0
+	CALL	CHECK_CMD		; swept first, so identity link 0 was free
+	LD	A,172
+	LD	(STAGE),A
+	; Channel 0 is live now: a stale link 1 is neither swept nor handed to
+	; channel 1, which opens on the next free id instead.
+	LD	A,0x02
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	HL,CMD_LOG
+	LD	(CMD_LOG_PTR),HL
+	LD	A,1
+	LD	DE,HOST_STR
+	LD	IX,PORT2_STR
+	CALL	UNET.F_CONNECT
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,(CMD_LOG_PTR)
+	LD	DE,CMD_LOG
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED		; no AT command besides CIPSTART
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	LD	DE,EXP_TCP1_LINK2
+	CALL	CHECK_CMD
+	XOR	A
+	LD	(UNET.CH_STATE),A
+	LD	(UNET.CH_STATE+1),A
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	HL,TCP.MUX_LINK_MAP
+	LD	(HL),0xFF
+	INC	HL
+	LD	(HL),0xFF
+
+; ------------------------------------------------------------------
+; Vector 18: an inbound CONNECT landing on a stale link proves the firmware
+; freed it - the accept clears its stale bit and nothing else.
+; ------------------------------------------------------------------
+	LD	A,18
+	LD	(STAGE),A
+	LD	A,0x0A			; links 1 and 3 stale
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	A,1
+	LD	(TCP.MUX_LISTEN_CH),A
+	LD	A,3
+	CALL	TCP.MUX_TRY_ACCEPT
+	LD	A,(TCP.MUX_LINK_MAP+1)
+	CP	3
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_STALE_LINKS)
+	CP	0x02
+	JP	NZ,FAILED
+	LD	A,0xFF
+	LD	(TCP.MUX_LISTEN_CH),A
+
 	JP	PASSED
+
+; In: A = fake MUX_WAIT_SEND_OK result (0 = OK), B = firmware link mapped to
+; channel 1. Opens channel 1 on that link and runs the real CLOSE_CHANNEL.
+; Out: A = close status; fails the test on CF=1 or when channel 1 or its map
+; entry was not released.
+CLOSE_CH1_WITH
+	LD	(FAKE_WAIT_RES),A
+	LD	A,B
+	LD	(TCP.MUX_LINK_MAP+1),A
+	XOR	A
+	LD	(TCP.MUX_STALE_LINKS),A
+	LD	A,1
+	LD	(UNET.CH_STATE+1),A
+	CALL	SET_CHANNEL
+	CALL	UNET.CLOSE_CHANNEL
+	JP	C,FAILED
+	LD	B,A
+	LD	A,(UNET.CH_STATE+1)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(TCP.MUX_LINK_MAP+1)
+	CP	0xFF
+	JP	NZ,FAILED
+	XOR	A
+	LD	(FAKE_WAIT_RES),A
+	LD	A,B
+	RET
+
+; In: HL = case {ch0 status, ch1 status, expected}. Runs it with ARG_CH=0
+; and again with ARG_CH=1. Out: HL = next case.
+CLOSE_LINK_CASE
+	LD	A,(HL)
+	LD	(MOCK_STATUS),A
+	INC	HL
+	LD	A,(HL)
+	LD	(MOCK_STATUS+1),A
+	INC	HL
+	LD	A,(HL)
+	LD	(MOCK_EXPECT),A
+	INC	HL
+	PUSH	HL
+	XOR	A
+	CALL	.one
+	LD	A,1
+	CALL	.one
+	POP	HL
+	RET
+.one
+	LD	(UNET.ARG_CH),A
+	LD	(MOCK_ARG),A
+	LD	HL,MOCK_LOG
+	LD	(MOCK_LOG_PTR),HL
+	CALL	UNET.CLOSE_LINK
+	JP	C,FAILED
+	LD	B,A
+	LD	A,(MOCK_EXPECT)
+	CP	B
+	JP	NZ,FAILED
+	LD	A,(MOCK_ARG)
+	LD	B,A
+	LD	A,(UNET.ARG_CH)
+	CP	B
+	JP	NZ,FAILED		; ARG_CH restored
+	LD	HL,(MOCK_LOG_PTR)
+	LD	DE,MOCK_LOG+2
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED		; exactly two closes
+	LD	A,(MOCK_LOG)
+	AND	A
+	JP	NZ,FAILED
+	LD	A,(MOCK_LOG+1)
+	CP	1
+	JP	NZ,FAILED		; channel 0 first, then channel 1
+	RET
+
+; In: E = channel 0 close status, D = channel 1 close status. Clears both
+; logs, re-arms CIPMUX and calls F_NETDONE. Out: A = NETDONE result (CF=1
+; fails the test).
+NETDONE_WITH
+	LD	(MOCK_STATUS),DE
+	LD	HL,MOCK_LOG
+	LD	(MOCK_LOG_PTR),HL
+	LD	HL,CMD_LOG
+	LD	(CMD_LOG_PTR),HL
+	LD	A,1
+	LD	(UNET.MUX_ACTIVE),A
+	CALL	UNET.F_NETDONE
+	JP	C,FAILED
+	RET
+
+; In: HL = log, DE = the only command expected in it.
+CHECK_LOG1
+	PUSH	HL
+	LD	HL,(CMD_LOG_PTR)
+	PUSH	DE
+	LD	DE,CMD_LOG+2
+	OR	A
+	SBC	HL,DE
+	POP	DE
+	POP	HL
+	JP	NZ,FAILED
+; In: HL = log slot, DE = command expected there.
+CHECK_LOG_AT
+	LD	A,(HL)
+	INC	HL
+	LD	H,(HL)
+	LD	L,A
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	RET
+
+; CLOSE_CHANNEL mock: log the channel, return MOCK_STATUS[channel], clobber BC
+; like the real routine may.
+MOCK_CLOSE
+	LD	A,(UNET.ARG_CH)
+	LD	HL,(MOCK_LOG_PTR)
+	LD	(HL),A
+	INC	HL
+	LD	(MOCK_LOG_PTR),HL
+	LD	HL,MOCK_STATUS
+	LD	C,A
+	LD	B,0
+	ADD	HL,BC
+	LD	A,(HL)
+	LD	BC,0xA55A
+	OR	A
+	RET
+
+; WIFI.UART_TX_CMD spy for SEND_AT_BUSY: log the command pointer, answer with
+; FAKE_CMD_RES (0 = OK) under the RES_*/CF contract, with an empty response
+; line so SEND_AT_BUSY never mistakes it for "busy" and retries.
+UART_CMD_SPY
+	PUSH	DE
+	EX	DE,HL
+	LD	HL,(CMD_LOG_PTR)
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	INC	HL
+	LD	(CMD_LOG_PTR),HL
+	EX	DE,HL
+	POP	DE
+	XOR	A
+	LD	(WIFI.RS_BUFF),A
+	LD	A,(FAKE_CMD_RES)
+	AND	A
+	RET	Z
+	SCF
+	RET
+
+FAKE_WAIT
+	LD	A,(FAKE_WAIT_RES)
+	AND	A
+	RET	Z
+	SCF
+	RET
+
+FAKE_CAPTURE
+	LD	A,(FAKE_CAPTURE_FAIL)
+	AND	A
+	RET	Z
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
 
 ; Fake one SEND OK, then capture one frame and latch an orderly peer close.
 ; The payload is queued in the real per-channel defer window; the failure path
@@ -613,7 +1261,10 @@ STUB_JP
 
 UART_TX_SPY
 	LD	(UART_CALL_PTR),HL
-	XOR	A
+	LD	A,(FAKE_TX_FAIL)
+	AND	A
+	RET	Z
+	SCF				; transmitter never became ready
 	RET
 
 FAILED
@@ -694,6 +1345,7 @@ LPORT_STR	EQU HOST_STR + 60
 
 EXP_TCP0	DB "AT+CIPSTART=0,",34,"TCP",34,",",34,"192.168.1.36",34,",9099",13,10,0
 EXP_TCP1	DB "AT+CIPSTART=1,",34,"TCP",34,",",34,"192.168.1.36",34,",9100",13,10,0
+EXP_TCP1_LINK2	DB "AT+CIPSTART=2,",34,"TCP",34,",",34,"192.168.1.36",34,",9100",13,10,0
 EXP_UDP1	DB "AT+CIPSTART=1,",34,"UDP",34,",",34,"192.168.1.36",34,",9099,1070,2",13,10,0
 EXP_UDP0	DB "AT+CIPSTART=0,",34,"UDP",34,",",34,"192.168.1.36",34,",9099,5000,2",13,10,0
 EXP_CLOSE1	DB "AT+CIPCLOSE=1",13,10,0
@@ -723,6 +1375,25 @@ HTTP_TEXT DB "HTTP/1.1 400",0
 HTTP_TEXT_LEN EQU $-HTTP_TEXT-1
 HTTP_RESPONSE EQU HTTP_TEXT_LEN
 FAKE_SEND_CALLS DB 0
+FAKE_TX_FAIL	DB 0
+FAKE_WAIT_RES	DB 0
+FAKE_CAPTURE_FAIL DB 0
+FAKE_CMD_RES	DB 0
+MOCK_STATUS	DB 0,0		; CLOSE_CHANNEL mock result for channel 0, 1
+MOCK_EXPECT	DB 0
+MOCK_ARG	DB 0
+MOCK_LOG_PTR	DW 0
+MOCK_LOG	DS 4,0
+CMD_LOG_PTR	DW 0
+CMD_LOG		DS 8,0
+; {channel 0 status, channel 1 status, expected CLOSE_LINK result}
+CLOSE_LINK_CASES
+	DB 0,0,0
+	DB NERR_BUSY,0,NERR_BUSY
+	DB 0,NERR_BUSY,NERR_BUSY
+	DB NERR_HW,NERR_TIMEOUT,NERR_TIMEOUT
+	DB NERR_CANCEL,0,NERR_CANCEL
+CLOSE_LINK_CASE_COUNT EQU ($-CLOSE_LINK_CASES)/3
 FAKE_SEND_FULL_ACK DB 0
 SEND_BUFFER EQU 0x8000
 RECV_BUFFER EQU 0x8800

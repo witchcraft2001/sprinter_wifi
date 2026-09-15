@@ -11,13 +11,13 @@
 ; a session that NETUP did not bring up as NET_ESP_FW=2.2.2 (see
 ; SELECT_ENV_RX_PROFILE), so it fails loudly instead of driving 2.2.1 firmware
 ; with the wrong command set. The L1 header name announces the target and full
-; DLL version (for example, "UNETESP v0.3.1") to consumers such as
+; DLL version (for example, "UNETESP v0.3.2") to consumers such as
 ; UNETTEST.
 ;
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetesp.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNETESP v0.3.1" --version 0.3 --no-compress \
+;     --name "UNETESP v0.3.2" --version 0.3 --no-compress \
 ;     -o build/UNETESP.DLL
 ;
 ; The L1 header has a compact, encoded major.minor version plus a 15-byte
@@ -353,6 +353,10 @@ F_CLOSE
 ; single-connection mode the stock utilities expect. The network itself
 ; (Wi-Fi join, UART settings) stays up, so a later CONNECT still works: it
 ; re-arms multi-connection mode through ENSURE_MUX.
+; Out: A = the failing channel's CLOSE status (0 when both closed cleanly),
+; or NERR_BUSY when the teardown itself could not finish (an unread +IPD tail
+; still on the wire, or the stale-link sweep unanswered): the channels are
+; released either way, but NETDONE must be called again to complete it.
 ; ======================================================
 F_NETDONE
 	CALL	CHECK_RX_ACTIVE
@@ -360,8 +364,13 @@ F_NETDONE
 	CALL	RESOLVE_PENDING		; no AT text may interleave a suspended send
 	JP	C,RET_BUSY
 	CALL	CLOSE_LINK
-	AND	A
-	RET	NZ			; do not inject CIPMUX while a close is unresolved
+	PUSH	AF			; A = close status, returned at .done
+	; A close that could not rescue a partial +IPD payload left its tail on
+	; the wire (the channel is closed by now, so CLOSE_LINK did not retry):
+	; plain AT replies would be read out of payload bytes. Rescue it here,
+	; else report the teardown as unfinished.
+	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
+	JR	C,.incomplete
 	; CLOSE_LINK may have left an accepted channel re-armed at "listening"
 	; (CH_RELEASE deliberately keeps LISTEN alive across an ordinary CLOSE);
 	; NETDONE closes everything, so force the server down too. Every channel
@@ -384,6 +393,9 @@ F_NETDONE
 	LD	A,0xFF
 	LD	(TCP.MUX_LISTEN_CH),A
 .no_listen
+	; A link whose CIPCLOSE went unconfirmed would make ESP-AT reject CIPMUX=0.
+	CALL	SWEEP_STALE_LINKS	; every channel is closed now: safe
+	JR	C,.incomplete		; unanswered: the mask is kept for a retry
 	LD	A,(MUX_ACTIVE)
 	AND	A
 	JR	Z,.done
@@ -393,7 +405,13 @@ F_NETDONE
 	XOR	A
 	LD	(MUX_ACTIVE),A
 .done
-	XOR	A
+	POP	AF
+	OR	A			; CF=0
+	RET
+.incomplete
+	POP	AF			; the close status is moot: call NETDONE again
+	LD	A,NERR_BUSY
+	OR	A			; CF=0
 	RET
 
 ; ======================================================
@@ -1754,6 +1772,7 @@ RESET_CHANNEL_STATE
 	LD	(CH_STATE),A
 	LD	(CH_STATE+1),A
 	LD	(SEND_CLOSE_MASK),A
+	LD	(TCP.MUX_STALE_LINKS),A
 	LD	A,0xFF
 	LD	(TCP.MUX_LISTEN_CH),A
 	LD	HL,TCP.MUX_LINK_MAP
@@ -1762,9 +1781,36 @@ RESET_CHANNEL_STATE
 	LD	(HL),0xFF
 	JP	TCP.RX_DEFER_RESET_ALL
 
+; Drop links the ESP may still hold after an unconfirmed CIPCLOSE, but only
+; while no channel is open: AT+CIPCLOSE=5 closes every link, a live one
+; included. The mask is cleared once the ESP has ANSWERED - OK, or ERROR/FAIL
+; (nothing was open) - and kept when it stayed silent or busy, so those ids
+; remain off-limits until a later sweep gets through.
+; Out: CF=0 done (or nothing to do / a channel is live), CF=1 unanswered.
+SWEEP_STALE_LINKS
+	LD	A,(TCP.MUX_STALE_LINKS)
+	AND	A
+	RET	Z
+	CALL	ANY_CHANNEL_OPEN
+	RET	NZ			; a live channel would be closed with them
+	LD	HL,CMD_CIPCLOSE_ALL
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	SEND_AT_BUSY
+	CP	RES_TX_TIMEOUT		; 0/ERROR/FAIL answered; timeouts/busy did not
+	CCF
+	RET	C
+	XOR	A
+	LD	(TCP.MUX_STALE_LINKS),A
+	RET				; CF=0
+
 ; Re-arm AT+CIPMUX=1 if NETDONE handed the ESP back in single-connection mode.
+; Called before every open (CONNECT/UDPOPEN/LISTEN, and the CONNECT ladder's
+; re-arm), so it is also where a leaked link gets swept once nothing is open -
+; the reconnect right after a failed close is exactly when it matters.
 ; Out: CF=1 when the ESP stayed busy.
 ENSURE_MUX
+	CALL	SWEEP_STALE_LINKS
+	RET	C			; an ESP not answering a plain AT is busy
 	LD	A,(MUX_ACTIVE)
 	AND	A
 	RET	NZ			; CF=0
@@ -1781,6 +1827,18 @@ ENSURE_MUX
 ; line loop, because the peer on the OTHER channel may transmit while this one
 ; is closing (an FTP server sends "226 Transfer complete" on the control link
 ; exactly when the client closes the data link).
+; The channel is released locally whatever happens (UNET CLOSE contract); A
+; says what the peer can be known to have learned:
+;   0            CIPCLOSE answered (OK, or ERROR: the link was already gone),
+;                or there was nothing to close on the wire
+;   NERR_HW      the command never left the 16550
+;   NERR_TIMEOUT the command went out, the ESP stayed silent
+;   NERR_CANCEL  the user ended that wait early
+;   NERR_BUSY    ESP extension: "busy p..." rejected it, or a partial +IPD
+;                payload still occupies the wire so no AT text could be sent
+; Every non-zero outcome marks the link stale (MUX_MARK_STALE_LINK) so it is
+; not reused before NETDONE/NETINIT sweeps it with AT+CIPCLOSE=5.
+; Out: CF=0, A = status.
 CLOSE_CHANNEL
 	CALL	GET_CH_STATE
 	AND	A
@@ -1789,9 +1847,9 @@ CLOSE_CHANNEL
 	JR	Z,.close_listening	; armed, no peer yet: no link to CIPCLOSE
 	LD	A,(ARG_CH)
 	CALL	TCP.SET_LINK_FROM_MAP
-	JR	C,.forget		; no mapped link: state was already stale
+	JR	C,.confirmed		; no mapped link: state was already stale
 	CALL	TCP.MUX_CAPTURE_PENDING_PAYLOAD
-	JR	C,.rx_busy		; never inject AT text into a partial +IPD payload
+	JR	C,.busy			; never inject AT text into a partial +IPD payload
 	LD	HL,TCP.CMD_BUFFER
 	LD	DE,CMD_CIPCLOSE_PREFIX
 	CALL	TCP.APPEND_STR
@@ -1800,27 +1858,44 @@ CLOSE_CHANNEL
 	CALL	TCP.APPEND_STR
 	LD	HL,TCP.CMD_BUFFER
 	CALL	WIFI.UART_TX_STRING
-	JR	C,.tx_busy
+	LD	A,NERR_HW
+	JR	C,.stale		; nothing reached the wire
 	LD	A,1
 	LD	(TCP.MUX_ACCEPT_OK),A
 	LD	(TCP.MUX_ACCEPT_CLOSED),A
 	CALL	TCP.MUX_WAIT_SEND_OK	; tolerate explicit ERROR: link may be gone already
-	JR	NC,.wait_done
-	CP	RES_RS_TIMEOUT
-	JR	Z,.wait_busy		; ambiguous: keep local state, do not send more AT
+	JR	NC,.confirmed
 	CP	RES_BUSY
-	JR	Z,.wait_busy		; command was rejected: the link is still open
-.wait_done
+	JR	Z,.busy			; command was rejected: the link is still open
+	CP	RES_RS_TIMEOUT
+	JR	NZ,.confirmed		; ERROR/FAIL: the ESP answered, link is gone
+	CALL	CONSUME_CANCEL
+	LD	A,NERR_CANCEL
+	JR	C,.stale
+	LD	A,NERR_TIMEOUT
+	JR	.stale
+.busy
+	LD	A,NERR_BUSY
+.stale
+	PUSH	AF
+	LD	A,(TCP.LINK_ID)
+	CALL	TCP.MUX_MARK_STALE_LINK
+	POP	AF
+	JR	.release
+.confirmed
+	XOR	A
+.release
+	PUSH	AF			; A = status
 	XOR	A
 	LD	(TCP.MUX_ACCEPT_OK),A
 	LD	(TCP.MUX_ACCEPT_CLOSED),A
-.forget
 	CALL	CH_RELEASE
 	LD	A,(ARG_CH)
 	CALL	TCP.MUX_CLEAR_CLOSED
 	LD	A,(ARG_CH)
 	CALL	TCP.RX_DEFER_RESET_CH	; an explicit close discards buffered data
-	XOR	A
+	POP	AF
+	OR	A			; CF=0
 	RET
 .close_listening
 	LD	HL,CMD_CIPSERVER_OFF
@@ -1832,31 +1907,30 @@ CLOSE_CHANNEL
 	CALL	SET_CH_STATE
 	XOR	A
 	RET
-.tx_busy
-.wait_busy
-.rx_busy
-	XOR	A
-	LD	(TCP.MUX_ACCEPT_OK),A
-	LD	(TCP.MUX_ACCEPT_CLOSED),A
-	LD	A,NERR_BUSY
-	OR	A
-	RET
 
-; Close every open channel; leave the network up.
+; Close every open channel; leave the network up. Both channels are closed
+; unconditionally (same as the RTL backend). Out: CF=0, A = the second
+; channel's status when non-zero, else the first one's. ARG_CH is preserved.
 CLOSE_LINK
 	LD	A,(ARG_CH)
 	PUSH	AF
 	XOR	A
 	LD	(ARG_CH),A
 	CALL	CLOSE_CHANNEL
-	AND	A
-	JR	NZ,.restore
+	PUSH	AF				; first channel's status
 	LD	A,1
 	LD	(ARG_CH),A
 	CALL	CLOSE_CHANNEL
-.restore
+	POP	BC				; B = first channel's status
+	OR	A
+	JR	NZ,.status
+	LD	A,B
+.status
+	LD	C,A
 	POP	AF
 	LD	(ARG_CH),A
+	LD	A,C
+	OR	A				; CF=0
 	RET
 
 ; Open the link, retrying while the ESP answers "busy" (its IP stack may
