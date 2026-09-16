@@ -276,7 +276,10 @@ Current utility-specific notes:
 - `FTP.EXE` returns `0` after a successful download, upload or listing, `1` for
   invalid command line, `2` when hardware is not found, `3` on ESP/TCP
   communication errors, `4` on FTP server errors and `5` for local DSS file
-  errors.
+  errors. UART integrity errors also return `3`, take precedence over a
+  concurrent link close, and disable automatic REST recovery. Their UART
+  diagnostic replaces the generic server-timeout hint. Download the affected
+  file again with `-y`; do not resume it with `-r`.
 - `UNETTEST.EXE` (diagnostic; ships on the floppy, not the ZIP) returns `0`
   after the full DLL walk, `1` for invalid command line, `2` when hardware is
   not found or the DLL cannot load, `3` on communication/connect/send errors

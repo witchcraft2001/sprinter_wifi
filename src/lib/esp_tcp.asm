@@ -2690,6 +2690,24 @@ ACCUM_PAYLOAD_LSR_ERROR
 ; Out: CF=0, A=byte, C=byte. CF=1 on timeout.
 ; ------------------------------------------------------
 READ_BYTE_TIMEOUT
+	IFDEF ESP_TCP_FAST_COMMAND_RX
+	IFNDEF ESP_AT_FORCE_221
+	IFNDEF ESP_AT_FORCE_222
+	LD	A,(WCOMMON.UART_ESP_PROFILE)
+	CP	UART_RX_PROFILE_222
+	JR	NZ,.LEGACY
+	ENDIF
+	; FTP's CIPSEND prompt can follow queued AT text at 230400 baud. The
+	; legacy UART_WAIT_RS sleeps 1 ms after an empty sample (23 incoming bytes,
+	; versus a 16-byte FIFO) and discards read-to-clear LSR errors. Use the same
+	; busy-poll/error-latching reader as payload receive. Map only for this call:
+	; WAIT_PROMPT's IPD skipper also calls here and must not nest ISA windows.
+	CALL	ISA.ISA_OPEN
+	CALL	READ_BYTE_TIMEOUT_OPEN
+	JP	ISA.ISA_CLOSE
+	ENDIF
+.LEGACY
+	ENDIF
 	CALL	WIFI.UART_WAIT_RS
 	RET	C
 	LD	HL,REG_RBR

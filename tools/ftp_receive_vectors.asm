@@ -1,0 +1,244 @@
+; Execute FTP's real caller-side status handling with deterministic transport
+; results. A failed receive deliberately leaves BC undefined: the caller must
+; not interpret it as a successful block length after checking UART LSR.
+	DEFINE FTP_RECEIVE_TEST
+	INCLUDE "../src/apps/ftp.asm"
+
+	; Keep the driver away from the memory-mapped UART test registers.
+	ASSERT $ < 0xD100
+	DS 0xD100-$,0
+	ORG 0xD100
+
+TEST_RESULT EQU 0xC000
+TEST_MARKER EQU 0xC001
+
+TEST_START
+	LD	SP,MAIN.STACK_TOP
+	XOR	A
+	LD	(TEST_RESULT),A
+	LD	(TEST_MARKER),A
+	LD	HL,MAIN.RECEIVE_STREAM_ANY_LINK
+	LD	DE,RECEIVE_SPY
+	CALL	STUB_JP
+	LD	HL,MAIN.RECEIVE_ONE_ANY_LINK
+	CALL	STUB_JP
+	LD	HL,WIFI.UART_RX_PAUSE
+	LD	DE,NO_UART
+	CALL	STUB_JP
+	LD	HL,WIFI.UART_RX_RESUME
+	CALL	STUB_JP
+	LD	HL,MAIN.PRINT_UART_OVERRUN
+	LD	DE,REPORT_UART
+	CALL	STUB_JP
+	LD	A,UART_RX_PROFILE_221
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+
+; CLOSED must survive the LSR mask, latch DATA_CLOSE_SEEN, and preserve only
+; the three bytes already collected before the failed follow-up receive.
+	LD	A,1
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_NOT_CONN
+	LD	(SPY_RESULT),A
+	LD	BC,3
+	CALL	MAIN.ACCUMULATE_DATA_BURST
+	JP	C,FAILED
+	LD	A,B
+	OR	A
+	JP	NZ,FAILED
+	LD	A,C
+	CP	3
+	JP	NZ,FAILED
+	LD	A,(MAIN.DATA_CLOSE_SEEN)
+	CP	1
+	JP	NZ,FAILED
+
+; A clean continuation timeout ends the burst without a false close or bytes.
+	LD	A,2
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	LD	BC,3
+	CALL	MAIN.ACCUMULATE_DATA_BURST
+	JP	C,FAILED
+	LD	A,B
+	OR	A
+	JP	NZ,FAILED
+	LD	A,C
+	CP	3
+	JP	NZ,FAILED
+	LD	A,(MAIN.DATA_CLOSE_SEEN)
+	OR	A
+	JP	NZ,FAILED
+
+; A UART error wins over CLOSED in both the control and data receive loops.
+; It must not flush a corrupt tail, declare success, or enter REST recovery.
+	LD	A,3
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_NOT_CONN
+	LD	(SPY_RESULT),A
+	LD	A,LSR_OE | LSR_FE | LSR_BI
+	LD	(SPY_LSR),A
+	CALL	MAIN.RECV_CONTROL_REPLY
+	CALL	ASSERT_UART_ERROR
+	LD	A,4
+	LD	(STAGE),A
+	XOR	A
+	LD	(MAIN.UART_ERROR_REPORTED),A
+	LD	(MAIN.DATA_EXPECTED_SEEN),A
+	LD	A,1
+	LD	(MAIN.LIST_FLAG),A
+	CALL	MAIN.RECV_DATA_TRANSFER
+	CALL	ASSERT_UART_ERROR
+	LD	A,(MAIN.TIMEOUT_RECOVERY)
+	OR	A
+	JP	NZ,FAILED
+
+	; The real FTP 2.2.2 command reader must bypass the sleeping legacy poll,
+	; return the prompt byte, and retain an OE that the hardware read clears.
+	LD	A,5
+	LD	(STAGE),A
+	LD	A,0xC9
+	LD	(ISA.ISA_OPEN),A
+	LD	(ISA.ISA_CLOSE),A
+	LD	(DSS),A
+	LD	HL,WIFI.UART_WAIT_RS
+	LD	DE,LEGACY_POLL
+	CALL	STUB_JP
+	LD	A,UART_RX_PROFILE_222
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	(LEGACY_CALLED),A
+	LD	A,LSR_DR | LSR_OE | LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	LD	A,'>'
+	LD	(REG_RBR),A
+	CALL	TCP.WAIT_PROMPT
+	JP	C,FAILED
+	LD	A,(LEGACY_CALLED)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_OE
+	JP	Z,FAILED
+
+	; The 2.2.1 profile still uses its established reader.
+	LD	A,6
+	LD	(STAGE),A
+	LD	A,UART_RX_PROFILE_221
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	LD	BC,0
+	CALL	TCP.READ_BYTE_TIMEOUT
+	JP	NC,FAILED
+	LD	A,(LEGACY_CALLED)
+	CP	1
+	JP	NZ,FAILED
+
+	; A prompt-phase UART error must survive SEND_CONTROL, even if the send
+	; helper otherwise returned success. No subsequent reply reset may hide it.
+	LD	A,7
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	HL,TCP.SEND_BUFFER_LINK_NO_WAIT
+	LD	DE,SEND_SPY
+	CALL	STUB_JP
+	LD	A,LSR_OE
+	LD	(SPY_LSR),A
+	XOR	A
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	CALL	ASSERT_UART_ERROR
+
+	; A clean prompt timeout preserves the transport result and does not get
+	; relabelled as a UART integrity error.
+	LD	A,8
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(MAIN.UART_ERROR_REPORTED)
+	OR	A
+	JP	NZ,FAILED
+
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+TEST_DONE
+	HALT
+
+ASSERT_UART_ERROR
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(MAIN.UART_ERROR_REPORTED)
+	CP	1
+	JP	NZ,FAILED
+	RET
+
+RESET_STATE
+	XOR	A
+	LD	(SPY_LSR),A
+	LD	(TCP.LSR_ACCUM),A
+	LD	(MAIN.DATA_CLOSE_SEEN),A
+	LD	(MAIN.UART_ERROR_REPORTED),A
+	LD	HL,6000
+	LD	(MAIN.RECV_CAP),HL
+	LD	HL,MAIN.RECV_BUFFER
+	LD	(MAIN.RECV_DEST),HL
+	RET
+
+RECEIVE_SPY
+	LD	A,(SPY_LSR)
+	LD	(TCP.LSR_ACCUM),A
+	LD	BC,0xAABB
+	LD	A,(SPY_RESULT)
+	SCF
+	RET
+
+SEND_SPY
+	LD	A,(SPY_LSR)
+	LD	(TCP.LSR_ACCUM),A
+	LD	A,(SPY_RESULT)
+	OR	A
+	RET	Z
+	SCF
+	RET
+
+LEGACY_POLL
+	LD	A,1
+	LD	(LEGACY_CALLED),A
+	SCF
+	RET
+
+NO_UART
+	XOR	A			; real helpers clobber AF too
+	RET
+
+REPORT_UART
+	LD	A,1
+	LD	(MAIN.UART_ERROR_REPORTED),A
+	RET
+
+STUB_JP
+	LD	(HL),0xC3
+	INC	HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	RET
+
+FAILED
+	LD	A,(STAGE)
+	LD	(TEST_RESULT),A
+	JP	TEST_DONE
+
+STAGE DB 0
+SPY_RESULT DB 0
+SPY_LSR DB 0
+LEGACY_CALLED DB 0

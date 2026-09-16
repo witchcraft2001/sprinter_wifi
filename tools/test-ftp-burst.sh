@@ -30,3 +30,22 @@ if [ "$marker" != 165 ] || [ "$result" != 0 ]; then
 fi
 
 echo "FTP multi-link in-window burst vectors: OK"
+
+sjasmplus --nologo --fullpath \
+  -I "$repo_root/src/include" \
+  -I "$repo_root/src/lib" \
+  --sym="$sym_file" --raw="$raw_file" "$script_dir/ftp_receive_vectors.asm"
+
+start_addr=$(awk '/^TEST_START:/ {sub(/^0x0*/, "", $3); print $3}' "$sym_file")
+end_addr=$(awk '/^TEST_DONE:/ {sub(/^0x0*/, "", $3); print $3}' "$sym_file")
+test -n "$start_addr"
+test -n "$end_addr"
+z88dk-ticks -l 16128 -pc "$start_addr" -end "$end_addr" -output "$ram_file" \
+  "$raw_file" >/dev/null
+marker=$(od -An -tu1 -j 49153 -N 1 "$ram_file" | tr -d ' ')
+result=$(od -An -tu1 -j 49152 -N 1 "$ram_file" | tr -d ' ')
+if [ "$marker" != 165 ] || [ "$result" != 0 ]; then
+  echo "FTP receive status vector $result failed (marker $marker)" >&2
+  exit 1
+fi
+echo "FTP receive status and UART error precedence vectors: OK"

@@ -213,7 +213,18 @@ RECEIVE_ANY_LINK
 ; body is delivered by the next receive call. A CLOSED result seen after stored
 ; data is similarly deferred so byte delivery remains ordered before close.
 ; ------------------------------------------------------
+; One-frame variant for control replies and FTP's retained tail. Use the same
+; in-window RTS guard as streaming: resuming in the caller leaves a bank-switch
+; and setup gap before the first UART read. Also consume any deferred result
+; from a preceding burst when FTP switches into tail mode.
+RECEIVE_ANY_LINK_PAUSED
+	XOR	A
+	JR	RECEIVE_ANY_LINK_BURST.SET_MODE
+
 RECEIVE_ANY_LINK_BURST
+	LD	A,1
+.SET_MODE
+	LD	(MULTI_COALESCE),A
 	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
 	CALL	MULTI_DIAG_RESET
 	ENDIF
@@ -263,7 +274,7 @@ RECEIVE_ANY_LINK_BURST
 	LD	(MULTI_DIAG_PHASE),A
 	ENDIF
 	CALL	WAIT_IPD_HEADER_MULTI
-	JR	C,.DONE
+	JP	C,.DONE
 	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS
 	LD	A,2
 	LD	(MULTI_DIAG_PHASE),A
@@ -288,6 +299,9 @@ RECEIVE_ANY_LINK_BURST
 	ENDIF
 	CALL	READ_PAYLOAD
 	JR	C,.DONE
+	LD	A,(MULTI_COALESCE)
+	AND	A
+	JR	Z,.RETURN_STORED_OK
 	LD	HL,(PAYLOAD_LEFT)
 	LD	A,H
 	OR	L
@@ -962,6 +976,7 @@ PASSIVE_RECEIVE_ENABLED DB 0
 ; terminal result survives one return so the public receive ordering is exact.
 MULTI_BURST_LINK DB 0xFF
 MULTI_PENDING_RESULT DB 0
+MULTI_COALESCE DB 0
 	ENDIF
 
 	IFDEF	ESP_TCP_MULTI_DIAGNOSTICS

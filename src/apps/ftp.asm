@@ -362,7 +362,19 @@ NET_ERROR_EXIT
 		LD	(MSG_NET_ERROR_NO),A
 		PRINTLN MSG_NET_ERROR
 		POP	AF
+		LD	HL,UART_ERROR_REPORTED
+		BIT	0,(HL)
+		JR	NZ,.EXIT
+		PUSH	AF
+		LD	HL,(CONTROL_ERROR_HINT)
+		LD	A,H
+		OR	L
+		JR	Z,.NO_HINT
+		PRINTLN_HL
+.NO_HINT
+		POP	AF
 		CALL	PRINT_NET_REASON		; plain-language hint for the RES_* code
+.EXIT
 		LD	B,3
 		JP	WCOMMON.EXIT
 
@@ -1292,10 +1304,30 @@ REPORT_SESSION_SPEED
 		JP	TPUT.REPORT
 
 SEND_CONTROL
+		LD	HL,MSG_CONTROL_SEND_ERROR
+		LD	(CONTROL_ERROR_HINT),HL
+		XOR	A
+		LD	(TCP.LSR_ACCUM),A
 		LD	HL,CMD_BUFF
 		LD	BC,(CMD_LEN)
 		LD	A,CONTROL_LINK
-		JP	TCP.SEND_BUFFER_LINK_NO_WAIT
+		CALL	TCP.SEND_BUFFER_LINK_NO_WAIT
+		; Prompt/TX polling can see read-to-clear UART errors before the reply
+		; receiver starts. Do not let its next LSR reset hide those errors.
+		PUSH	AF
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+		JR	Z,.UART_OK
+		POP	AF
+		CALL	WIFI.UART_RX_PAUSE
+		CALL	PRINT_UART_OVERRUN
+		CALL	WIFI.UART_RX_RESUME
+		LD	A,RES_RS_TIMEOUT
+		SCF
+		RET
+.UART_OK
+		POP	AF
+		RET
 
 RECV_CONTROL_REPLY_IGNORE
 		CALL	RECV_CONTROL_REPLY
@@ -1311,6 +1343,8 @@ RECV_CONTROL_REPLY_OPTIONAL
 
 RECV_CONTROL_REPLY_TIMEOUT
 		LD	(CONTROL_TIMEOUT),DE
+		LD	HL,MSG_CONTROL_RECV_ERROR
+		LD	(CONTROL_ERROR_HINT),HL
 		CALL	RESET_REPLY_STATE
 .READ
 		; Clear sticky LSR error bits before each RECEIVE so OE detection
@@ -1322,18 +1356,22 @@ RECV_CONTROL_REPLY_TIMEOUT
 		LD	DE,(CONTROL_TIMEOUT)
 		; Keep RTS low while preparing the next read. Resume only after every
 		; register is ready, immediately before entering the UART drain path.
-		CALL	WIFI.UART_RX_RESUME
-		CALL	TCP.RECEIVE_ANY_LINK
+		CALL	RECEIVE_ONE_ANY_LINK
 		PUSH	AF,BC
 		CALL	WIFI.UART_RX_PAUSE
 		POP	BC,AF
-		JR	C,.ERROR
 		; UART overrun/parity/framing error during RECEIVE means the +IPD
 		; payload is misaligned. TCP can't recover lost bytes, so propagate
 		; as a fatal error rather than processing corrupt control bytes.
+		PUSH	AF
 		LD	A,(TCP.LSR_ACCUM)
 		AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-		JR	NZ,.UART_ERROR
+		JR	Z,.UART_OK
+		POP	AF
+		JR	.UART_ERROR
+.UART_OK
+		POP	AF
+		JR	C,.ERROR
 		LD	A,B
 		OR	C
 		JR	Z,.READ
@@ -1384,6 +1422,8 @@ RECV_CONTROL_REPLY_TIMEOUT
 		CALL	WIFI.UART_RX_RESUME
 .RETURN_PAUSED
 		XOR	A
+		LD	(CONTROL_ERROR_HINT),A
+		LD	(CONTROL_ERROR_HINT+1),A
 		RET
 
 .ERROR
@@ -1892,19 +1932,22 @@ RECV_DATA_TRANSFER
 		CALL	RECEIVE_STREAM_ANY_LINK
 		JR	.RECEIVE_DONE
 .RECEIVE_ONE
-		CALL	WIFI.UART_RX_RESUME
-		CALL	TCP.RECEIVE_ANY_LINK
+		CALL	RECEIVE_ONE_ANY_LINK
 .RECEIVE_DONE
 		PUSH	AF,BC
 		CALL	WIFI.UART_RX_PAUSE
 		POP	BC,AF
-		JR	C,.ERROR
-		; UART error during data-link receive: bytes are misaligned and
-		; TCP cannot retransmit lost UART bytes. Treat as end-of-listing
-		; if anything has been received already; otherwise propagate.
+		; Integrity errors take precedence even over CLOSED or a parser failure:
+		; no bytes from a damaged UART stream may reach disk or REST recovery.
+		PUSH	AF
 		LD	A,(TCP.LSR_ACCUM)
 		AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-		JP	NZ,.UART_ERROR
+		JR	Z,.UART_OK
+		POP	AF
+		JP	.UART_ERROR
+.UART_OK
+		POP	AF
+		JR	C,.ERROR
 		LD	A,B
 		OR	C
 		JR	Z,.READ
@@ -2201,9 +2244,14 @@ ACCUMULATE_DATA_BURST
 			; LSR_ACCUM belongs to the whole outer receive iteration. Do not
 			; discard an overrun from a follow-up burst by returning success and
 			; letting the next .READ clear it.
+			PUSH	AF
 			LD	A,(TCP.LSR_ACCUM)
 			AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
-			JR	NZ,.UART_ERROR
+			JR	Z,.UART_OK
+			POP	AF
+			JR	.UART_ERROR
+.UART_OK
+			POP	AF			; AND above must not erase CF / RES_NOT_CONN
 			JR	NC,.RECEIVED
 			; A normal data-link close may be received while draining a burst.
 			; Preserve the data already collected, but do not lose the close and
@@ -2241,6 +2289,21 @@ ACCUMULATE_DATA_BURST
 			LD	A,RES_RS_TIMEOUT
 			SCF
 			RET
+
+; Control/tail receive selector. Preserve one-frame delivery, with the 2.2.2
+; RTS guard inside the mapped UART window. The 2.2.1 transport stays unchanged.
+RECEIVE_ONE_ANY_LINK
+			IFNDEF	ESP_AT_FORCE_221
+			IFDEF	ESP_AT_FORCE_222
+			JP	TCP.RECEIVE_ANY_LINK_PAUSED
+			ELSE
+			LD	A,(WCOMMON.UART_ESP_PROFILE)
+			CP	UART_RX_PROFILE_222
+			JP	Z,TCP.RECEIVE_ANY_LINK_PAUSED
+			ENDIF
+			ENDIF
+			CALL	WIFI.UART_RX_RESUME
+			JP	TCP.RECEIVE_ANY_LINK
 
 ; Stream receive selector. Forced builds compile only their matching backend;
 ; universal FTP trusts NETUP's published NET_ESP_FW and never probes ESP again.
@@ -2956,6 +3019,9 @@ PUT_CHAR
 ; distinguishes a real OE (bit 1) from PE/FE/BI or FIFO error (bit 7) on the
 ; next real-hardware report instead of collapsing every condition to "overrun".
 PRINT_UART_OVERRUN
+		LD	A,1
+		LD	(UART_ERROR_REPORTED),A
+		PRINT WCOMMON.LINE_END
 		LD	A,(TCP.LSR_ACCUM)
 		LD	C,A
 		LD	DE,MSG_UART_LSR_ACC_HEX
@@ -3148,6 +3214,14 @@ MSG_WIFI_NOT_FOUND
 		DB "Sprinter-WiFi not found!",0
 MSG_UART_READY
 		DB "UART initialized.",0
+MSG_CONTROL_SEND_ERROR
+		DB "FTP control send failed (CIPSEND prompt/TX).",0
+MSG_CONTROL_RECV_ERROR
+		DB "FTP control reply not received.",0
+; Report the phase only on the fatal NET_ERROR_EXIT path. Optional final
+; 226/221 waits may time out normally and must stay quiet.
+CONTROL_ERROR_HINT
+		DW 0
 MSG_CONNECTING
 		DB "Connecting to ",0
 MSG_COLON
@@ -3214,6 +3288,8 @@ MSG_FTP_ERROR
 		DB "FTP server returned error: ",0
 MSG_UART_OVERRUN
 		DB "UART overrun. Try lower BAUD or check RTS/CTS flow control.",0
+UART_ERROR_REPORTED
+		DB 0
 MSG_UART_FRAMING
 		DB "UART framing/parity/break error. Check baud and UART session state.",0
 MSG_UART_RX_ERROR
@@ -3504,6 +3580,9 @@ PASV_P2
 		; Override the generic 1500-byte MTU guard so FTP never starts a frame
 		; that cannot finish before its slow DSS_WRITE pause.
 		DEFINE TCP_ACTIVE_IPD_MAX_OVERRIDE FTP_ACTIVE_IPD_MAX
+		; Only FTP opts into fast 2.2.2 command-byte polling. Keep other clients
+		; and the field-proven 2.2.1 command reader unchanged.
+		DEFINE ESP_TCP_FAST_COMMAND_RX
 		INCLUDE "esp_tcp.asm"
 		DEFINE	ESP_TCP_MULTI_DIAGNOSTICS
 		INCLUDE "esp_tcp_multi.asm"
@@ -3657,4 +3736,6 @@ RECV_BUFFER	EQU WIN2_BASE
 
 		ENDMODULE
 
+		IFNDEF FTP_RECEIVE_TEST
 		END MAIN.START
+		ENDIF
