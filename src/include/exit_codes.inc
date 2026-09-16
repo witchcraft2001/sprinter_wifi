@@ -1,0 +1,14 @@
+; Common DSS utility exit status contract shared by network kits.
+	IFNDEF	_EXIT_CODES_INC
+	DEFINE	_EXIT_CODES_INC
+
+EXIT_OK         EQU 0
+EXIT_ARGUMENT   EQU 1
+EXIT_HARDWARE   EQU 2
+EXIT_NETWORK    EQU 3
+EXIT_CONFIG     EQU 4
+EXIT_LOCAL      EQU 5
+EXIT_REMOTE     EQU 6
+EXIT_CANCELLED  EQU 7
+
+	ENDIF

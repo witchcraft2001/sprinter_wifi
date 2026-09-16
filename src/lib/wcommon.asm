@@ -7,6 +7,8 @@
 	IFNDEF	_WCOMMON
 	DEFINE	_WCOMMON
 
+	INCLUDE "exit_codes.inc"
+
 ; The normal package build defines neither profile and uses only the ESP-AT
 ; features shared by 2.2.1 and 2.2.2. Forced builds must name one dialect.
 	IFDEF	ESP_AT_FORCE_221
@@ -52,7 +54,7 @@ CHECK_ERROR
 	IFDEF	TRACE
 	CALL	DUMP_UART_REGS
 	ENDIF
-	LD		B,3
+	LD		B,EXIT_NETWORK
 	POP		HL											; ret addr reset
 	;;ENDIF
 
@@ -79,7 +81,7 @@ FIND_SWF
 NO_TL_FOUND
 	POP 	BC
 	PRINTLN MSG_SWF_NOF
-	LD		B,2
+	LD		B,EXIT_HARDWARE
 	JP		EXIT
 	;;ENDIF
 
@@ -451,7 +453,7 @@ CMD_CIPCLOSE_ONE
 ; ------------------------------------------------------
 ; Require that NETUP has brought the network up: env NET must equal "WIFI" and
 ; NET_ESP_HW must be set (both published by NETUP). On failure print a hint and
-; exit with B=4 (config error). Network-dependent tools call this before any
+; exit with B=EXIT_CONFIG (config error). Network-dependent tools call this before any
 ; ESP/TCP operation. Reads env via DSS ENVIRON (#46/#01).
 ; ------------------------------------------------------
 REQUIRE_NET_UP
@@ -539,11 +541,11 @@ REQUIRE_NET_UP
 	RET
 .FAIL
 	PRINTLN MSG_NET_NOT_UP
-	LD	B,4
+	LD	B,EXIT_CONFIG
 	JP	EXIT
 .PROFILE_FAIL
 	PRINTLN MSG_NET_NOT_UP
-	LD	B,4
+	LD	B,EXIT_CONFIG
 	JP	EXIT
 ; Compare ASCIIZ at HL and DE. Out: Z if equal. Trashes A,C,HL,DE.
 .STRMATCH

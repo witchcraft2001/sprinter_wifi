@@ -69,6 +69,8 @@ Exit Codes
   0  FTP login, PASV and file download, upload or directory listing completed.
   1  Invalid command line.
   2  Sprinter-WiFi card was not found.
-  3  ESP/TCP communication error.
-  4  FTP server returned an unexpected or negative reply.
-  5  Local file create, read, write, or close failed.
+  3  ESP/TCP/UART communication error, timeout, or incomplete transfer.
+  4  NETUP session/configuration is missing or invalid.
+  5  Local file, runtime memory, or DSS storage error.
+  6  FTP server rejected a command, login, PASV, REST, or transfer.
+  7  Cancelled by the user (Esc/Ctrl+Z).

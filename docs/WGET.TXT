@@ -61,5 +61,8 @@ Exit status
   0  File body downloaded.
   1  Invalid command line or URL.
   2  Sprinter-WiFi hardware was not found.
-  3  ESP/TCP/HTTP error.
-  5  Local output file error.
+  3  ESP/TCP/UART communication error, timeout, or incomplete transfer.
+  4  NETUP session/configuration is missing or invalid.
+  5  Local output file, runtime memory, or DSS storage error.
+  6  HTTP server response rejected, unsupported response, or bad redirect.
+  7  Cancelled by the user (Esc/Ctrl+Z).

@@ -250,9 +250,11 @@ Common status codes for automation-friendly utilities:
 - `0` - success.
 - `1` - invalid command line or usage error.
 - `2` - Sprinter-WiFi hardware was not found.
-- `3` - ESP communication error, timeout, unsupported command, unreachable
-  host, or unexpected ESP response.
-- `4` - configuration error, for example missing or invalid `NET.CFG`.
+- `3` - ESP/TCP/UART communication error, timeout, or incomplete transfer.
+- `4` - configuration or NETUP session error.
+- `5` - local file, runtime memory, or DSS storage error.
+- `6` - remote server/protocol rejection (HTTP/FTP application-level error).
+- `7` - cancelled by the user (Esc/Ctrl+Z).
 
 Current utility-specific notes:
 
@@ -261,8 +263,10 @@ Current utility-specific notes:
 - `NETRESET.EXE` returns `0` on successful reset/reinitialization, `2` when
   hardware is not found and `3` on ESP communication failure.
 - `WGET.EXE` returns `0` after a successful body download, `1` for invalid
-  command line or URL, `2` when hardware is not found, `3` for ESP/TCP/HTTP
-  errors and `5` for local output file errors.
+  command line or URL, `2` when hardware is not found, `3` for ESP/TCP/UART
+  errors, timeout or incomplete transfer, `4` for a missing/invalid NETUP
+  session, `5` for local output or runtime memory errors, `6` for an HTTP
+  server/protocol rejection, and `7` when cancelled by the user.
 - `DLSPEED.EXE` returns `0` only for an exact non-zero `Content-Length`, a
   non-zero saved duration and a clean UART LSR; `1` means invalid command line
   or URL, `2` means no card, `3` covers ESP/TCP/HTTP errors, timeout, a
@@ -274,9 +278,11 @@ Current utility-specific notes:
   command line, `2` when hardware is not found, `3` on ESP/UDP/TFTP protocol
   errors and `5` for local DSS file errors.
 - `FTP.EXE` returns `0` after a successful download, upload or listing, `1` for
-  invalid command line, `2` when hardware is not found, `3` on ESP/TCP
-  communication errors, `4` on FTP server errors and `5` for local DSS file
-  errors. UART integrity errors also return `3`, take precedence over a
+  invalid command line, `2` when hardware is not found, `3` on ESP/TCP/UART
+  communication errors, timeout or incomplete transfer, `4` for a missing or
+  invalid NETUP session, `5` for local DSS file/runtime memory errors, `6` on
+  FTP server errors, and `7` when cancelled by the user. UART integrity errors
+  also return `3`, take precedence over a
   concurrent link close, and disable automatic REST recovery. Their UART
   diagnostic replaces the generic server-timeout hint. Download the affected
   file again with `-y`; do not resume it with `-r`.
