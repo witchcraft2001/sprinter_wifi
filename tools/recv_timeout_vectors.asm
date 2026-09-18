@@ -1,9 +1,11 @@
-; Host-side regression vectors for BUGREPORT-RECV-IY0-HANG.
+; Host-side regression vectors for UNETESP RECV timeout handling.
 ; The harness assembles the real UNETESP DLL, calls its public F_RECV entry
-; with IY=0, and exercises the common UART byte reader with BC=0. The old
-; implementation wrapped BC to 0xFFFF and did not return for about 65 seconds.
+; with IY=0, and exercises the common UART byte reader with BC=0 and BC=2.
+; The delay-tick hook lets z88dk-ticks verify the RTL-compatible idle path
+; without entering DSS/ISA code.
 
 	DEVICE NOSLOT64K
+	DEFINE ESP_TCP_TEST_DELAY_TICK
 
 	INCLUDE "unetesp.asm"
 
@@ -46,9 +48,26 @@ TEST_START
 	LD	DE,1
 	AND	A
 	SBC	HL,DE
-	JP	NZ,FAILED		; ABI must clamp zero to one tick
+	JP	NZ,FAILED		; ABI must clamp zero to one bounded poll tick
 
-	; Defense in depth: a direct zero-budget byte read gets one spin window and
+	; Non-zero budgets must pass through unchanged (no backend-specific /5
+	; workaround in the caller or ABI wrapper).
+	LD	A,7
+	LD	(STAGE),A
+	XOR	A
+	LD	DE,0x8000
+	LD	IX,16
+	LD	IY,1000
+	CALL	UNET.F_RECV
+	AND	A
+	JP	NZ,FAILED
+	LD	HL,(SPY_TIMEOUT)
+	LD	DE,1000
+	AND	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+
+	; Defense in depth: a direct zero-budget byte read gets one LSR sample and
 	; then times out without calling the 1 ms delay or wrapping BC to 0xFFFF.
 	LD	A,2
 	LD	(STAGE),A
@@ -64,8 +83,7 @@ TEST_START
 	OR	C
 	JP	NZ,FAILED		; reader preserves the caller's zero budget
 
-	; Zero is checked only after the spin: an already pending UART byte must
-	; still be returned immediately.
+	; An already pending UART byte must still be returned immediately.
 	LD	A,3
 	LD	(STAGE),A
 	LD	A,LSR_DR
@@ -81,9 +99,26 @@ TEST_START
 	CP	0x5A
 	JP	NZ,FAILED
 
+	; A non-zero idle timeout must perform one RTL-compatible delay tick after
+	; the first bounded UART probe, then use a single LSR sample per following
+	; tick. The old reader repeated 200 LSR reads plus DELAY_1MS every time.
+TIMEOUT_BENCH_START
+	LD	A,4
+	LD	(STAGE),A
+	XOR	A
+	LD	(REG_LSR),A
+	LD	(DELAY_TICKS),A
+	LD	BC,2
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+	LD	A,(DELAY_TICKS)
+	CP	1
+	JP	NZ,FAILED
+TIMEOUT_BENCH_DONE
+
 	; The non-open esplib reader used by direct TCP consumers had the same
 	; zero-to-0xFFFF wrap. Its zero budget must stop after one LSR sample too.
-	LD	A,4
+	LD	A,5
 	LD	(STAGE),A
 	XOR	A
 	LD	(REG_LSR),A
@@ -96,7 +131,7 @@ TEST_START
 
 	; Command/interrupt receive owns the ISA window but shares the same public
 	; timeout contract and therefore needs its own underflow guard.
-	LD	A,5
+	LD	A,6
 	LD	(STAGE),A
 	XOR	A
 	LD	(REG_LSR),A
@@ -127,6 +162,12 @@ RECEIVE_SPY
 UNEXPECTED_DELAY
 	JP	FAILED
 
+; Test-only replacement for the RTL-compatible one-millisecond delay.
+TEST_DELAY_TICK
+	LD	HL,DELAY_TICKS
+	INC	(HL)
+	RET
+
 FAILED
 	LD	A,(STAGE)
 	LD	(TEST_RESULT),A
@@ -138,5 +179,6 @@ TEST_DONE
 
 STAGE		DB 0
 SPY_TIMEOUT	DW 0
+DELAY_TICKS	DB 0
 
 	END TEST_START

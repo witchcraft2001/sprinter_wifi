@@ -878,10 +878,8 @@ F_RECV
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	LD	DE,(ARG_IY)
-	; IY=0 is the UNET non-blocking poll form. Keep it bounded even though the
-	; byte reader's internal millisecond budget uses zero as "no ticks left".
-	; One tick preserves the reader's initial UART spin window and matches the
-	; polling convention used by the RTL8019A backend.
+	; Match UNETRTL's public poll convention: its TCP layer uses zero as the
+	; default long timeout, so IY=0 is represented by one bounded probe.
 	LD	A,D
 	OR	E
 	JR	NZ,.timeout_ready

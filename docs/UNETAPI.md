@@ -305,9 +305,17 @@ protocols where the peer may speak without prompting.
 ### Function 7 - RECV
 
 Reads up to `max` bytes from one channel with an `IY` millisecond timeout.
-`IY=0` is a bounded non-blocking poll: the ESP backend still performs its
-initial UART spin window and internally clamps the timeout to one millisecond;
-it never turns zero into a 65-second wait.
+`IY=0` is a bounded non-blocking poll. UNETESP represents it as one immediate
+UART probe, matching UNETRTL. For a non-zero idle timeout, UNETESP keeps the
+fast UART burst probe, then lowers RTS and uses the shared `UTIL.DELAY_1MS`
+pace used by UNETRTL; subsequent idle ticks use one UART status sample rather
+than repeating the expensive burst probe.
+The tick is a CPU-cycle delay (`BC=400` decrement loop), as in UNETRTL,
+not an interrupt/frame clock: no `HALT`, 50 Hz assumption or interrupt-enabled
+state is required. Its physical duration still depends on CPU speed and wait
+states, just like the other cycle-counted backends. Keyboard cancellation is
+checked on the first idle tick and then every 200 ticks; RTS is restored on
+timeout, byte receipt and cancellation.
 Returns:
 
 - `A=NERR_OK, DE>0` - data received.

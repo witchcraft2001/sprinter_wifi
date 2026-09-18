@@ -22,10 +22,9 @@ TCP_ACTIVE_IPD_MAX	EQU TCP_ACTIVE_IPD_MAX_OVERRIDE
 	ELSE
 TCP_ACTIVE_IPD_MAX	EQU 1500
 	ENDIF
-; Busy-poll iterations spent waiting for the next UART byte before falling back
-; to a 1 ms timeout tick. Sized to comfortably bridge the gap between FIFO
-; bursts at 115200 baud across the Sprinter clock range; tune up if downloads
-; still see per-burst stalls, down if a stalled link should time out sooner.
+; Busy-poll iterations spent waiting for the next UART byte before the normal
+; one-millisecond timeout pace. Sized to bridge FIFO bursts at 115200 baud;
+; it is a one-off fast probe, not a chargeable millisecond tick.
 RX_SPIN_BUDGET		EQU 200
 ; Short timeout for peeking whether another back-to-back +IPD frame is coming
 ; within one RECEIVE call. Bounds the end-of-stream wait on an idle keep-alive
@@ -2746,10 +2745,12 @@ READ_BYTE_RECV_TIMEOUT
 ; The hot path is a busy-poll on LSR.DR with NO per-byte delay: at 115200 baud a
 ; byte arrives every ~87 us and each FIFO burst is drained back-to-back while
 ; DR stays set, so the old "DELAY_1MS on every empty poll" (which throttled the
-; link to ~1 KB/s and kept the ESP permanently backpressured) is gone. Only when
-; the spin budget is exhausted without a byte do we fall back to a 1 ms tick that
-; advances the timeout and the periodic cancel poll, so a genuinely stalled link
-; still times out.
+; link to ~1 KB/s and kept the ESP permanently backpressured) is gone. Once the
+; bounded spin finds the UART idle, use the same UTIL.DELAY_1MS pacing contract
+; as UNETRTL. RTS stays low while the ISA window is closed for that delay, so a
+; 230400-baud peer cannot overflow the 16550 FIFO. BC is decremented before a
+; delay, exactly like UNETRTL's TCP receive loop: a one-tick poll probes and
+; returns without an added sleep.
 ; Out: CF=0, A=byte, C=byte. CF=1 on timeout/cancel.
 READ_BYTE_TIMEOUT_OPEN
 	IFDEF ESP_TCP_TEST_READER
@@ -2758,10 +2759,16 @@ READ_BYTE_TIMEOUT_OPEN
 	JP	@TEST_READ_BYTE
 	ENDIF
 	PUSH	BC,DE,HL
-	LD	HL,200
-	LD	(RBT_CANCEL_TICK),HL
-.MS_TICK
+	LD	A,1
+	LD	(RBT_CANCEL_TICK),A
+	; The first empty probe bridges a UART FIFO burst. Later idle probes use
+	; one LSR sample per RTL-compatible cycle-counted tick (no IRQ clock).
+.PROBE
 	LD	DE,RX_SPIN_BUDGET
+	LD	A,B
+	OR	C
+	JR	NZ,.SPIN
+	LD	DE,1
 .SPIN
 	LD	HL,REG_LSR
 	LD	A,(HL)
@@ -2777,33 +2784,42 @@ READ_BYTE_TIMEOUT_OPEN
 	LD	A,D
 	OR	E
 	JR	NZ,.SPIN
-	; A zero budget means a non-blocking poll: the initial spin window above is
-	; still allowed to catch an already arriving byte, but BC must never wrap to
-	; 0xFFFF. Public UNET RECV clamps IY=0 to one tick; this guard also protects
-	; direct TCP/UDP callers and future entry points.
 	LD	A,B
 	OR	C
 	JR	Z,.TIMEOUT
-	; Spin window elapsed with no byte: advance the ms timeout / cancel poll.
+	; Account before sleeping, as UNETRTL does. A public IY=1 poll therefore
+	; returns after its probe without paying an extra one-millisecond delay.
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	Z,.TIMEOUT
+	IFDEF ESP_TCP_TEST_DELAY_TICK
+	CALL	@TEST_DELAY_TICK
+	ELSE
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	; DSS keyboard scans are not part of the delay calibration. Keep them
+	; periodic, as in the original reader, rather than paying for 1000 scans
+	; in a 1000-tick timeout. Check once immediately, then every 200 ticks.
+	LD	HL,RBT_CANCEL_TICK
+	DEC	(HL)
+	JR	NZ,.SKIP_CANCEL
+	LD	(HL),200
+	CALL	@WCOMMON.CHECK_CANCEL_IN_ISA
+	JR	C,.CANCEL
+.SKIP_CANCEL
+	CALL	ISA.ISA_CLOSE
 	IFDEF ESP_TCP_DIAGNOSTICS
 	CALL	DIAG_RECORD_WAIT_TICK
 	ENDIF
 	CALL	UTIL.DELAY_1MS
-	LD	HL,(RBT_CANCEL_TICK)
-	DEC	HL
-	LD	(RBT_CANCEL_TICK),HL
-	LD	A,H
-	OR	L
-	JR	NZ,.SKIP_CANCEL
-	LD	HL,200
-	LD	(RBT_CANCEL_TICK),HL
-	CALL	@WCOMMON.CHECK_CANCEL_IN_ISA
-	JR	C,.CANCEL
-.SKIP_CANCEL
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.MS_TICK
+	CALL	ISA.ISA_OPEN
+	CALL	WIFI.UART_RX_RESUME_OPEN
+	ENDIF
+	; Do not repeat RX_SPIN_BUDGET for every nominal millisecond: that was the
+	; source of the fivefold timeout. Resume with one status sample; a received
+	; byte returns immediately, otherwise the next RTL tick starts.
+	LD	DE,1
+	JR	.SPIN
 .TIMEOUT
 	IFDEF ESP_TCP_DIAGNOSTICS
 	CALL	DIAG_END_WAIT_RUN
@@ -2823,6 +2839,8 @@ READ_BYTE_TIMEOUT_OPEN
 	RET
 .CANCEL
 	; User cancel: return as if timeout; WCOMMON.CANCELLED flag is set.
+	; The cancel check returns with ISA open; undo our pause on this exit too.
+	CALL	WIFI.UART_RX_RESUME_OPEN
 	IFDEF ESP_TCP_DIAGNOSTICS
 	CALL	DIAG_END_WAIT_RUN
 	ENDIF
@@ -3098,8 +3116,8 @@ IPD_BAD_CHAR	DB 0
 LAST_LSR	DB 0
 LSR_ACCUM	DB 0
 
-; Periodic cancel-poll counter for byte read loop
-RBT_CANCEL_TICK	DW 0
+; Idle-tick countdown, not an interrupt or frame counter.
+RBT_CANCEL_TICK	DB 0
 
 	IFDEF ESP_TCP_DIAGNOSTICS
 ; DLSPEED-only receive telemetry. Kept in the compact loaded image: these are
