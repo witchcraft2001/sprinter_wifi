@@ -56,7 +56,16 @@ profile in the banner. The default transfer path remains active `+IPD`, because
 - `FTP.EXE host[:port] [path] -l|-n [-u user] [-p pass]` logs in through
   ESP-AT multi-connection mode, enters passive mode and prints a `LIST` or
   `NLST` directory listing.
-- `PING.EXE host` checks host reachability using ESP-AT `AT+PING`.
+- `PING.EXE [-t] [-n count] [-p ms] host` sends a series of `AT+PING` echo
+  requests (default 4, like standard `ping`) and reports round-trip time and
+  loss, closing with `PING done.` like the other tools in this package (the
+  sibling Ethernet kits print `RESULT OK` there instead). `-t` pings until
+  interrupted; `-p` sets the pause between requests (default 1000 ms). The interval is measured request to
+  request against the DSS clock, so the `AT+PING` exchange itself counts as
+  part of the pause rather than being added to it; a sub-second `-p` value is
+  counted out in ~1 ms quanta and is approximate, as on the sibling kits.
+  ESP-AT's `AT+PING` has no size/TTL/timeout options, so `-l`/`-i`/`-w` are
+  not offered.
 - `WGET.EXE url [-o output] [-y|-f] [-r] [-d]` downloads an http:// resource to a
   local DSS file. Without `-o`, the output name is derived from the URL path. If
   the file exists, WGET asks `[R]esume / [O]verwrite / [C]ancel`; `-y` (or `-f`)
@@ -258,7 +267,8 @@ Common status codes for automation-friendly utilities:
 
 Current utility-specific notes:
 
-- `PING.EXE` returns `0` only when `+PING:<time_ms>` was received.
+- `PING.EXE` returns `0` when at least one reply was received, `3` when none
+  was (or on an ESP/comm error), and `7` if the run was cancelled.
 - `NETUP.EXE` returns `4` when `NET.CFG` is missing, unreadable or lacks SSID.
 - `NETRESET.EXE` returns `0` on successful reset/reinitialization, `2` when
   hardware is not found and `3` on ESP communication failure.
@@ -286,11 +296,63 @@ Current utility-specific notes:
   concurrent link close, and disable automatic REST recovery. Their UART
   diagnostic replaces the generic server-timeout hint. Download the affected
   file again with `-y`; do not resume it with `-r`.
+  After a UART integrity error FTP closes the local file and exits with `3`
+  without waiting for `CIPCLOSE` replies in the corrupted stream. RTS stays
+  paused; the next client's initialization handles stale ESP links. No ESP
+  reset or UART renegotiation is performed during this error exit.
+  The ESP-AT 2.2.2 active receive path holds interrupts off while draining
+  the mapped UART, preserving the caller's interrupt state as in RTL's ISA
+  access. Empty-FIFO polling keeps RTS stable instead of briefly resuming and
+  pausing the ESP once per idle tick. The 21 MHz polling budget includes the
+  loop's work (no additional millisecond sleep); keyboard/IRQ service pauses
+  occur once initially and then every 200 idle ticks. RTS is lowered before
+  unmapping ISA/restoring interrupts. Detected UART corruption aborts this receive
+  immediately instead of waiting for missing bytes to satisfy the `+IPD`
+  length. The 2.2.1 receive algorithm is unchanged. This protection does not
+  substitute for working RTS/CTS wiring; sustained 230400-baud transfers still
+  need validation on real hardware.
 - `UNETTEST.EXE` (diagnostic; ships on the floppy, not the ZIP) returns `0`
   after the full DLL walk, `1` for invalid command line, `2` when hardware is
   not found or the DLL cannot load, `3` on communication/connect/send errors
   or when NETDONE reports a failed close, and `4` when the network is not
   configured.
+
+### Intermittent FTP UART errors: boundary trace
+
+`make ftp-trace` builds developer-only `build/FTPTRACE.EXE` (not packaged).
+It uses the same CLI/session/receive algorithm as FTP and identifies itself
+with `[UART TRACE]` in the banner. This is a diagnostic, **not a confirmed fix**
+for the intermittent ESP-AT 2.2.2 / 230400-baud framing error. Normal FTP builds
+do not contain these probes. Run the same download with `-y`, for example:
+
+```
+FTPTRACE 192.168.1.108 IM2.TXT -y
+```
+
+At a UART error or receive timeout it prints a heading and 11 hexadecimal
+bytes. The five boundary slots hold their latest samples, not a chronological
+packet log. No output is produced by a probe during successful receive.
+
+| Field | Meaning |
+| --- | --- |
+| `pre` | LSR before raising RTS for the next active receive |
+| `stp` | LSR just after lowering RTS at receive return |
+| `wr0`, `wr1` | LSR immediately before/after the streaming DSS file write |
+| `ui` | LSR after progress output, still with RTS paused |
+| `first` | First boundary probe that observed error bits: `01`–`05` in the order above; `00` means no boundary probe observed them (the byte reader may have latched them) |
+| `err` | Sticky error-bit mask captured by the boundary probes |
+| `LCR`, `MCR`, `IIR` | UART register snapshot at report time, without changing the divisor latch or flow settings |
+| `rx` | Transport phase: `01` prefix scan, `02` link/length, `03` payload |
+
+`FF` in a boundary slot means it has not been sampled yet. LSR reads acknowledge
+UART error bits; probes retain those bits and merge them into the next receive's
+error latch, so instrumentation cannot silently discard an error. `first` marks
+**observation**, not the exact electrical instant or cause of the error: FIFO
+contents can delay when an erroneous character becomes visible. The diagnostic
+adds small boundary overhead and can affect a timing-sensitive reproduction.
+It does not probe the firmware, change BAUD/AFE/FIFO settings, reset ESP, or
+add UART status reads to the 2.2.1 path. Send the complete trace and LSR lines
+from a failing run; successful downloads should also be compared with the source.
 
 ## UNET network DLL
 

@@ -47,6 +47,28 @@ ISA_RESET
 ; ------------------------------------------------------
 ISA_OPEN
 	PUSH	AF,BC
+	IFDEF ISA_RX_GUARD
+	; FTP 2.2.2 holds RTS high only while draining mapped UART registers.
+	; DSS interrupts may spend longer than a FIFO's worth of time away from
+	; that loop. Match RTL's IFF-preserving ISA critical section, but opt in
+	; at runtime so the proven 2.2.1 receive path is not changed.
+	LD	A,(RX_CRITICAL)
+	OR	A
+	JR	Z,.SAVE_IFF
+	LD	A,I
+	JP	PE,.IFF_ON
+	LD	A,I			; retry the NMOS LD A,I interrupt race, as RTL does
+	JP	PE,.IFF_ON
+	DI
+	XOR	A
+	JR	.SAVE_IFF
+.IFF_ON
+	DI
+	LD	A,1
+.SAVE_IFF
+	; Do not disable interrupts in the legacy path.
+	LD	(SAVE_IFF),A
+	ENDIF
 	LD		BC, PAGE3
 	IN 		A,(C)
 	LD 		(SAVE_MMU3), A
@@ -78,11 +100,24 @@ ISA_CLOSE
 	LD		BC,PAGE3
 	LD		A,(SAVE_MMU3)
 	OUT		(C),A
+	IFDEF ISA_RX_GUARD
+	; The guarded caller must lower RTS BEFORE closing ISA. This also allows
+	; idle/cancel checks to service DSS interrupts safely between drain runs.
+	LD	A,(SAVE_IFF)
+	OR	A
+	JR	Z,.NO_EI
+	EI
+.NO_EI
+	ENDIF
 	POP		BC,AF
 	RET
 
 ; To save memory page 3
 SAVE_MMU3		DB	0
+	IFDEF ISA_RX_GUARD
+RX_CRITICAL		DB	0
+SAVE_IFF		DB	0
+	ENDIF
 
 	ENDMODULE
 

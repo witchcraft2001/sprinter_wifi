@@ -262,8 +262,16 @@ RECEIVE_ANY_LINK_BURST
 
 	; Eliminate the resume-to-drain race: map ISA and select the non-flushing
 	; streaming trigger first, then raise RTS in-place and read immediately.
+	IFDEF ISA_RX_GUARD
+	LD	A,1
+	LD	(ISA.RX_CRITICAL),A
+	ENDIF
 	CALL	ISA.ISA_OPEN
 	CALL	WIFI.UART_SET_DATA_RX_MODE_OPEN
+	IFDEF FTP_UART_TRACE
+	LD	A,1
+	CALL	UART_TRACE.SAMPLE_OPEN
+	ENDIF
 	CALL	WIFI.UART_RX_RESUME_OPEN
 	LD	HL,(PAYLOAD_LEFT)
 	LD	A,H
@@ -363,13 +371,23 @@ RECEIVE_ANY_LINK_BURST
 	LD	BC,(RECV_STORED)
 	XOR	A
 .DONE
-	; Close the only overrun window left by the FTP-side accumulator: throttle
-	; ESP while MCR and UART registers are still mapped, then unmap ISA. The
-	; outer FTP guard repeats the pause harmlessly before slow work.
+	; Throttle ESP while MCR and UART registers are still mapped, then unmap
+	; ISA (and restore IRQs in guarded FTP builds). The outer FTP guard repeats
+	; the pause harmlessly before slow work.
 	PUSH	AF
 	CALL	WIFI.UART_RX_PAUSE_OPEN
+	IFDEF FTP_UART_TRACE
+	LD	A,2
+	CALL	UART_TRACE.SAMPLE_OPEN
+	ENDIF
 	POP	AF
 	CALL	ISA.ISA_CLOSE
+	IFDEF ISA_RX_GUARD
+	PUSH	AF
+	XOR	A
+	LD	(ISA.RX_CRITICAL),A
+	POP	AF
+	ENDIF
 	RET
 	ENDIF
 

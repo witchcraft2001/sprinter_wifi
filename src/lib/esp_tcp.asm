@@ -26,6 +26,12 @@ TCP_ACTIVE_IPD_MAX	EQU 1500
 ; one-millisecond timeout pace. Sized to bridge FIFO bursts at 115200 baud;
 ; it is a one-off fast probe, not a chargeable millisecond tick.
 RX_SPIN_BUDGET		EQU 200
+	IFDEF ISA_RX_GUARD
+; Guarded FTP polls continuously instead of pulsing RTS on every empty tick.
+; ~1 ms at the Sprinter's 21 MHz, including the LSR/error loop itself; no
+; additional DELAY_1MS. Host-side cycle vectors bound this accounting.
+RX_GUARD_SPIN_BUDGET	EQU 156
+	ENDIF
 ; Short timeout for peeking whether another back-to-back +IPD frame is coming
 ; within one RECEIVE call. Bounds the end-of-stream wait on an idle keep-alive
 ; socket without giving up on a still-active burst. This wait is paid once per
@@ -2603,6 +2609,9 @@ READ_PAYLOAD
 	LD	(LAST_LSR),A
 	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
 	CALL	NZ,ACCUM_PAYLOAD_LSR_ERROR
+	IFDEF ISA_RX_GUARD
+	JR	C,.TIMEOUT		; corrupt +IPD length can never be satisfied
+	ENDIF
 	LD	A,(LAST_LSR)
 	AND	LSR_DR
 	JR	Z,.WAIT_BYTE
@@ -2681,6 +2690,10 @@ ACCUM_PAYLOAD_LSR_ERROR
 	OR	(HL)
 	LD	(HL),A
 	POP	HL
+	IFDEF ISA_RX_GUARD
+	LD	A,(ISA.RX_CRITICAL)
+	RRA				; CF = guard (0/1); legacy only latches
+	ENDIF
 	RET
 	ENDIF
 
@@ -2751,6 +2764,8 @@ READ_BYTE_RECV_TIMEOUT
 ; 230400-baud peer cannot overflow the 16550 FIFO. BC is decremented before a
 ; delay, exactly like UNETRTL's TCP receive loop: a one-tick poll probes and
 ; returns without an added sleep.
+; Exception: guarded FTP 2.2.2 budgets continuous polling at 21 MHz instead
+; of delay ticks, keeping RTS stable between periodic keyboard/IRQ checks.
 ; Out: CF=0, A=byte, C=byte. CF=1 on timeout/cancel.
 READ_BYTE_TIMEOUT_OPEN
 	IFDEF ESP_TCP_TEST_READER
@@ -2761,8 +2776,8 @@ READ_BYTE_TIMEOUT_OPEN
 	PUSH	BC,DE,HL
 	LD	A,1
 	LD	(RBT_CANCEL_TICK),A
-	; The first empty probe bridges a UART FIFO burst. Later idle probes use
-	; one LSR sample per RTL-compatible cycle-counted tick (no IRQ clock).
+	; The first empty probe bridges a UART FIFO burst. Unguarded idle probes
+	; then use one LSR sample per RTL-compatible tick; guarded FTP keeps polling.
 .PROBE
 	LD	DE,RX_SPIN_BUDGET
 	LD	A,B
@@ -2777,6 +2792,19 @@ READ_BYTE_TIMEOUT_OPEN
 	LD	HL,LSR_ACCUM
 	OR	(HL)
 	LD	(HL),A
+	IFDEF ISA_RX_GUARD
+	; A lost byte invalidates the advertised +IPD length. Return to FTP's
+	; UART-error handler now, not after a full per-byte timeout. Test the
+	; accumulated status too, since reading LSR clears its sticky error bits.
+	AND	LSR_OE | LSR_PE | LSR_FE | LSR_BI | LSR_RCVE
+	JR	Z,.STATUS_OK
+	LD	A,(ISA.RX_CRITICAL)
+	OR	A
+	JR	Z,.STATUS_OK
+	POP	AF
+	JR	.TIMEOUT
+.STATUS_OK
+	ENDIF
 	POP	AF
 	AND	LSR_DR
 	JR	NZ,.OK
@@ -2796,6 +2824,27 @@ READ_BYTE_TIMEOUT_OPEN
 	IFDEF ESP_TCP_TEST_DELAY_TICK
 	CALL	@TEST_DELAY_TICK
 	ELSE
+	IFDEF ISA_RX_GUARD
+	LD	A,(ISA.RX_CRITICAL)
+	OR	A
+	JR	Z,.LEGACY_IDLE
+	; While actively draining, keep RTS stable and poll throughout the tick.
+	; Previously each idle tick resumed RTS for just one LSR sample, often
+	; stopping the ESP again before even one 230400-baud byte could arrive.
+	; Only pause for the periodic DSS keyboard/IRQ service, never per tick.
+	LD	HL,RBT_CANCEL_TICK
+	DEC	(HL)
+	JR	NZ,.GUARD_PROBE
+	LD	(HL),200
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	CALL	@WCOMMON.CHECK_CANCEL_IN_ISA
+	JR	C,.CANCEL
+	CALL	WIFI.UART_RX_RESUME_OPEN
+.GUARD_PROBE
+	LD	DE,RX_GUARD_SPIN_BUDGET
+	JP	.SPIN
+.LEGACY_IDLE
+	ENDIF
 	CALL	WIFI.UART_RX_PAUSE_OPEN
 	; DSS keyboard scans are not part of the delay calibration. Keep them
 	; periodic, as in the original reader, rather than paying for 1000 scans
@@ -2819,7 +2868,11 @@ READ_BYTE_TIMEOUT_OPEN
 	; source of the fivefold timeout. Resume with one status sample; a received
 	; byte returns immediately, otherwise the next RTL tick starts.
 	LD	DE,1
+	IFDEF ISA_RX_GUARD
+	JP	.SPIN
+	ELSE
 	JR	.SPIN
+	ENDIF
 .TIMEOUT
 	IFDEF ESP_TCP_DIAGNOSTICS
 	CALL	DIAG_END_WAIT_RUN

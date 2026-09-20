@@ -1,20 +1,69 @@
 PING.EXE - Host reachability diagnostic
 
 Purpose
-  Checks whether a host is reachable and prints the response time.
+  Sends a series of AT+PING echo requests to a host and reports round-trip
+  time, packet loss, and an overall result - similar to a standard `ping`
+  command and to the sibling Sprinter Ethernet PING utilities.
 
 Usage
-  PING.EXE host
+  PING.EXE [-t] [-n count] [-p ms] host
+  PING.EXE /?
+
+  -t        ping until interrupted (Esc/Ctrl+Z).
+  -n count  number of echo requests (default 4, max 65535).
+  -p ms     pause between requests (default 1000, 0 = no pause).
+  host      destination IPv4 address or host name.
+
+  Flags may be written as -x or /x, in any case, and may appear before or
+  after the host. -t and -n cannot be combined.
 
 Examples
   PING.EXE 8.8.8.8
   PING.EXE example.com
+  PING.EXE -n 10 -p 200 8.8.8.8
+  PING.EXE -t 8.8.8.8
 
 Behavior
-  PING prints the response time on success, otherwise it reports an error.
+  If the target is not a dotted-decimal IPv4 address, PING resolves it once
+  via AT+CIPDOMAIN and prints the resolved address in the header
+  ("Pinging host [ip]:"); if resolution fails or is not supported by the
+  firmware/emulator, PING falls back to pinging the host text directly.
+
+  Each reply prints "Reply from <target>: time=Nms" (or "time<1ms" for a
+  sub-millisecond reply); an unanswered request prints "Request timed out."
+  After the series, PING prints a summary:
+
+      Ping statistics for <target>:
+          Packets: Sent = S, Received = R, Lost = L.
+      PING done.
+
+  If no reply was received the closing line is "No replies received."
+  instead; an interrupted run prints "Cancelled by user." above the
+  statistics and no closing line. The sibling Ethernet PING utilities print
+  "RESULT OK"/"RESULT FAIL" here; this package closes every utility with
+  "<NAME> done.", which is the convention PING follows.
+
+  The pause is timed like the gap in the sibling Ethernet PING utilities:
+  whole seconds come from the DSS system clock, so requests go out one second
+  apart (or -p seconds apart) whatever speed the machine runs at, and a
+  sub-second remainder is counted out in ~1 ms quanta. A -p value below a
+  second - -p 200 - is therefore approximate, as it is on the sibling kits.
+
+  The interval is measured from one request to the next, not from the reply.
+  Unlike the Ethernet kits, where an echo is a card write, a whole AT+PING
+  exchange with the ESP can take most of a second; that time is counted as
+  part of the pause instead of being added to it. A request that takes longer
+  than -p is therefore followed by no pause at all.
+
+  ESP-AT's AT+PING command reports only round-trip time - it has no options
+  for packet size, TTL, or a per-reply timeout, unlike the raw-Ethernet ping
+  utilities on the sibling Sprinter network cards. PING.EXE therefore does
+  not accept -l, -i, or -w; unknown flags are rejected as a usage error.
 
 Exit status
-  0  A reply was received.
+  0  At least one reply was received.
   1  Invalid command line.
   2  Sprinter-WiFi hardware was not found.
-  3  ESP communication error, unsupported command or unreachable host.
+  3  ESP communication error, unsupported command, or no reply was received.
+  4  Network is not up - run NETUP first.
+  7  Cancelled by the user (Esc/Ctrl+Z).

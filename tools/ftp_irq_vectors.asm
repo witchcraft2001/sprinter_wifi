@@ -1,0 +1,309 @@
+; Real FTP/ISA/UART routines, with memory-backed UART registers in z88dk-ticks.
+; No scripted byte reader: exercise both payload and idle LSR error paths.
+	DEFINE FTP_RECEIVE_TEST
+	INCLUDE "../src/apps/ftp.asm"
+	ASSERT $ < 0xD100
+	DS 0xD100-$,0
+	ORG 0xD100
+
+TEST_RESULT EQU 0xC000
+TEST_MARKER EQU 0xC001
+	MACRO EXPECT_IFF enabled?
+	LD	A,I
+	IF enabled?
+	JP	PO,FAILED
+	ELSE
+	JP	PE,FAILED
+	ENDIF
+	ENDM
+
+TEST_START
+	LD	SP,MAIN.STACK_TOP
+	XOR	A
+	LD	(TEST_RESULT),A
+	LD	(TEST_MARKER),A
+
+; Unprotected (2.2.1) mapping must not alter either incoming IFF state.
+	LD	A,1
+	LD	(STAGE),A
+	EI
+	CALL	ISA.ISA_OPEN
+	EXPECT_IFF 1
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+	DI
+	CALL	ISA.ISA_OPEN
+	EXPECT_IFF 0
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 0
+
+; Protected receive disables IRQs, restores the caller's state on close,
+; and repeats this correctly over the timeout reader's close/open cycles.
+	LD	A,2
+	LD	(STAGE),A
+	LD	A,1
+	LD	(ISA.RX_CRITICAL),A
+	EI
+	CALL	ISA.ISA_OPEN
+	EXPECT_IFF 0
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+	CALL	ISA.ISA_OPEN
+	EXPECT_IFF 0
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+	DI
+	CALL	ISA.ISA_OPEN
+	EXPECT_IFF 0
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 0
+	XOR	A
+	LD	(ISA.RX_CRITICAL),A
+	EI
+
+; A pending 4K payload is drained without delays. Entry/exit retain the
+; caller's IFF, lower RTS before returning and clear the opt-in guard.
+	LD	A,3
+	LD	(STAGE),A
+	CALL	SETUP
+	LD	A,LSR_DR | LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	LD	A,0xA5
+	LD	(REG_RBR),A
+	CALL	TCP.RECEIVE_ANY_LINK_PAUSED
+	JP	C,FAILED
+	LD	HL,4096
+	OR	A
+	SBC	HL,BC
+	JP	NZ,FAILED
+	LD	A,(0x8FFF)
+	CP	0xA5
+	JP	NZ,FAILED
+	CALL	CHECK_RETURN
+
+; OE alongside a ready byte must abort BEFORE storing the corrupt byte.
+	LD	A,4
+	LD	(STAGE),A
+	CALL	SETUP
+	LD	A,LSR_OE | LSR_DR
+	LD	(REG_LSR),A
+	CALL	TCP.RECEIVE_ANY_LINK_PAUSED
+	CALL	CHECK_ERROR
+	LD	A,(0x8000)
+	OR	A
+	JP	NZ,FAILED
+
+; Error in prefix/idle reader must not run the 20000-tick receive timeout.
+	LD	A,5
+	LD	(STAGE),A
+	CALL	SETUP
+	XOR	A
+	LD	(TCP.PAYLOAD_LEFT),A
+	LD	(TCP.PAYLOAD_LEFT+1),A
+	LD	A,LSR_OE
+	LD	(REG_LSR),A
+	CALL	TCP.RECEIVE_ANY_LINK_PAUSED
+	CALL	CHECK_ERROR
+
+; A read-to-clear LSR error latched earlier is also fatal on the idle path.
+	LD	A,6
+	LD	(STAGE),A
+	LD	A,1
+	LD	(ISA.RX_CRITICAL),A
+	XOR	A
+	LD	(REG_LSR),A
+	LD	BC,20000
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+
+; The empty reader's periodic keyboard service closes ISA with RTS low, then
+; reopens with IRQs masked. Stub only keyboard access, not the polling loop.
+	LD	A,7
+	LD	(STAGE),A
+	LD	A,0xC9			; RET: no key
+	LD	(WCOMMON.CHECK_CANCEL_IN_ISA),A
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	CALL	ISA.ISA_OPEN
+	LD	BC,2
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+	EXPECT_IFF 0
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+
+; Cancellation must unwind the same critical section without leaving DI.
+	LD	A,8
+	LD	(STAGE),A
+	LD	HL,0xC937		; SCF / RET: cancelled
+	LD	(WCOMMON.CHECK_CANCEL_IN_ISA),HL
+	CALL	ISA.ISA_OPEN
+	LD	BC,20000
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+	EXPECT_IFF 0
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+
+; The unguarded legacy payload path still latches errors and returns bytes.
+	LD	A,9
+	LD	(STAGE),A
+	XOR	A
+	LD	(ISA.RX_CRITICAL),A
+	CALL	SETUP
+	LD	HL,1
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	(TCP.RECV_REMAIN),HL
+	LD	HL,0x8000
+	LD	(TCP.RECV_PTR),HL
+	LD	HL,0
+	LD	(TCP.RECV_STORED),HL
+	LD	A,LSR_DR | LSR_OE
+	LD	(REG_LSR),A
+	CALL	TCP.READ_PAYLOAD
+	JP	C,FAILED
+	LD	A,C
+	CP	1
+	JP	NZ,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_OE
+	JP	Z,FAILED
+
+; Exact field report: 0x69 = DR/FE/THRE/TEMT, without OE. It is still fatal,
+; leaves the suspect byte unstored and returns with RTS paused, IRQs restored.
+	LD	A,10
+	LD	(STAGE),A
+	CALL	SETUP
+	LD	A,0x69
+	LD	(REG_LSR),A
+	CALL	TCP.RECEIVE_ANY_LINK_PAUSED
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	CP	0x69
+	JP	NZ,FAILED
+	LD	A,(0x8000)
+	OR	A
+	JP	NZ,FAILED
+	CALL	CHECK_RETURN
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+TEST_DONE
+	DI
+	HALT
+
+FAILED
+	LD	A,(STAGE)
+	LD	(TEST_RESULT),A
+	JP	TEST_DONE
+
+SETUP
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	(TCP.MULTI_PENDING_RESULT),A
+	LD	(TCP.PAYLOAD_LINK),A
+	LD	(0x8000),A
+	LD	A,1
+	LD	(WIFI.UART_FLOW_MODE),A
+	LD	A,UART_RX_PROFILE_222
+	LD	(WIFI.UART_RX_PROFILE),A
+	LD	HL,4096
+	LD	(TCP.PAYLOAD_LEFT),HL
+	LD	HL,0x8000
+	LD	BC,4096
+	LD	DE,20000
+	RET
+
+CHECK_ERROR
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_OE
+	JP	Z,FAILED
+CHECK_RETURN
+	EXPECT_IFF 1
+	LD	A,(ISA.RX_CRITICAL)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(REG_MCR)
+	AND	MCR_RTS
+	JP	NZ,FAILED
+	RET
+
+STAGE DB 0
+
+; Independent entry: 1000 nominal ticks with actual ISA, flow-control and
+; keyboard wrappers. Instrument only the MCR helper entries; each spy executes
+; their displaced first instruction and rejoins the real implementation.
+BENCH_IDLE
+	LD	SP,MAIN.STACK_TOP
+	XOR	A
+	LD	(TEST_MARKER),A
+	LD	(TEST_RESULT),A
+	LD	(REG_LSR),A
+	LD	(TCP.LSR_ACCUM),A
+	LD	(PAUSE_COUNT),A
+	LD	(RESUME_COUNT),A
+	LD	A,11
+	LD	(STAGE),A
+	LD	A,1
+	LD	(ISA.RX_CRITICAL),A
+	LD	(WIFI.UART_FLOW_MODE),A
+	LD	HL,0xC9AF		; XOR A / RET: DSS_SCANKEY has no key
+	LD	(DSS),HL
+	LD	HL,WIFI.UART_RX_PAUSE_OPEN
+	LD	DE,PAUSE_SPY
+	CALL	PATCH_JUMP
+	LD	HL,WIFI.UART_RX_RESUME_OPEN
+	LD	DE,RESUME_SPY
+	CALL	PATCH_JUMP
+	EI
+	CALL	ISA.ISA_OPEN
+	LD	BC,1000
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+	EXPECT_IFF 0
+	LD	A,(PAUSE_COUNT)
+	CP	5			; once immediately, then once per 200 ticks
+	JP	NZ,FAILED
+	LD	A,(RESUME_COUNT)
+	CP	5
+	JP	NZ,FAILED
+	LD	A,(REG_MCR)
+	CP	MCR_AFE | MCR_RTS
+	JP	NZ,FAILED
+	CALL	WIFI.UART_RX_PAUSE_OPEN
+	CALL	ISA.ISA_CLOSE
+	EXPECT_IFF 1
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+	JP	TEST_DONE
+
+PATCH_JUMP
+	LD	(HL),0xC3
+	INC	HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	RET
+PAUSE_SPY
+	PUSH	HL
+	LD	HL,PAUSE_COUNT
+	INC	(HL)
+	POP	HL
+	LD	A,(WIFI.UART_FLOW_MODE)
+	JP	WIFI.UART_RX_PAUSE_OPEN+3
+RESUME_SPY
+	PUSH	HL
+	LD	HL,RESUME_COUNT
+	INC	(HL)
+	POP	HL
+	LD	A,(WIFI.UART_FLOW_MODE)
+	JP	WIFI.UART_RX_RESUME_OPEN+3
+PAUSE_COUNT DB 0
+RESUME_COUNT DB 0
+	END TEST_START

@@ -47,13 +47,14 @@ What you need
       PING 8.8.8.8
       WGET http://example.com -o INDEX.HTM -y
 
-  A successful PING prints a reply time; WGET saves the page to INDEX.HTM.
+  A successful PING sends 4 requests and prints reply times, loss, and
+  "PING done."; WGET saves the page to INDEX.HTM.
 
 One-shot batch
   CONNECT.BAT runs NETRESET, NETUP and PING 8.8.8.8 in sequence.
 
 Everyday commands (run after NETUP)
-  PING host                 reachability test
+  PING [-t] [-n count] [-p ms] host    reachability test (4 requests default)
   WGET url [-o file]        download an http:// file (no HTTPS)
   FTP  host file [-u user -p pass]   download over FTP
   TFTP host GET file -o FILE          download over TFTP

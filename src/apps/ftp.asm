@@ -4,6 +4,11 @@
 ; ======================================================
 
 EXE_VERSION		EQU 1
+		; Opt in only for the 2.2.2 active receiver; legacy 2.2.1 never
+		; enables ISA.RX_CRITICAL. Other utilities keep their existing ISA code.
+		IFNDEF ESP_AT_FORCE_221
+		DEFINE ISA_RX_GUARD
+		ENDIF
 DEFAULT_TIMEOUT		EQU 5000
 FTP_RECV_TIMEOUT	EQU 10000
 FTP_DATA_TIMEOUT	EQU 20000
@@ -62,6 +67,15 @@ OUT_SIZE		EQU 80
 		INCLUDE "macro.inc"
 		INCLUDE "dss.inc"
 		INCLUDE "exit_codes.inc"
+		; Diagnostic-only hooks compile to no code in the distributed FTP.
+		MACRO FTP_UART_SAMPLE phase?
+		IFDEF FTP_UART_TRACE
+		PUSH	AF
+		LD	A,phase?
+		CALL	UART_TRACE.SAMPLE
+		POP	AF
+		ENDIF
+		ENDM
 
 		MODULE MAIN
 
@@ -100,6 +114,9 @@ START
 		CALL	INIT_RUNTIME_PAGE
 		JP	C,INIT_MEMORY_ERROR
 		CALL	CLEAR_BSS
+		IFDEF FTP_UART_TRACE
+		CALL	UART_TRACE.INIT
+		ENDIF
 		LD	A,NO_HANDLE
 		LD	(OUT_FH),A
 		CALL	ISA.ISA_RESET
@@ -1335,7 +1352,6 @@ SEND_CONTROL
 		POP	AF
 		CALL	WIFI.UART_RX_PAUSE
 		CALL	PRINT_UART_OVERRUN
-		CALL	WIFI.UART_RX_RESUME
 		LD	A,RES_RS_TIMEOUT
 		SCF
 		RET
@@ -1450,7 +1466,6 @@ RECV_CONTROL_REPLY_TIMEOUT
 .UART_ERROR
 		CALL	WIFI.UART_RX_PAUSE
 		CALL	PRINT_UART_OVERRUN
-		CALL	WIFI.UART_RX_RESUME
 		LD	A,RES_RS_TIMEOUT
 		SCF
 		RET
@@ -2064,7 +2079,6 @@ RECV_DATA_TRANSFER
 			XOR	A
 			LD	(TRANSFER_ACTIVE),A
 			CALL	PRINT_UART_OVERRUN
-			CALL	WIFI.UART_RX_RESUME
 			LD	A,RES_RS_TIMEOUT
 			SCF
 			RET
@@ -2465,7 +2479,9 @@ WRITE_DATA_BUFFER
 		LD	E,C
 		LD	A,(OUT_FH)
 		LD	C,DSS_WRITE
+		FTP_UART_SAMPLE 3
 		RST	DSS
+		FTP_UART_SAMPLE 4
 		POP	BC
 		RET	C
 		CALL	ADD_DATA_TOTAL
@@ -2477,6 +2493,7 @@ WRITE_DATA_BUFFER
 		AND	A
 		JR	NZ,.NO_PROGRESS
 		CALL	PROGRESS_TICK_RX_PAUSED
+		FTP_UART_SAMPLE 5
 .NO_PROGRESS
 		XOR	A
 		RET
@@ -2963,6 +2980,13 @@ APPEND_CHAR_HL
 
 CLEANUP_TCP
 		CALL	CLOSE_OUTPUT_FILE_IGNORE
+		; A corrupt active +IPD stream has no trustworthy AT line boundaries.
+		; CLOSE_LINK uses per-byte waits: a continuing data stream can keep
+		; that cleanup alive long after the UART diagnostic. Leave RTS low and
+		; let the next client's ESP_PRELUDE drain/close the stale links instead.
+		LD	A,(UART_ERROR_REPORTED)
+		AND	A
+		RET	NZ
 		LD	A,(DATA_OPEN)
 		AND	A
 		JR	Z,.CONTROL
@@ -3044,15 +3068,10 @@ PRINT_UART_OVERRUN
 		LD	A,1
 		LD	(UART_ERROR_REPORTED),A
 		PRINT WCOMMON.LINE_END
-		LD	A,(TCP.LSR_ACCUM)
-		LD	C,A
-		LD	DE,MSG_UART_LSR_ACC_HEX
-		CALL	UTIL.HEXB
-		LD	A,(TCP.LAST_LSR)
-		LD	C,A
-		LD	DE,MSG_UART_LSR_LAST_HEX
-		CALL	UTIL.HEXB
-		PRINTLN MSG_UART_LSR
+		IFDEF FTP_UART_TRACE
+		CALL	UART_TRACE.REPORT
+		ENDIF
+		CALL	PRINT_UART_LSR
 		LD	A,(TCP.LSR_ACCUM)
 		AND	LSR_OE
 		JR	NZ,.OVERRUN
@@ -3071,6 +3090,9 @@ PRINT_UART_OVERRUN
 ; Snapshot the exact active-receive state while RTS is still low. This runs
 ; only after a 20-second wait (before recovery or failure), never in the hot path.
 PRINT_RX_TIMEOUT_DIAG
+		IFDEF FTP_UART_TRACE
+		JP	UART_TRACE.REPORT
+		ELSE
 		PRINTLN	MSG_RX_DIAG_HEADER
 		PRINT	MSG_RX_DIAG_TOTAL
 		LD	HL,DATA_TOTAL
@@ -3110,6 +3132,8 @@ PRINT_RX_TIMEOUT_DIAG
 		PRINTLN	MSG_RX_DIAG_LAST
 		; Reuse the existing exact LSR line, but not its explanatory error text:
 		; a clean recovery requires the error-bit mask to be zero.
+		ENDIF
+PRINT_UART_LSR
 		LD	A,(TCP.LSR_ACCUM)
 		LD	C,A
 		LD	DE,MSG_UART_LSR_ACC_HEX
@@ -3121,6 +3145,7 @@ PRINT_RX_TIMEOUT_DIAG
 		PRINTLN	MSG_UART_LSR
 		RET
 
+		IFNDEF FTP_UART_TRACE
 PRINT_U32_PTR_FTP
 		LD	C,(HL)
 		INC	HL
@@ -3147,6 +3172,7 @@ PRINT_U8_FTP
 		LD	H,0
 		LD	DE,0
 		JP	TPUT.PRINT_DEC_32
+		ENDIF
 
 CLEAR_BSS
 		LD	HL,FTP_BSS_BASE
@@ -3226,6 +3252,9 @@ MSG_START
 		DB "FTP "
 		PACKAGE_VERSION_TAG
 		DB " - passive FTP client for SprinterESP"
+		IFDEF FTP_UART_TRACE
+		DB " [UART TRACE]"
+		ENDIF
 		DB 0
 		; MSG_USAGE moved to the WIN2 cold overlay (see OVL_MSG_USAGE below).
 MSG_WIFI_FOUND
@@ -3309,11 +3338,11 @@ MSG_NETR_NOCONN
 MSG_FTP_ERROR
 		DB "FTP server returned error: ",0
 MSG_UART_OVERRUN
-		DB "UART overrun. Try lower BAUD or check RTS/CTS flow control.",0
+		DB "UART overrun. Check RTS/CTS and BAUD.",0
 UART_ERROR_REPORTED
 		DB 0
 MSG_UART_FRAMING
-		DB "UART framing/parity/break error. Check baud and UART session state.",0
+		DB "UART framing/parity/break error. Check BAUD/session.",0
 MSG_UART_RX_ERROR
 		DB "UART receiver FIFO error. Received block was discarded.",0
 MSG_UART_LSR
@@ -3322,6 +3351,7 @@ MSG_UART_LSR_ACC_HEX
 		DB "xx, last=0x"
 MSG_UART_LSR_LAST_HEX
 		DB "xx",0
+		IFNDEF FTP_UART_TRACE
 MSG_RX_DIAG_HEADER
 		DB "RX timeout diagnostics:",0
 MSG_RX_DIAG_TOTAL
@@ -3346,6 +3376,7 @@ MSG_RX_DIAG_LAST
 		DB ", last header byte 0x"
 MSG_RX_DIAG_LAST_HEX
 		DB "xx",0
+		ENDIF
 MSG_FILE_ERROR
 			DB "File create/read/write/close error.",0
 MSG_ABORTED
@@ -3609,6 +3640,9 @@ PASV_P2
 		DEFINE	ESP_TCP_MULTI_DIAGNOSTICS
 		INCLUDE "esp_tcp_multi.asm"
 		INCLUDE "tput_lib.asm"
+		IFDEF FTP_UART_TRACE
+		INCLUDE "ftp_uart_trace.asm"
+		ENDIF
 		; esplib.asm MUST be last: it ends with the RS_BUFF label that anchors
 		; the runtime receive buffer and all BSS. Any include after it would be
 		; overlaid by the ESP receive buffer.

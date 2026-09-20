@@ -1,6 +1,9 @@
 ; ======================================================
 ; PING for Sprinter ESP Network Kit
-; Host reachability diagnostic using ESP-AT AT+PING.
+; Host reachability diagnostic using ESP-AT AT+PING, formatted like the
+; sibling RTL8019A/3C509B ping utilities. ESP-AT's AT+PING returns only an
+; RTT in milliseconds - it has no packet-size, TTL, or per-reply timeout
+; knobs - so -l/-i/-w (present on the sibling kits) are not offered here.
 ; ======================================================
 
 EXE_VERSION		EQU 1
@@ -8,8 +11,6 @@ DEFAULT_TIMEOUT		EQU 2000
 PING_TIMEOUT		EQU 8000
 PING_BUSY_RETRIES	EQU 8			; AT+PING retries while the ESP answers "busy"
 PING_BUSY_DELAY		EQU 400			; ms between busy retries
-PING_WARMUP_RETRIES	EQU 3			; AT+PING retries while the route is still warming up ("+timeout")
-PING_WARMUP_DELAY	EQU 600			; ms between warmup retries
 PING_FORMAT_RETRIES	EQU 3			; retry a terminal OK with a damaged/missing +PING line
 PING_FORMAT_DELAY	EQU 150
 HOST_SIZE		EQU 96
@@ -19,6 +20,7 @@ CMD_SIZE		EQU 128
 
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
+	INCLUDE "exit_codes.inc"
 
 	MODULE MAIN
 
@@ -49,8 +51,11 @@ START
 	CALL	WCOMMON.INIT_VMODE
 	PRINTLN MSG_START
 
-	CALL	PARSE_HOST
+	CALL	PARSE_PING_ARGS
 	JP	C,USAGE
+	LD	A,(OPT_HELP)
+	AND	A
+	JP	NZ,SHOW_HELP
 
 	CALL	WIFI.UART_FIND
 	JP	C,NO_WIFI
@@ -78,179 +83,268 @@ START
 	JP	COMMAND_ERROR_EXIT
 .UART_FLOW_OK
 
-	PRINT MSG_PINGING
-	PRINT HOST_BUFF
-	PRINT WCOMMON.LINE_END
+	CALL	STAT_RESET
+	CALL	RESOLVE_TARGET
 
+	LD	HL,(OPT_COUNT)
+	LD	(PING_LEFT),HL
+	XOR	A
+	LD	(PING_STOP),A
+
+.LOOP
+	; Anchor the pacing before the request, not after the reply: AT+PING plus
+	; the ESP's own ping take most of a second, and that time belongs inside
+	; the one-second interval, not on top of it.
+	CALL	PAUSE_ANCHOR_NOW
 	CALL	BUILD_PING_CMD
-	; Right after NETUP's join the ESP IP stack may still be coming up, so it
-	; answers a network command (AT+PING) with "busy p..." (which reads as a
-	; timeout) even though plain AT works. Retry on busy for a short while; a
-	; manual run works only because the human pause already covers this window.
-	LD	A,PING_BUSY_RETRIES
-	LD	(PING_RETRY),A
-	LD	A,PING_WARMUP_RETRIES
-	LD	(PING_WRETRY),A
-	LD	A,PING_FORMAT_RETRIES
-	LD	(PING_FRETRY),A
-.PING_TRY
-	LD	HL,CMD_BUFF
-	LD	DE,WIFI.RS_BUFF
-	LD	BC,PING_TIMEOUT
-	CALL	WIFI.UART_TX_CMD
-	IFDEF	PING_HEXDUMP
-	PUSH	AF
-	CALL	DUMP_RS_HEX
-	POP	AF
-	ENDIF
-	AND	A
-	JP	Z,.PING_OK
-	LD	(PING_STATUS),A
-	; "busy p..." -> the ESP IP stack is still coming up; quick retry.
-	LD	HL,LIT_BUSY
-	CALL	RESP_CONTAINS			; CF=1 if ESP replied "busy"
-	JR	NC,.CHK_WARMUP
-	LD	A,(PING_RETRY)
-	OR	A
-	JR	Z,.PING_NZ			; out of busy retries -> report
-	DEC	A
-	LD	(PING_RETRY),A
-	LD	HL,PING_BUSY_DELAY
-	CALL	UTIL.DELAY
-	JP	.PING_TRY
-.CHK_WARMUP
-	; Right after NETUP the route/ARP may not be ready yet, so the first pings
-	; come back "+timeout" (or no reply at all). Retry a few times before
-	; declaring the host unreachable - a manual run avoids this via the human
-	; pause. A genuinely down host still fails once the retries are spent.
-	CALL	RESP_IS_PING_TIMEOUT		; CF=1 if "+timeout" or silent timeout
-	JR	NC,.PING_NZ
-	LD	A,(PING_WRETRY)
-	OR	A
-	JR	Z,.PING_NZ			; out of warmup retries -> report
-	DEC	A
-	LD	(PING_WRETRY),A
-	LD	HL,PING_WARMUP_DELAY
-	CALL	UTIL.DELAY
-	JR	.PING_TRY
-.PING_NZ
-	LD	A,(PING_STATUS)
-	CALL	PRINT_PING_RESULT
-	JR	NC,.SUCCESS
+	CALL	SEND_PING_ONE
 
-	; A genuine ping timeout (host unreachable) is not the same as an ESP that
-	; does not support AT+PING - report it accordingly.
+	LD	A,(WCOMMON.CANCELLED)
+	AND	A
+	JP	NZ,.CANCELLED
+
+	CALL	STAT_SENT
+
+	LD	A,(PING_STATUS)
+	AND	A
+	JR	NZ,.NOT_OK
+	CALL	FIND_PING_RTT
+	JR	C,.TIMEOUT_LINE
+	; PRINT below issues RST DSS, which clobbers C (and thus BC) - stash the
+	; RTT value before printing anything else.
+	LD	(PING_RTT),BC
+	CALL	STAT_RECEIVED
+	PRINT	MSG_REPLY_FROM
+	LD	HL,(PING_TARGET)
+	PRINT_HL
+	PRINT	MSG_COLON_SPACE
+	LD	BC,(PING_RTT)
+	CALL	PRINT_RTT_MS
+	JR	.ADVANCE
+.NOT_OK
+	LD	A,(PING_STATUS)
 	CALL	RESP_IS_PING_TIMEOUT
-	JR	C,.TIMED_OUT
-	LD	A,(PING_STATUS)
-	CP	RES_ERROR
-	JR	Z,.UNSUPPORTED
-	CP	RES_FAIL
-	JR	Z,.UNSUPPORTED
-	ADD	A,'0'
-	LD	(MSG_ERROR_NO),A
-	PRINTLN MSG_COMM_ERROR
-	LD	B,3
-	JP	WCOMMON.EXIT
-
-.TIMED_OUT
-	PRINTLN MSG_PING_TIMEOUT
-	LD	B,3
-	JP	WCOMMON.EXIT
-
-.UNSUPPORTED
-	PRINTLN MSG_PING_UNSUPPORTED
-	LD	B,3
-	JP	WCOMMON.EXIT
-
-.PING_OK
-	; A valid final OK can still follow a UART-corrupted informational line.
-	; Never accept or print a truncated result such as "G:109"; retry the
-	; idempotent ping command after restoring command-response FIFO mode.
-	CALL	FIND_PING_RESULT
-	JR	NC,.PING_VALID
-	LD	A,(PING_FRETRY)
+	JR	C,.TIMEOUT_LINE
+	; A genuine ESP/comm error (not a ping timeout) stops further requests;
+	; the statistics collected so far are still printed.
+	CALL	PRINT_HARD_ERROR
+	LD	A,1
+	LD	(PING_STOP),A
+	JR	.ADVANCE
+.TIMEOUT_LINE
+	PRINTLN	MSG_TIMED_OUT
+.ADVANCE
+	LD	A,(PING_STOP)
 	AND	A
-	JR	Z,.PING_MALFORMED
-	DEC	A
-	LD	(PING_FRETRY),A
-	LD	HL,PING_FORMAT_DELAY
-	CALL	UTIL.DELAY
-	JP	.PING_TRY
-.PING_MALFORMED
-	CALL	PRINT_PING_RESULT
-	LD	B,3
-	JP	WCOMMON.EXIT
-.PING_VALID
-	CALL	PRINT_PING_RESULT
-	JR	NC,.SUCCESS
-	LD	B,3
-	JP	WCOMMON.EXIT
+	JR	NZ,.FINISH
+	LD	A,(OPT_INFINITE)
+	AND	A
+	JR	NZ,.PAUSE
+	LD	HL,(PING_LEFT)
+	DEC	HL
+	LD	(PING_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	Z,.FINISH
+.PAUSE
+	CALL	PING_PAUSE
+	JR	C,.FINISH
+	JP	.LOOP
+.CANCELLED
+	; The in-flight request is counted as sent and lost, same as the sibling
+	; ping utilities.
+	CALL	STAT_SENT
+.FINISH
+	LD	A,(WCOMMON.CANCELLED)
+	AND	A
+	JR	Z,.NO_CANCEL_MSG
+	PRINT	WCOMMON.LINE_END
+	PRINTLN	MSG_CANCELLED_LINE
+.NO_CANCEL_MSG
+	PRINT	WCOMMON.LINE_END
+	PRINT	MSG_STATS_FOR
+	LD	HL,(PING_TARGET)
+	PRINT_HL
+	PRINTLN	MSG_COLON
+	CALL	PRINT_PACKETS_LINE
 
-.SUCCESS
-	PRINTLN MSG_DONE
-	LD	B,0
+	LD	A,(WCOMMON.CANCELLED)
+	AND	A
+	JR	NZ,.EXIT_CANCELLED
+	LD	HL,(PING_RECEIVED)
+	LD	A,H
+	OR	L
+	JR	Z,.EXIT_FAIL
+	; Every utility in this package closes with "<NAME> done." on success and
+	; with a reason line on failure; the sibling kits' "RESULT OK/FAIL" would
+	; be the odd one out here.
+	PRINTLN	MSG_DONE
+	LD	B,EXIT_OK
+	JP	WCOMMON.EXIT
+.EXIT_FAIL
+	PRINTLN	MSG_NO_REPLY
+	LD	B,EXIT_NETWORK
+	JP	WCOMMON.EXIT
+.EXIT_CANCELLED
+	; "Cancelled by user." is already on screen above the statistics.
+	LD	B,EXIT_CANCELLED
 	JP	WCOMMON.EXIT
 
 NO_WIFI
 	PRINTLN MSG_WIFI_NOT_FOUND
-	LD	B,2
+	LD	B,EXIT_HARDWARE
 	JP	WCOMMON.EXIT
 
 USAGE
 	PRINTLN MSG_USAGE
-	LD	B,1
+	LD	B,EXIT_ARGUMENT
+	JP	WCOMMON.EXIT
+
+SHOW_HELP
+	PRINTLN MSG_USAGE
+	LD	B,EXIT_OK
 	JP	WCOMMON.EXIT
 
 ; ------------------------------------------------------
-; Parse first command-line argument into HOST_BUFF.
-; Out: CF=0 - host parsed, CF=1 - missing/invalid argument.
+; Resolve HOST_BUFF via AT+CIPDOMAIN when it is not already a dotted-decimal
+; IPv4 literal, and print the "Pinging ..." / "Our IP=" header. Sets
+; PING_TARGET to whichever ASCIIZ buffer AT+PING should actually address
+; (IP_BUFF on a successful resolve, HOST_BUFF otherwise). jesperl does not
+; implement AT+CIPDOMAIN, so a failed/unsupported resolve falls back to
+; pinging the host text directly, same as real ESP-AT would refuse to open a
+; hostname it cannot resolve.
 ; ------------------------------------------------------
-PARSE_HOST
-	LD	HL,(CMDLINE_PTR)
-	LD	A,(HL)
+RESOLVE_TARGET
+	LD	HL,HOST_BUFF
+	LD	(PING_TARGET),HL
+	LD	HL,HOST_BUFF
+	CALL	IS_IPV4_LITERAL
+	JR	NC,.HEADER_PLAIN
+	LD	HL,CMD_BUFF
+	LD	DE,CMD_CIPDOMAIN_PREFIX
+	CALL	APPEND_STR
+	LD	IX,HOST_BUFF
+	CALL	APPEND_IX_STR
+	LD	DE,CMD_QUOTE_CRLF
+	CALL	APPEND_STR
+	LD	HL,CMD_BUFF
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,DEFAULT_TIMEOUT
+	CALL	WIFI.UART_TX_CMD
 	AND	A
-	JR	Z,.NO_ARG
-	LD	B,A
-	INC	HL
-.SKIP
-	LD	A,B
-	AND	A
-	JR	Z,.NO_ARG
-	LD	A,(HL)
-	CP	0x21
-	JR	NC,.START_COPY
-	INC	HL
-	DJNZ	.SKIP
-	JR	.NO_ARG
+	JR	NZ,.HEADER_PLAIN
+	LD	HL,WIFI.RS_BUFF
+	LD	DE,IP_BUFF
+	LD	C,15
+	CALL	FIND_CIPDOMAIN_IP
+	JR	C,.HEADER_PLAIN
+	LD	HL,IP_BUFF
+	LD	(PING_TARGET),HL
+	PRINT	MSG_PINGING
+	PRINT	HOST_BUFF
+	PRINT	MSG_OPEN_BRACKET
+	PRINT	IP_BUFF
+	PRINTLN	MSG_CLOSE_COLON
+	JR	.OUR_IP
+.HEADER_PLAIN
+	PRINT	MSG_PINGING
+	PRINT	HOST_BUFF
+	PRINTLN	MSG_COLON
+.OUR_IP
+	CALL	PRINT_OUR_IP
+	RET
 
-.START_COPY
-	LD	DE,HOST_BUFF
-	LD	C,HOST_SIZE-1
-.COPY
-	LD	A,B
+; Print "Our IP=<addr>" from env NET_IP (published by NETUP); omitted if the
+; variable is missing or empty.
+PRINT_OUR_IP
+	LD	HL,ENV_NET_IP_KEY
+	LD	DE,WCOMMON.ENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	RET	Z
+	LD	A,(WCOMMON.ENV_VAL_BUF)
 	AND	A
-	JR	Z,.END
-	LD	A,(HL)
-	CP	0x21
-	JR	C,.END
-	LD	(DE),A
-	INC	DE
-	INC	HL
-	DEC	B
-	DEC	C
-	JR	NZ,.COPY
-.END
+	RET	Z
+	PRINT	MSG_OUR_IP
+	PRINT	WCOMMON.ENV_VAL_BUF
+	PRINT	WCOMMON.LINE_END
+	RET
+
+; ------------------------------------------------------
+; Send one AT+PING for PING_TARGET, preserving the busy-retry (ESP IP stack
+; still coming up right after NETUP) and malformed-response retry (2.2.2
+; sometimes loses the first bytes of a delayed response, "+PING:228" ->
+; "G:228"). The former warm-up-timeout retry is intentionally gone: with a
+; multi-ping series, an early timeout is now legitimate, visible ping output
+; instead of something to hide.
+; Out: A = PING_STATUS = RES_* result (0 on a clean OK).
+; ------------------------------------------------------
+SEND_PING_ONE
+	LD	A,PING_BUSY_RETRIES
+	LD	(PING_RETRY),A
+	LD	A,PING_FORMAT_RETRIES
+	LD	(PING_FRETRY),A
+.TRY
+	LD	HL,CMD_BUFF
+	LD	DE,WIFI.RS_BUFF
+	LD	BC,PING_TIMEOUT
+	CALL	WIFI.UART_TX_CMD
+	LD	(PING_STATUS),A
+	CP	RES_BUSY
+	JR	NZ,.NOT_BUSY
+	LD	A,(PING_RETRY)
+	OR	A
+	JR	Z,.RETURN_STATUS
+	DEC	A
+	LD	(PING_RETRY),A
+	LD	HL,PING_BUSY_DELAY
+	CALL	UTIL.DELAY
+	JP	.TRY
+.NOT_BUSY
+	LD	A,(PING_STATUS)
+	AND	A
+	JR	NZ,.RETURN_STATUS
+	CALL	FIND_PING_RESULT
+	JR	NC,.OK_VALID
+	LD	A,(PING_FRETRY)
+	AND	A
+	JR	Z,.OK_VALID			; retries spent -> accept the terminal OK as-is
+	DEC	A
+	LD	(PING_FRETRY),A
+	LD	HL,PING_FORMAT_DELAY
+	CALL	UTIL.DELAY
+	JP	.TRY
+.OK_VALID
 	XOR	A
-	LD	(DE),A
-	LD	A,(HOST_BUFF)
-	AND	A
-	JR	Z,.NO_ARG
-	AND	A
+	LD	(PING_STATUS),A
 	RET
-.NO_ARG
-	SCF
+.RETURN_STATUS
+	LD	A,(PING_STATUS)
 	RET
+
+PRINT_HARD_ERROR
+	LD	A,(PING_STATUS)
+	CP	RES_TX_TIMEOUT
+	JR	Z,.TXTIMEOUT
+	PRINTLN MSG_PING_UNSUPPORTED
+	RET
+.TXTIMEOUT
+	PRINTLN MSG_TX_TIMEOUT
+	RET
+
+; ------------------------------------------------------
+; Pause OPT_PAUSE ms between requests; OPT_PAUSE=0 pauses for 0 ms. Whole
+; seconds are paced on the DSS wall clock and any remainder on the measured
+; delay loop (see ping_lib.asm). ISA is already closed here - UART_TX_CMD
+; closes it on the way out - so both the RST DSS clock read and
+; WCOMMON.CHECK_CANCEL are safe to call directly.
+; Out: CF=1 - cancelled (WCOMMON.CANCELLED set); CF=0 - pause elapsed.
+; ------------------------------------------------------
+PING_PAUSE
+	LD	HL,(OPT_PAUSE)
+	JP	PAUSE_MS
 
 ; ------------------------------------------------------
 ; Send command in HL with default timeout.
@@ -277,109 +371,21 @@ COMMAND_ERROR_EXIT
 	ADD	A,'0'
 	LD	(MSG_ERROR_NO),A
 	PRINTLN MSG_COMM_ERROR
-	LD	B,3
+	LD	B,EXIT_NETWORK
 	JP	WCOMMON.EXIT
 
 ; ------------------------------------------------------
-; Build AT+PING command from HOST_BUFF.
+; Build AT+PING command from PING_TARGET (HOST_BUFF, or IP_BUFF once
+; RESOLVE_TARGET has resolved a hostname).
 ; ------------------------------------------------------
 BUILD_PING_CMD
 	LD	HL,CMD_BUFF
 	LD	DE,CMD_PING_PREFIX
 	CALL	APPEND_STR
-	LD	IX,HOST_BUFF
+	LD	IX,(PING_TARGET)
 	CALL	APPEND_IX_STR
 	LD	DE,CMD_QUOTE_CRLF
 	JP	APPEND_STR
-
-; ------------------------------------------------------
-; Print parsed +PING response or raw ESP response if +PING is missing.
-; Accepts both ESP-AT forms seen in the field:
-;   +PING:<ms>
-;   +<ms>
-; Out: CF=0 - valid ping response found, CF=1 - no ping result.
-; ------------------------------------------------------
-PRINT_PING_RESULT
-	CALL	FIND_PING_RESULT
-	JR	C,.RAW
-	PUSH	HL
-	PRINT MSG_REPLY
-	POP	HL
-	XOR	A
-	LD	(PING_DIGITS),A
-	CALL	PRINT_DECIMAL_FIELD
-	LD	A,(PING_DIGITS)
-	AND	A
-	JR	Z,.RAW
-	PRINTLN MSG_MS
-	AND	A
-	RET
-.RAW
-	PRINTLN MSG_NO_PING_RESULT
-	LD	HL,WIFI.RS_BUFF
-	CALL	PRINT_ESP_RESPONSE
-	SCF
-	RET
-
-; Locate the decimal result without producing output.
-; Out: CF=0/HL -> first digit, CF=1 when no valid +PING/+<ms> line exists.
-FIND_PING_RESULT
-	LD	HL,WIFI.RS_BUFF
-.NEXT
-	LD	A,(HL)
-	AND	A
-	JR	Z,.NOT_FOUND
-	LD	DE,RESP_PING_PREFIX
-	CALL	UTIL.STARTSWITH
-	JR	Z,.FOUND_PING
-	LD	A,(HL)
-	CP	'+'
-	JR	Z,.FOUND_SHORT
-	CALL	SKIP_LINE
-	JR	.NEXT
-.FOUND_PING
-	LD	BC,6
-	ADD	HL,BC
-	JR	.FOUND_DECIMAL
-.FOUND_SHORT
-	INC	HL
-.FOUND_DECIMAL
-	CALL	FIND_DECIMAL_FIELD
-	RET
-.NOT_FOUND
-	SCF
-	RET
-
-FIND_DECIMAL_FIELD
-	LD	A,(HL)
-	CP	' '
-	JR	Z,.SKIP
-	CP	9
-	JR	Z,.SKIP
-	CP	'0'
-	JR	C,.ERR
-	CP	'9'+1
-	JR	NC,.ERR
-	AND	A
-	RET
-.SKIP
-	INC	HL
-	JR	FIND_DECIMAL_FIELD
-.ERR
-	SCF
-	RET
-
-; ------------------------------------------------------
-; Skip current LF-separated response line.
-; ------------------------------------------------------
-SKIP_LINE
-	LD	A,(HL)
-	AND	A
-	RET	Z
-	INC	HL
-	CP	10
-	RET	Z
-	JR	SKIP_LINE
 
 ; ------------------------------------------------------
 ; Print ESP response buffer with LF -> CRLF conversion.
@@ -408,23 +414,6 @@ PRINT_ESP_FAILURE
 	LD	HL,WIFI.RS_BUFF
 	JP	PRINT_ESP_RESPONSE
 
-PRINT_DECIMAL_FIELD
-	LD	A,(HL)
-	CP	' '
-	JR	Z,.SKIP
-	CP	9
-	JR	Z,.SKIP
-	CP	'0'
-	RET	C
-	CP	'9'+1
-	RET	NC
-	CALL	PUT_CHAR
-	LD	A,1
-	LD	(PING_DIGITS),A
-.SKIP
-	INC	HL
-	JR	PRINT_DECIMAL_FIELD
-
 PUT_CHAR
 	PUSH	HL
 	LD	C,DSS_PUTCHAR
@@ -432,47 +421,13 @@ PUT_CHAR
 	POP	HL
 	RET
 
-; Keep the dynamically assembled AT+PING command terminated even though
-; CMD_BUFF is runtime BSS and can contain bytes left by a previous program.
-; Without the copied zero UART_TX_STRING continued past CR/LF and fed ESP a
-; second garbage line, commonly producing ERR CODE:0x010b0000 / "busy p...".
+; Keep the dynamically assembled AT+PING/AT+CIPDOMAIN command terminated even
+; though CMD_BUFF is runtime BSS and can contain bytes left by a previous
+; program. Without the copied zero UART_TX_STRING continued past CR/LF and
+; fed ESP a second garbage line, commonly producing ERR CODE:0x010b0000 /
+; "busy p...".
 	INCLUDE "asciiz_append.asm"
-
-	IFDEF	PING_HEXDUMP
-; ------------------------------------------------------
-; Debug: dump the first 32 bytes of WIFI.RS_BUFF as hex + result code, so the
-; exact bytes the UART stored (incl. any leading control/framing artefacts)
-; are visible. A=UART_TX_CMD result on entry.
-; ------------------------------------------------------
-DUMP_RS_HEX
-	PUSH	AF
-	LD	C,A
-	LD	DE,HEXD_RES
-	CALL	UTIL.HEXB
-	LD	B,32
-	LD	HL,WIFI.RS_BUFF
-	LD	DE,HEXD_BYTES
-.NEXT
-	LD	A,(HL)
-	LD	C,A
-	CALL	UTIL.HEXB			; writes 2 hex chars, advances DE by 2
-	LD	A,' '
-	LD	(DE),A
-	INC	DE
-	INC	HL
-	DJNZ	.NEXT
-	XOR	A
-	LD	(DE),A
-	PRINTLN	HEXD_HDR
-	POP	AF
-	RET
-HEXD_HDR
-	DB "DUMP res="
-HEXD_RES
-	DB "xx bytes="
-HEXD_BYTES
-	DS 32*3+1,0
-	ENDIF
+	INCLUDE "ping_lib.asm"
 
 MSG_START
 	DB "PING "
@@ -480,7 +435,13 @@ MSG_START
 	DB " - SprinterESP host diagnostic"
 	DB 0
 MSG_USAGE
-	DB "Usage: PING.EXE host",0
+	DB "Usage:",13,10
+	DB "  PING.EXE [-t] [-n count] [-p ms] host",13,10
+	DB "  PING.EXE /?",13,10,13,10
+	DB "  -t        ping until interrupted (Esc/Ctrl+Z).",13,10
+	DB "  -n count  number of echo requests (default 4, max 65535).",13,10
+	DB "  -p ms     pause between requests (default 1000, 0 = no pause).",13,10
+	DB "  host      destination IPv4 address or host name.",0
 MSG_WIFI_NOT_FOUND
 	DB "Sprinter-WiFi not found!",0
 MSG_UART_READY
@@ -489,19 +450,32 @@ MSG_ESP_RESPONSE
 	DB "ESP response:",0
 MSG_PINGING
 	DB "Pinging ",0
-MSG_REPLY
-	DB "Reply time: ",0
-MSG_MS
-	DB " ms",0
-MSG_NO_PING_RESULT
-	DB "No +PING result in ESP response:",0
-MSG_PING_TIMEOUT
-	DB "Host did not respond (timed out). It may be down, blocking",13,10
-	DB "ping, or the network is still coming up - try again.",0
+MSG_OPEN_BRACKET
+	DB " [",0
+MSG_CLOSE_COLON
+	DB "]:",0
+MSG_COLON
+	DB ":",0
+MSG_COLON_SPACE
+	DB ": ",0
+MSG_OUR_IP
+	DB "Our IP=",0
+MSG_REPLY_FROM
+	DB "Reply from ",0
+MSG_TIMED_OUT
+	DB "Request timed out.",0
 MSG_PING_UNSUPPORTED
 	DB "ESP-AT PING failed or is not supported by firmware/emulator.",0
+MSG_TX_TIMEOUT
+	DB "Could not send AT+PING command (UART busy).",0
+MSG_CANCELLED_LINE
+	DB "Cancelled by user.",0
+MSG_STATS_FOR
+	DB "Ping statistics for ",0
 MSG_DONE
 	DB "PING done.",0
+MSG_NO_REPLY
+	DB "No replies received.",0
 MSG_COMM_ERROR
 	DB "ESP communication error #"
 MSG_ERROR_NO
@@ -511,85 +485,29 @@ CMD_ECHO_OFF
 	DB "ATE0",13,10,0
 CMD_PING_PREFIX
 	DB "AT+PING=",34,0
+CMD_CIPDOMAIN_PREFIX
+	DB "AT+CIPDOMAIN=",34,0
 CMD_QUOTE_CRLF
 	DB 34,13,10,0
-RESP_PING_PREFIX
-	DB "+PING:",0
-LIT_BUSY
-	DB "busy",0
-LIT_TIMEOUT
-	DB "timeout",0			; ESP AT+PING failure indicator ("+timeout")
-LIT_TIMEOUT_UPPER
-	DB "TIMEOUT",0			; ESP-AT 2.2.2 form: "+PING:TIMEOUT"
-PING_DIGITS
-	DB 0
+ENV_NET_IP_KEY
+	DB "NET_IP",0
+
 PING_STATUS
 	DB 0
 PING_RETRY
 	DB 0
-PING_WRETRY
-	DB 0
 PING_FRETRY
 	DB 0
+PING_STOP
+	DB 0
+PING_LEFT
+	DW 0
+PING_TARGET
+	DW 0
+PING_RTT
+	DW 0
 CMDLINE_PTR
 	DW 0			; arg buffer ptr captured from IX at entry
-
-; ------------------------------------------------------
-; RESP_IS_PING_TIMEOUT: CF=1 if the AT+PING response means "timed out" - either
-; the ESP wrote "+timeout"/"timeout" into RS_BUFF, or it stayed silent so the
-; UART layer returned RES_RS_TIMEOUT (PING_STATUS). Trashes A,B,DE,HL.
-; ------------------------------------------------------
-RESP_IS_PING_TIMEOUT
-	LD	A,(PING_STATUS)
-	CP	RES_RS_TIMEOUT
-	JR	Z,.YES				; no reply at all -> a timeout
-	LD	HL,LIT_TIMEOUT
-	CALL	RESP_CONTAINS
-	RET	C
-	LD	HL,LIT_TIMEOUT_UPPER
-	JP	RESP_CONTAINS			; CF per scan
-.YES
-	SCF
-	RET
-
-; ------------------------------------------------------
-; RESP_CONTAINS: scan WIFI.RS_BUFF for the ASCIIZ needle at HL (e.g. "busy",
-; "timeout"). Out: CF=1 if found, CF=0 if not. Trashes A,B,DE,HL.
-; ------------------------------------------------------
-RESP_CONTAINS
-	PUSH	HL				; needle start
-	LD	DE,WIFI.RS_BUFF
-.SCAN
-	LD	A,(DE)
-	AND	A
-	JR	Z,.NO
-	POP	HL				; reload needle start
-	PUSH	HL
-	PUSH	DE				; save haystack position
-.CMP
-	LD	A,(HL)
-	AND	A
-	JR	Z,.YES				; whole needle matched
-	LD	B,A
-	LD	A,(DE)
-	CP	B
-	JR	NZ,.NEXT
-	INC	HL
-	INC	DE
-	JR	.CMP
-.NEXT
-	POP	DE				; restore haystack position
-	INC	DE
-	JR	.SCAN
-.YES
-	POP	DE				; discard saved position
-	POP	HL				; discard needle start
-	SCF
-	RET
-.NO
-	POP	HL				; discard needle start
-	OR	A
-	RET
 
 	ENDMODULE
 
@@ -604,7 +522,8 @@ RESP_CONTAINS
 
 HOST_BUFF	EQU NETCFG.NETCFG_BSS_END
 CMD_BUFF	EQU HOST_BUFF + HOST_SIZE
-PING_BSS_END	EQU CMD_BUFF + CMD_SIZE
+IP_BUFF		EQU CMD_BUFF + CMD_SIZE
+PING_BSS_END	EQU IP_BUFF + 16
 
 	ENDMODULE
 

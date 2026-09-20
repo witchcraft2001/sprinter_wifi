@@ -1,7 +1,11 @@
-.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-dlspeed test-race-server dlspeed racetest clean
+.PHONY: build package image test test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-ping test-dlspeed test-race-server dlspeed racetest clean
 
 build:
 	tools/build.sh
+
+.PHONY: ftp-trace
+ftp-trace:
+	sh tools/build-ftp-trace.sh
 
 package:
 	tools/package.sh
@@ -9,7 +13,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-dlspeed test-race-server
+test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-ping test-dlspeed test-race-server
 	tools/test-zmodem.sh
 
 test-libman:
@@ -44,6 +48,9 @@ test-ftp-burst:
 
 test-progress:
 	tools/test-progress.sh
+
+test-ping:
+	tools/test-ping.sh
 
 test-dlspeed:
 	tools/test-dlspeed.sh

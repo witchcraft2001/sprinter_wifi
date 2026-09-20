@@ -1,0 +1,147 @@
+; Boundary reads acknowledge LSR in hardware. They must keep the error sticky
+; across the next RECEIVE reset, without changing flow control or ABI registers.
+	DEFINE FTP_UART_TRACE
+	DEFINE FTP_RECEIVE_TEST
+	INCLUDE "../src/apps/ftp.asm"
+	ASSERT $ < 0xD100
+	DS 0xD100-$,0
+	ORG 0xD100
+
+TEST_RESULT EQU 0xC000
+TEST_MARKER EQU 0xC001
+TEST_START
+	LD	SP,MAIN.STACK_TOP
+	XOR	A
+	LD	(TEST_RESULT),A
+	LD	(TEST_MARKER),A
+	LD	(TCP.LSR_ACCUM),A
+	LD	A,UART_RX_PROFILE_222
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	CALL	UART_TRACE.INIT
+	LD	A,1
+	LD	(STAGE),A
+	LD	A,(UART_TRACE.DATA)
+	CP	0xFF
+	JP	NZ,FAILED
+	LD	A,(UART_TRACE.FIRST)
+	OR	A
+	JP	NZ,FAILED
+
+	LD	A,LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	LD	A,MCR_AFE
+	LD	(REG_MCR),A
+	LD	BC,0x1234
+	LD	DE,0x5678
+	LD	HL,0x9ABC
+	LD	A,0x47
+	SCF
+	FTP_UART_SAMPLE 3
+	JP	NC,FAILED
+	CP	0x47
+	JP	NZ,FAILED
+	LD	A,H
+	CP	0x9A
+	JP	NZ,FAILED
+	LD	A,L
+	CP	0xBC
+	JP	NZ,FAILED
+	LD	HL,0x1234
+	OR	A
+	SBC	HL,BC
+	JP	NZ,FAILED
+	LD	HL,0x5678
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+
+	LD	A,2
+	LD	(STAGE),A
+	LD	A,0x69		; new FE during DSS_WRITE, first observed on return
+	LD	(REG_LSR),A
+	FTP_UART_SAMPLE 4
+	LD	A,(UART_TRACE.FIRST)
+	CP	4
+	JP	NZ,FAILED
+	LD	A,(UART_TRACE.ERRORS)
+	CP	LSR_FE
+	JP	NZ,FAILED
+	LD	A,(UART_TRACE.DATA+3)
+	CP	0x69
+	JP	NZ,FAILED
+
+	; Model hardware clearing FE on that LSR read, then FTP clearing its own
+	; per-receive latch. The pre-resume sample must re-inject the saved error.
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	A,0x61
+	LD	(REG_LSR),A
+	FTP_UART_SAMPLE 1
+	LD	A,(TCP.LSR_ACCUM)
+	AND	LSR_FE
+	JP	Z,FAILED
+	LD	A,(UART_TRACE.FIRST)
+	CP	4
+	JP	NZ,FAILED
+	LD	A,(REG_MCR)
+	CP	MCR_AFE
+	JP	NZ,FAILED
+	LD	A,0x63		; a later OE must not replace the first FE boundary
+	LD	(REG_LSR),A
+	FTP_UART_SAMPLE 2
+	LD	A,(UART_TRACE.FIRST)
+	CP	4
+	JP	NZ,FAILED
+	LD	A,(UART_TRACE.ERRORS)
+	CP	LSR_FE | LSR_OE
+	JP	NZ,FAILED
+
+	; The 2.2.1 path must not sample/latch an extra UART status.
+	LD	A,3
+	LD	(STAGE),A
+	CALL	UART_TRACE.INIT
+	LD	A,UART_RX_PROFILE_221
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	LD	A,0x69
+	LD	(REG_LSR),A
+	FTP_UART_SAMPLE 4
+	LD	A,(UART_TRACE.DATA+3)
+	CP	0xFF
+	JP	NZ,FAILED
+	LD	A,(UART_TRACE.ERRORS)
+	OR	A
+	JP	NZ,FAILED
+
+	; Execute the report and verify its exact hex row and NUL termination.
+	; Console calls alone are stubbed; ISA/register snapshot and HEXB are real.
+	LD	A,4
+	LD	(STAGE),A
+	LD	A,0xC9
+	LD	(DSS),A
+	LD	A,3
+	LD	(REG_LCR),A
+	LD	(TCP.MULTI_DIAG_PHASE),A
+	LD	A,0xC1
+	LD	(REG_IIR),A
+	CALL	UART_TRACE.REPORT
+	LD	HL,UART_TRACE.ROW
+	LD	DE,EXPECTED_ROW
+	LD	B,33
+.COMPARE
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,FAILED
+	INC	HL
+	INC	DE
+	DJNZ	.COMPARE
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+TEST_DONE
+	HALT
+FAILED
+	LD	A,(STAGE)
+	LD	(TEST_RESULT),A
+	JP	TEST_DONE
+STAGE DB 0
+EXPECTED_ROW DB "FF FF FF FF FF 00 00 03 20 C1 03",0
+	END TEST_START

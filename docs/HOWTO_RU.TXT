@@ -50,13 +50,14 @@ Sprinter ESP Network Kit - Быстрый старт (HOWTO)
       PING 8.8.8.8
       WGET http://example.com -o INDEX.HTM -y
 
-  Успешный PING печатает время ответа; WGET сохраняет страницу в INDEX.HTM.
+  Успешный PING отправляет 4 запроса и печатает время ответа, потери и
+  "PING done."; WGET сохраняет страницу в INDEX.HTM.
 
 Запуск одной командой (batch)
   CONNECT.BAT последовательно выполняет NETRESET, NETUP и PING 8.8.8.8.
 
 Повседневные команды (запускать после NETUP)
-  PING host                 проверка доступности
+  PING [-t] [-n count] [-p ms] host    проверка доступности (по умолчанию 4 запроса)
   WGET url [-o file]        скачать файл по http:// (HTTPS не поддерживается)
   FTP  host file [-u user -p pass]   скачать по FTP
   TFTP host GET file -o FILE          скачать по TFTP
