@@ -92,9 +92,12 @@ MSG_INIT_ESP
 
 MSG_DONE
 	DB "NETRESET done.",0
+MSG_FAILED
+	DB "NETRESET failed.",0
 
 	ENDMODULE
 
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

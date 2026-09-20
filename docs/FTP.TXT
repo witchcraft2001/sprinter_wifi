@@ -74,3 +74,14 @@ Exit Codes
   5  Local file, runtime memory, or DSS storage error.
   6  FTP server rejected a command, login, PASV, REST, or transfer.
   7  Cancelled by the user (Esc/Ctrl+Z).
+
+  A successful run closes with "FTP done."; a run that ends with status 2-6
+  prints its reason and closes with "FTP failed.".
+
+Notes
+-----
+  "No '>' from ESP, sending anyway." means the ESP did not print its
+  AT+CIPSEND prompt in time. FTP then sends the control command regardless:
+  a module that is merely slow still takes it, and if the ESP really is
+  stuck the following reply wait reports the error. Seeing this line now and
+  then is harmless; seeing it on every command is worth reporting.

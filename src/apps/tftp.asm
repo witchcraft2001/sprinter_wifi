@@ -1547,6 +1547,8 @@ MSG_KB_UNK
 	DB "KB / ?",0
 MSG_DONE
 	DB "TFTP done.",0
+MSG_FAILED
+	DB "TFTP failed.",0
 MSG_WIFI_NOT_FOUND
 	DB "Sprinter-WiFi not found!",0
 MSG_FILE_ERROR
@@ -1678,6 +1680,7 @@ ESP_TCP_BSS_BASE	EQU 0xB000
 
 	INCLUDE "netcfg_lib.asm"
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

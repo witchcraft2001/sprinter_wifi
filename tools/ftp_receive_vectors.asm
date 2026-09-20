@@ -153,18 +153,123 @@ TEST_START
 	CALL	MAIN.SEND_CONTROL
 	CALL	ASSERT_UART_ERROR
 
-	; A clean prompt timeout preserves the transport result and does not get
-	; relabelled as a UART integrity error.
+	; A clean prompt timeout is not relabelled as a UART integrity error, and
+	; is no longer fatal: the control payload goes out anyway, exactly once and
+	; exactly as built, and the following reply wait becomes the verdict.
 	LD	A,8
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	HL,WIFI.UART_TX_BUFFER
+	LD	DE,TX_SPY
+	CALL	STUB_JP
+	LD	HL,14
+	LD	(MAIN.CMD_LEN),HL
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(MAIN.UART_ERROR_REPORTED)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(TX_COUNT)
+	CP	1
+	JP	NZ,FAILED
+	LD	HL,(TX_HL)
+	LD	DE,MAIN.CMD_BUFF
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,(TX_BC)
+	LD	DE,14
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+
+	; A user cancel surfaces through the same timeout code and must stay a
+	; failure with nothing transmitted.
+	LD	A,11
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,1
+	LD	(WCOMMON.CANCELLED),A
+	CALL	MAIN.SEND_CONTROL
+	PUSH	AF
+	XOR	A
+	LD	(WCOMMON.CANCELLED),A
+	POP	AF
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(TX_COUNT)
+	OR	A
+	JP	NZ,FAILED
+
+	; Only the prompt timeout takes the fallback; a TX timeout passes through.
+	LD	A,12
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_TX_TIMEOUT
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	NC,FAILED
+	CP	RES_TX_TIMEOUT
+	JP	NZ,FAILED
+	LD	A,(TX_COUNT)
+	OR	A
+	JP	NZ,FAILED
+
+	; A fallback payload the UART refuses is reported as a TX timeout.
+	LD	A,13
 	LD	(STAGE),A
 	CALL	RESET_STATE
 	LD	A,RES_RS_TIMEOUT
 	LD	(SPY_RESULT),A
+	LD	A,1
+	LD	(TX_FAIL),A
 	CALL	MAIN.SEND_CONTROL
 	JP	NC,FAILED
-	CP	RES_RS_TIMEOUT
+	CP	RES_TX_TIMEOUT
 	JP	NZ,FAILED
-	LD	A,(MAIN.UART_ERROR_REPORTED)
+
+	; The prompt wait runs under the stable-RTS guard on the 2.2.2 profile only,
+	; and the guard never outlives the send - success or failure.
+	LD	A,14
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	XOR	A
+	LD	(SPY_RESULT),A
+	LD	A,UART_RX_PROFILE_222
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	LD	A,(GUARD_SEEN)
+	CP	1
+	JP	NZ,FAILED
+	LD	A,(ISA.RX_CRITICAL)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	LD	A,1
+	LD	(WCOMMON.CANCELLED),A
+	CALL	MAIN.SEND_CONTROL
+	PUSH	AF
+	XOR	A
+	LD	(WCOMMON.CANCELLED),A
+	POP	AF
+	JP	NC,FAILED
+	LD	A,(ISA.RX_CRITICAL)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,UART_RX_PROFILE_221
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	XOR	A
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	LD	A,(GUARD_SEEN)
 	OR	A
 	JP	NZ,FAILED
 
@@ -235,6 +340,8 @@ RESET_STATE
 	LD	(MAIN.DATA_CLOSE_SEEN),A
 	LD	(MAIN.UART_ERROR_REPORTED),A
 	LD	(RESUME_COUNT),A
+	LD	(TX_COUNT),A
+	LD	(TX_FAIL),A
 	LD	HL,6000
 	LD	(MAIN.RECV_CAP),HL
 	LD	HL,MAIN.RECV_BUFFER
@@ -250,9 +357,23 @@ RECEIVE_SPY
 	RET
 
 SEND_SPY
+	LD	A,(ISA.RX_CRITICAL)
+	LD	(GUARD_SEEN),A
 	LD	A,(SPY_LSR)
 	LD	(TCP.LSR_ACCUM),A
 	LD	A,(SPY_RESULT)
+	OR	A
+	RET	Z
+	SCF
+	RET
+
+; Stands in for WIFI.UART_TX_BUFFER: records the fallback payload request.
+TX_SPY
+	LD	(TX_HL),HL
+	LD	(TX_BC),BC
+	LD	HL,TX_COUNT
+	INC	(HL)
+	LD	A,(TX_FAIL)
 	OR	A
 	RET	Z
 	SCF
@@ -315,3 +436,8 @@ RESUME_COUNT DB 0
 CLOSE_FILE_COUNT DB 0
 CLOSE_LINK_COUNT DB 0
 EXIT_CODE DB 0
+GUARD_SEEN DB 0
+TX_COUNT DB 0
+TX_FAIL DB 0
+TX_HL DW 0
+TX_BC DW 0

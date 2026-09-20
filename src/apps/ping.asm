@@ -176,8 +176,8 @@ START
 	OR	L
 	JR	Z,.EXIT_FAIL
 	; Every utility in this package closes with "<NAME> done." on success and
-	; with a reason line on failure; the sibling kits' "RESULT OK/FAIL" would
-	; be the odd one out here.
+	; with a reason line plus "<NAME> failed." on failure (WCOMMON.EXIT prints
+	; the latter); the sibling kits' "RESULT OK/FAIL" would be the odd one out.
 	PRINTLN	MSG_DONE
 	LD	B,EXIT_OK
 	JP	WCOMMON.EXIT
@@ -474,6 +474,8 @@ MSG_STATS_FOR
 	DB "Ping statistics for ",0
 MSG_DONE
 	DB "PING done.",0
+MSG_FAILED
+	DB "PING failed.",0
 MSG_NO_REPLY
 	DB "No replies received.",0
 MSG_COMM_ERROR
@@ -512,6 +514,7 @@ CMDLINE_PTR
 	ENDMODULE
 
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

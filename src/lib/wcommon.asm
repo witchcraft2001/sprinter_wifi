@@ -62,6 +62,24 @@ CHECK_ERROR
 ;	Program exit point
 ; ------------------------------------------------------
 EXIT
+	IFDEF	WCOMMON_FAIL_LINE
+	; Every utility closes a good run with "<NAME> done."; close a failed one
+	; with "<NAME> failed." from the single exit point they all share, so the
+	; line cannot go missing on one error path. A usage error already ends on
+	; the usage text and a user cancel on its own "Aborted"/"Cancelled" line,
+	; so neither gets the extra line. The utility supplies MAIN.MSG_FAILED.
+	LD		A,B
+	AND		A
+	JR		Z,.NO_FAIL_LINE
+	CP		EXIT_ARGUMENT
+	JR		Z,.NO_FAIL_LINE
+	CP		EXIT_CANCELLED
+	JR		Z,.NO_FAIL_LINE
+	PUSH	BC
+	PRINTLN	@MAIN.MSG_FAILED
+	POP		BC
+.NO_FAIL_LINE
+	ENDIF
 	CALL	REST_VMODE
     DSS_EXEC	DSS_EXIT
 ; ------------------------------------------------------

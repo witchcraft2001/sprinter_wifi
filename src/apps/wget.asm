@@ -17,6 +17,13 @@ RECV_BUFFER_SIZE	EQU 16384
 ; queued-but-unsent +IPD data on FIN. Must be < RECV_BUFFER_SIZE and safely
 ; larger than the largest tail ESP can drop in one close (~1-2 KB observed).
 HOLD_TAIL_MARGIN	EQU 8192
+; Real ESP-AT delivers active +IPD frames of up to 2920 bytes (two TCP
+; segments), not the library's 1500-byte default.
+WGET_ACTIVE_IPD_MAX	EQU 3000
+; Enter hold mode one maximum +IPD early, as FTP does, so the last stream-mode
+; read never has to accept only a prefix of a frame (see UPDATE_HOLD_MODE).
+HOLD_ENTER_MARGIN	EQU HOLD_TAIL_MARGIN + WGET_ACTIVE_IPD_MAX
+	ASSERT HOLD_ENTER_MARGIN < RECV_BUFFER_SIZE
 URL_SIZE		EQU 160
 HOST_SIZE		EQU 96
 PORT_SIZE		EQU 8
@@ -1079,7 +1086,7 @@ RECEIVE_HTTP
 	JP	C,.CANCELLED
 		CALL	WIFI.UART_RX_RESUME
 		; Switch to retain-tail mode before the read once the body is within
-		; HOLD_TAIL_MARGIN of completion; SETUP_RECV_DEST then accumulates into
+		; HOLD_ENTER_MARGIN of completion; SETUP_RECV_DEST then accumulates into
 		; RECV_BUFFER at a growing offset instead of overwriting from the start.
 		CALL	UPDATE_HOLD_MODE
 		CALL	SETUP_RECV_DEST
@@ -1820,8 +1827,11 @@ PROGRESS_TICK
 
 ; ------------------------------------------------------
 ; Enter retain-tail (hold) mode once the announced body has at most
-; HOLD_TAIL_MARGIN bytes left to receive. Called at the loop top BEFORE the
-; read so the final bytes are accumulated, never written under an RTS-off
+; HOLD_ENTER_MARGIN bytes left to receive. The extra maximum +IPD on top of
+; HOLD_TAIL_MARGIN guarantees that the preceding stream-mode read, whose
+; capacity SETUP_RECV_DEST clamps to the tail boundary, still has room for a
+; whole frame and returns at a payload boundary. Called at the loop top BEFORE
+; the read so the final bytes are accumulated, never written under an RTS-off
 ; pause. Latches HOLD_MODE; never clears it mid-transfer. No-op without a
 ; known Content-Length.
 ; ------------------------------------------------------
@@ -1838,7 +1848,7 @@ UPDATE_HOLD_MODE
 	OR	L
 	RET	Z				; remaining 0 -> done, no need to hold
 	EX	DE,HL				; DE = remaining
-	LD	HL,HOLD_TAIL_MARGIN
+	LD	HL,HOLD_ENTER_MARGIN
 	OR	A
 	SBC	HL,DE				; MARGIN - remaining; CF=1 -> MARGIN < remaining
 	RET	C				; remaining > MARGIN -> not yet
@@ -2682,6 +2692,8 @@ MSG_NO_BODY
 	DB "HTTP response has no downloaded body.",0
 MSG_DONE
 	DB "WGET done.",0
+MSG_FAILED
+	DB "WGET failed.",0
 MSG_NET_ERROR
 	DB "Network/ESP error #"
 MSG_ERROR_NO
@@ -2892,12 +2904,21 @@ U32_POW10_TABLE
 	; WGET consumes NET_BAUD/NET_ESP_* from NETUP and never loads NET.CFG.
 	DEFINE	NETCFG_SESSION_ONLY
 	INCLUDE "netcfg_lib.asm"
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"
 	; DNS resolution plus an external ESP8266 TCP connect can legitimately
 	; exceed the shared 20-second local-service timeout.
 	DEFINE	TCP_LONG_OPEN_TIMEOUT
+	; With the library's 1500-byte default, RECEIVE began a 2920-byte frame that
+	; no longer fitted RECV_BUFFER, filled the buffer mid-frame and handed WGET
+	; a DSS write while the ESP was still streaming the rest of it. Stopping an
+	; eager frame with RTS at that artificial boundary is what real ESP-AT 2.2.2
+	; hardware answers with OE/FE/BI (FTP hit and fixed the same thing); the
+	; transfer then died in that frame's continuation. Same bound as
+	; FTP_ACTIVE_IPD_MAX: coalescing now always stops between frames.
+	DEFINE	TCP_ACTIVE_IPD_MAX_OVERRIDE WGET_ACTIVE_IPD_MAX
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "tput_lib.asm"
 	; esplib.asm MUST be last: it ends with the RS_BUFF label that anchors the

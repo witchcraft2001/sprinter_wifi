@@ -125,7 +125,7 @@ TEST_START
 	XOR	A
 	LD	(TCP.LSR_ACCUM),A
 	CALL	ISA.ISA_OPEN
-	LD	BC,2
+	LD	BC,300			; spans the keyboard service at idle tick 200
 	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
 	JP	NC,FAILED
 	EXPECT_IFF 0
@@ -268,10 +268,10 @@ BENCH_IDLE
 	JP	NC,FAILED
 	EXPECT_IFF 0
 	LD	A,(PAUSE_COUNT)
-	CP	5			; once immediately, then once per 200 ticks
+	CP	4			; once per 200 idle ticks, never on the first
 	JP	NZ,FAILED
 	LD	A,(RESUME_COUNT)
-	CP	5
+	CP	4
 	JP	NZ,FAILED
 	LD	A,(REG_MCR)
 	CP	MCR_AFE | MCR_RTS
@@ -279,6 +279,65 @@ BENCH_IDLE
 	CALL	WIFI.UART_RX_PAUSE_OPEN
 	CALL	ISA.ISA_CLOSE
 	EXPECT_IFF 1
+	LD	A,0xA5
+	LD	(TEST_MARKER),A
+	JP	TEST_DONE
+
+; Independent entry: the unguarded application reader (every utility without
+; ISA_RX_GUARD, and FTP outside its receive guard). 300 idle ticks must never
+; drop RTS and must leave the ISA window mapped, apart from the one keyboard
+; service at tick 200. The per-millisecond RTS pulse / ISA remap of the UNETESP
+; pacing is what this vector keeps out of the applications.
+BENCH_APP_IDLE
+	LD	SP,MAIN.STACK_TOP
+	XOR	A
+	LD	(TEST_MARKER),A
+	LD	(TEST_RESULT),A
+	LD	(REG_LSR),A
+	LD	(TCP.LSR_ACCUM),A
+	LD	(PAUSE_COUNT),A
+	LD	(RESUME_COUNT),A
+	LD	(CLOSE_COUNT),A
+	LD	(ISA.RX_CRITICAL),A
+	LD	A,12
+	LD	(STAGE),A
+	LD	A,1
+	LD	(WIFI.UART_FLOW_MODE),A
+	LD	A,MCR_AFE | MCR_RTS
+	LD	(REG_MCR),A
+	LD	HL,0xC9AF		; XOR A / RET: DSS_SCANKEY has no key
+	LD	(DSS),HL
+	LD	HL,WIFI.UART_RX_PAUSE_OPEN
+	LD	DE,PAUSE_SPY
+	CALL	PATCH_JUMP
+	LD	HL,WIFI.UART_RX_RESUME_OPEN
+	LD	DE,RESUME_SPY
+	CALL	PATCH_JUMP
+	EI
+	CALL	ISA.ISA_OPEN
+	; Patch after the open above, so only the reader's own closes are counted.
+	LD	HL,ISA.ISA_CLOSE
+	LD	DE,CLOSE_SPY
+	CALL	PATCH_JUMP
+	LD	BC,300
+	CALL	TCP.READ_BYTE_TIMEOUT_OPEN
+	JP	NC,FAILED
+	EXPECT_IFF 1			; the legacy reader never masks IRQs
+	LD	A,(PAUSE_COUNT)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(RESUME_COUNT)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(CLOSE_COUNT)
+	CP	1			; the single keyboard service at tick 200
+	JP	NZ,FAILED
+	LD	A,(REG_MCR)
+	CP	MCR_AFE | MCR_RTS
+	JP	NZ,FAILED
+	LD	A,(WCOMMON.CANCELLED)
+	OR	A
+	JP	NZ,FAILED
 	LD	A,0xA5
 	LD	(TEST_MARKER),A
 	JP	TEST_DONE
@@ -304,6 +363,16 @@ RESUME_SPY
 	POP	HL
 	LD	A,(WIFI.UART_FLOW_MODE)
 	JP	WIFI.UART_RX_RESUME_OPEN+3
+; ISA_CLOSE starts PUSH AF / PUSH BC / LD A,0x01 (4 bytes under the 3-byte JP).
+CLOSE_SPY
+	PUSH	AF
+	PUSH	BC
+	LD	A,(CLOSE_COUNT)
+	INC	A
+	LD	(CLOSE_COUNT),A
+	LD	A,0x01
+	JP	ISA.ISA_CLOSE+4
 PAUSE_COUNT DB 0
 RESUME_COUNT DB 0
+CLOSE_COUNT DB 0
 	END TEST_START

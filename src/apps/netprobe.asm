@@ -177,6 +177,8 @@ MSG_GMR_RESPONSE
 
 MSG_DONE
 	DB "NETPROBE done.",0
+MSG_FAILED
+	DB "NETPROBE failed.",0
 
 MSG_COMM_ERROR
 	DB "ESP communication error #"
@@ -193,6 +195,7 @@ CMD_GMR
 	ENDMODULE
 
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

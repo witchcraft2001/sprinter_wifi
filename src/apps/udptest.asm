@@ -502,6 +502,8 @@ MSG_NO_REPLY
 	DB "No UDP reply received.",0
 MSG_DONE
 	DB "UDPTEST done.",0
+MSG_FAILED
+	DB "UDPTEST failed.",0
 MSG_COMM_ERROR
 	DB "ESP/UDP communication error #"
 MSG_ERROR_NO
@@ -560,6 +562,7 @@ ESP_TCP_BSS_BASE	EQU 0xB000
 
 	INCLUDE "netcfg_lib.asm"
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

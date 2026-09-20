@@ -322,7 +322,10 @@ DIV_10:
 ;	Out:	DE - address of strinf
 ; ------------------------------------------------------
 	;;IFUSED	FAST_UTOA
+	; FTP never formats through FAST_UTOA and has no WIN1 bytes to spare for it;
+	; it opts out with UTIL_NO_FAST_UTOA, exactly as the DLL build does.
 	IFNDEF UNET_DLL
+	IFNDEF UTIL_NO_FAST_UTOA
 FAST_UTOA
 	LD		BC,0+256
 	PUSH 	BC
@@ -394,6 +397,7 @@ FAST_UTOA
 	INC		DE
 
 	JR 		.LEADING_ZEROES
+	ENDIF
 	ENDIF
 	;;ENDIF
 

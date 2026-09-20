@@ -98,6 +98,8 @@ DSS_WRCHAR		EQU 0x58			; D=row E=col A=char B=attr
 
 	DEVICE NOSLOT64K
 
+	; WIN1 is nearly full: drop the library formatter TELNET never calls.
+	DEFINE UTIL_NO_FAST_UTOA
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
 
@@ -2155,6 +2157,8 @@ MSG_NO_CONNECT_HINT
 	DB "resolve (DNS). Check the address/port and your connection.",0
 MSG_DONE
 	DB "TELNET done.",0
+MSG_FAILED
+	DB "TELNET failed.",0
 LBL_IDLE
 	DB "idle:",0
 ST_ONLINE
@@ -2262,6 +2266,7 @@ ESP_TCP_BSS_BASE	EQU WIN2_BASE
 RS_BUFF_SIZE	EQU 96
 
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

@@ -432,6 +432,8 @@ MSG_RESPONSE
 	DB "Response:",0
 MSG_DONE
 	DB "TCPTEST done.",0
+MSG_FAILED
+	DB "TCPTEST failed.",0
 MSG_COMM_ERROR
 	DB "ESP communication error #"
 MSG_ERROR_NO
@@ -472,6 +474,7 @@ RECV_BLOCKS
 	ENDMODULE
 
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

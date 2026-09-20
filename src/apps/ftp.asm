@@ -9,6 +9,8 @@ EXE_VERSION		EQU 1
 		IFNDEF ESP_AT_FORCE_221
 		DEFINE ISA_RX_GUARD
 		ENDIF
+		; WIN1 is nearly full: drop the library formatter FTP never calls.
+		DEFINE UTIL_NO_FAST_UTOA
 DEFAULT_TIMEOUT		EQU 5000
 FTP_RECV_TIMEOUT	EQU 10000
 FTP_DATA_TIMEOUT	EQU 20000
@@ -397,31 +399,13 @@ NET_ERROR_EXIT
 		PRINTLN_HL
 .NO_HINT
 		POP	AF
-		CALL	PRINT_NET_REASON		; plain-language hint for the RES_* code
+		; Plain-language hint for the RES_* code. Cold text, so it lives in the
+		; WIN2 overlay; the routine reads the code back from MSG_NET_ERROR_NO.
+		LD	HL,OVL_PRINT_NET_REASON
+		CALL	CALL_OVERLAY
 .EXIT
 		LD	B,EXIT_NETWORK
 		JP	WCOMMON.EXIT
-
-; Print a human-readable explanation line for the RES_* network error code in A
-; (esplib.asm). "#3" alone means nothing to a tester; this says what to check.
-; Unknown/benign codes print nothing. Trashes A,HL,DE.
-PRINT_NET_REASON
-		CP	NET_REASON_COUNT
-		RET	NC
-		LD	L,A
-		LD	H,0
-		ADD	HL,HL				; code * 2 (word table)
-		LD	DE,NET_REASON_TABLE
-		ADD	HL,DE
-		LD	E,(HL)
-		INC	HL
-		LD	D,(HL)
-		LD	A,D
-		OR	E				; null entry -> no extra line
-		RET	Z
-		EX	DE,HL
-		PRINTLN_HL
-		RET
 
 FTP_ERROR_EXIT
 		CALL	CLEANUP_TCP
@@ -1339,10 +1323,12 @@ SEND_CONTROL
 		LD	(CONTROL_ERROR_HINT),HL
 		XOR	A
 		LD	(TCP.LSR_ACCUM),A
+		CALL	PROMPT_GUARD_ON
 		LD	HL,CMD_BUFF
 		LD	BC,(CMD_LEN)
 		LD	A,CONTROL_LINK
 		CALL	TCP.SEND_BUFFER_LINK_NO_WAIT
+		CALL	PROMPT_GUARD_OFF
 		; Prompt/TX polling can see read-to-clear UART errors before the reply
 		; receiver starts. Do not let its next LSR reset hide those errors.
 		PUSH	AF
@@ -1357,6 +1343,60 @@ SEND_CONTROL
 		RET
 .UART_OK
 		POP	AF
+		RET	NC
+		; No '>' within the timeout. Whatever the ESP is doing, the payload is
+		; the right next byte stream: a module that did print the prompt (lost
+		; or still held back by flow control) is waiting for exactly these
+		; bytes, a stalled one executes the queued CIPSEND first and then takes
+		; them, and one that refused CIPSEND answers a harmless ERROR. Reissuing
+		; CIPSEND instead would be delivered to the server as payload. The reply
+		; wait that follows is the real verdict.
+		CP	RES_RS_TIMEOUT
+		SCF
+		RET	NZ
+		LD	A,(WCOMMON.CANCELLED)
+		AND	A
+		LD	A,RES_RS_TIMEOUT
+		SCF
+		RET	NZ
+		PRINTLN	MSG_PROMPT_LOST
+		LD	HL,CMD_BUFF
+		LD	BC,(CMD_LEN)
+		CALL	WIFI.UART_TX_BUFFER
+		LD	A,RES_TX_TIMEOUT
+		RET	C
+		XOR	A
+		RET
+
+; The CIPSEND prompt is awaited through the byte reader, whose unguarded idle
+; path raises RTS for a single LSR sample per tick (~13 us, three bit times at
+; 230400). An ESP at flow=3 rarely gets a byte out through such a pulse, so a
+; prompt that is not already on the wire within the first ~2 ms spin - the
+; module answers slower after an idle gap such as the DSS file create/close -
+; trickles out over seconds or misses the timeout: the intermittent "#4" on
+; SIZE and the long pause before "FTP done.". Run the wait under the same
+; guard as the 2.2.2 data receiver instead: RTS stays high and is dropped only
+; for the periodic keyboard check. ESP-AT 2.2.1 keeps its legacy reader.
+PROMPT_GUARD_ON
+		IFDEF ISA_RX_GUARD
+		IFDEF ESP_AT_FORCE_222
+		LD	A,1
+		ELSE
+		LD	A,(WCOMMON.UART_ESP_PROFILE)
+		SUB	UART_RX_PROFILE_221		; 0 = 2.2.1 (legacy), 1 = 2.2.2
+		ENDIF
+		LD	(ISA.RX_CRITICAL),A
+		ENDIF
+		RET
+
+; Preserves AF: callers test the send result after dropping the guard.
+PROMPT_GUARD_OFF
+		IFDEF ISA_RX_GUARD
+		PUSH	AF
+		XOR	A
+		LD	(ISA.RX_CRITICAL),A
+		POP	AF
+		ENDIF
 		RET
 
 RECV_CONTROL_REPLY_IGNORE
@@ -2156,11 +2196,13 @@ SEND_DATA_TRANSFER
 		LD	B,H
 		LD	C,L
 .SEND_CHUNK
+		CALL	PROMPT_GUARD_ON
 		LD	HL,(BURST_DEST)
 		PUSH	BC
 		LD	A,DATA_LINK
 		CALL	TCP.SEND_BUFFER_LINK
 		POP	BC
+		CALL	PROMPT_GUARD_OFF
 		RET	C
 		CALL	ADD_DATA_TOTAL
 		LD	HL,(BURST_DEST)
@@ -3305,6 +3347,10 @@ MSG_INPUT_FILE
 		DB "Input file: ",0
 MSG_DONE
 		DB "FTP done.",0
+MSG_FAILED
+		DB "FTP failed.",0
+MSG_PROMPT_LOST
+		DB "No '>' from ESP, sending anyway.",0
 MSG_COMM_ERROR
 		DB "ESP communication error #"
 MSG_ERROR_NO
@@ -3313,28 +3359,7 @@ MSG_NET_ERROR
 		DB "Network/ESP error #"
 MSG_NET_ERROR_NO
 		DB "n!",0
-; Plain-language hints for the RES_* codes, printed under "Network/ESP error #N".
-; Indexed by code; a 0 entry means "no hint for this code".
-NET_REASON_COUNT	EQU 7
-NET_REASON_TABLE
-		DW 0			; 0 RES_OK (not an error)
-		DW MSG_NETR_ERR		; 1 RES_ERROR
-		DW MSG_NETR_FAIL	; 2 RES_FAIL
-		DW MSG_NETR_TXTO	; 3 RES_TX_TIMEOUT
-		DW MSG_NETR_RXTO	; 4 RES_RS_TIMEOUT
-		DW 0			; 5 RES_CONNECTED
-		DW MSG_NETR_NOCONN	; 6 RES_NOT_CONN
-MSG_NETR_ERR
-		DB "Could not open the connection: host down or refused, wrong",13,10
-		DB "address/DNS, or Wi-Fi not up (run NETUP).",0
-MSG_NETR_FAIL
-		DB "The network operation failed.",0
-MSG_NETR_TXTO
-		DB "Sprinter-WiFi (ESP) did not respond - check the card and cabling.",0
-MSG_NETR_RXTO
-		DB "No reply from the server - it may be down or too slow (timeout).",0
-MSG_NETR_NOCONN
-		DB "The connection was closed before the transfer finished.",0
+		; NET_REASON_TABLE and its hint strings live in the WIN2 cold overlay.
 MSG_FTP_ERROR
 		DB "FTP server returned error: ",0
 MSG_UART_OVERRUN
@@ -3626,6 +3651,7 @@ PASV_P2
 		DEFINE	NETCFG_SESSION_ONLY
 		INCLUDE "netcfg_lib.asm"
 		DEFINE WCOMMON_USE_NETCFG
+		DEFINE WCOMMON_FAIL_LINE
 		INCLUDE "wcommon.asm"
 		INCLUDE "dss_error.asm"
 		INCLUDE "isa.asm"
@@ -3754,6 +3780,54 @@ ESP_DRAIN_RX
 .DONE
 		CALL	WIFI.UART_EMPTY_RS
 		RET
+
+; Print a human-readable explanation line for the RES_* network error code
+; (esplib.asm). "#3" alone means nothing to a tester; this says what to check.
+; CALL_OVERLAY cannot pass A, so the code is read back from the digit that
+; NET_ERROR_EXIT already patched into MSG_NET_ERROR_NO. Unknown/benign codes
+; print nothing. Trashes A,HL,DE.
+OVL_PRINT_NET_REASON
+		LD	A,(MSG_NET_ERROR_NO)
+		SUB	'0'
+		CP	NET_REASON_COUNT
+		RET	NC
+		LD	L,A
+		LD	H,0
+		ADD	HL,HL				; code * 2 (word table)
+		LD	DE,NET_REASON_TABLE
+		ADD	HL,DE
+		LD	E,(HL)
+		INC	HL
+		LD	D,(HL)
+		LD	A,D
+		OR	E				; null entry -> no extra line
+		RET	Z
+		EX	DE,HL
+		PRINTLN_HL
+		RET
+
+; Plain-language hints for the RES_* codes, printed under "Network/ESP error #N".
+; Indexed by code; a 0 entry means "no hint for this code".
+NET_REASON_COUNT	EQU 7
+NET_REASON_TABLE
+		DW 0			; 0 RES_OK (not an error)
+		DW MSG_NETR_ERR		; 1 RES_ERROR
+		DW MSG_NETR_FAIL	; 2 RES_FAIL
+		DW MSG_NETR_TXTO	; 3 RES_TX_TIMEOUT
+		DW MSG_NETR_RXTO	; 4 RES_RS_TIMEOUT
+		DW 0			; 5 RES_CONNECTED
+		DW MSG_NETR_NOCONN	; 6 RES_NOT_CONN
+MSG_NETR_ERR
+		DB "Could not open the connection: host down or refused, wrong",13,10
+		DB "address/DNS, or Wi-Fi not up (run NETUP).",0
+MSG_NETR_FAIL
+		DB "The network operation failed.",0
+MSG_NETR_TXTO
+		DB "Sprinter-WiFi (ESP) did not respond - check the card and cabling.",0
+MSG_NETR_RXTO
+		DB "No reply from the server - it may be down or too slow (timeout).",0
+MSG_NETR_NOCONN
+		DB "The connection was closed before the transfer finished.",0
 OVL_END
 		ENT
 OVERLAY_SIZE	EQU OVL_END - OVL_BASE

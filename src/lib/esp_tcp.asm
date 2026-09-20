@@ -2758,14 +2758,17 @@ READ_BYTE_RECV_TIMEOUT
 ; The hot path is a busy-poll on LSR.DR with NO per-byte delay: at 115200 baud a
 ; byte arrives every ~87 us and each FIFO burst is drained back-to-back while
 ; DR stays set, so the old "DELAY_1MS on every empty poll" (which throttled the
-; link to ~1 KB/s and kept the ESP permanently backpressured) is gone. Once the
-; bounded spin finds the UART idle, use the same UTIL.DELAY_1MS pacing contract
-; as UNETRTL. RTS stays low while the ISA window is closed for that delay, so a
-; 230400-baud peer cannot overflow the 16550 FIFO. BC is decremented before a
-; delay, exactly like UNETRTL's TCP receive loop: a one-tick poll probes and
-; returns without an added sleep.
-; Exception: guarded FTP 2.2.2 budgets continuous polling at 21 MHz instead
-; of delay ticks, keeping RTS stable between periodic keyboard/IRQ checks.
+; link to ~1 KB/s and kept the ESP permanently backpressured) is gone. BC is
+; decremented before a delay, exactly like UNETRTL's TCP receive loop: a
+; one-tick poll probes and returns without an added sleep.
+; Idle pacing differs by build:
+; - UNETESP (UNET_DLL): the UTIL.DELAY_1MS contract of UNETRTL. RTS is dropped
+;   and the ISA window closed for each idle millisecond, one LSR sample per
+;   tick, so the public RECV timeout is a true millisecond count.
+; - Applications: RTS and the ISA window stay up for the whole wait and each
+;   tick re-arms the spin window (the reader shipped until 2026-09-18).
+; - Guarded FTP 2.2.2 budgets continuous polling at 21 MHz instead of delay
+;   ticks, keeping RTS stable between periodic keyboard/IRQ checks.
 ; Out: CF=0, A=byte, C=byte. CF=1 on timeout/cancel.
 READ_BYTE_TIMEOUT_OPEN
 	IFDEF ESP_TCP_TEST_READER
@@ -2774,10 +2777,19 @@ READ_BYTE_TIMEOUT_OPEN
 	JP	@TEST_READ_BYTE
 	ENDIF
 	PUSH	BC,DE,HL
+	; UNETESP services the keyboard on the first idle tick. Applications wait
+	; 200 ticks, as they always did: the guarded FTP reader drops RTS for that
+	; service, and doing so ~1 ms into every inter-frame gap is exactly when the
+	; next +IPD starts. Real ESP-AT 2.2.2 answers an RTS stop inside an eager
+	; frame with OE/FE/BI (see FTP_HOLD_ENTER_MARGIN), so keep those stops rare.
+	IFDEF UNET_DLL
 	LD	A,1
+	ELSE
+	LD	A,200
+	ENDIF
 	LD	(RBT_CANCEL_TICK),A
-	; The first empty probe bridges a UART FIFO burst. Unguarded idle probes
-	; then use one LSR sample per RTL-compatible tick; guarded FTP keeps polling.
+	; The first empty probe bridges a UART FIFO burst. UNETESP then uses one LSR
+	; sample per RTL-compatible tick; applications and guarded FTP keep polling.
 .PROBE
 	LD	DE,RX_SPIN_BUDGET
 	LD	A,B
@@ -2845,6 +2857,28 @@ READ_BYTE_TIMEOUT_OPEN
 	JP	.SPIN
 .LEGACY_IDLE
 	ENDIF
+	IFNDEF UNET_DLL
+	; Applications keep the reader that was field-proven at 230400 baud: RTS
+	; stays asserted and the ISA window stays mapped for the whole wait, AFE
+	; covers the 1 ms sleep, and every tick re-arms the spin window. The RTL
+	; pacing below drops RTS and remaps ISA on every idle millisecond; on real
+	; hardware that 1 kHz RTS pulse train starved CIPSEND prompts and preceded
+	; mid-stream OE/FE/BI in WGET, so it is confined to UNETESP, whose RECV
+	; timeout contract needs it. A tick here costs about 1.8 ms at 21 MHz (spin
+	; window + delay), as it always did for the applications; their timeout
+	; constants were tuned against that.
+	IFDEF ESP_TCP_DIAGNOSTICS
+	CALL	DIAG_RECORD_WAIT_TICK
+	ENDIF
+	CALL	UTIL.DELAY_1MS
+	LD	HL,RBT_CANCEL_TICK
+	DEC	(HL)
+	JP	NZ,.PROBE
+	LD	(HL),200
+	CALL	@WCOMMON.CHECK_CANCEL_IN_ISA
+	JR	C,.CANCEL
+	JP	.PROBE
+	ELSE
 	CALL	WIFI.UART_RX_PAUSE_OPEN
 	; DSS keyboard scans are not part of the delay calibration. Keep them
 	; periodic, as in the original reader, rather than paying for 1000 scans
@@ -2864,9 +2898,11 @@ READ_BYTE_TIMEOUT_OPEN
 	CALL	ISA.ISA_OPEN
 	CALL	WIFI.UART_RX_RESUME_OPEN
 	ENDIF
-	; Do not repeat RX_SPIN_BUDGET for every nominal millisecond: that was the
-	; source of the fivefold timeout. Resume with one status sample; a received
-	; byte returns immediately, otherwise the next RTL tick starts.
+	ENDIF
+	; UNETESP only (applications looped back to .PROBE above). Do not repeat
+	; RX_SPIN_BUDGET for every nominal millisecond: that was the source of the
+	; fivefold timeout. Resume with one status sample; a received byte returns
+	; immediately, otherwise the next RTL tick starts.
 	LD	DE,1
 	IFDEF ISA_RX_GUARD
 	JP	.SPIN

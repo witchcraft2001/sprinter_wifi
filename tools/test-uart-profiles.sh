@@ -200,6 +200,16 @@ grep -Eq '^FTP_HOLD_ENTER_MARGIN[[:space:]]+EQU[[:space:]]+FTP_HOLD_TAIL_MARGIN 
 	"$repo_root/src/apps/ftp.asm"
 grep -Eq '^[[:space:]]*DEFINE[[:space:]]+TCP_ACTIVE_IPD_MAX_OVERRIDE[[:space:]]+FTP_ACTIVE_IPD_MAX$' \
 	"$repo_root/src/apps/ftp.asm"
+# WGET shares both halves of that rule: coalescing sized for 2920-byte frames
+# and hold mode entered one maximum +IPD before the retained tail.
+grep -Eq '^WGET_ACTIVE_IPD_MAX[[:space:]]+EQU[[:space:]]+3000$' \
+	"$repo_root/src/apps/wget.asm"
+grep -Eq '^HOLD_ENTER_MARGIN[[:space:]]+EQU[[:space:]]+HOLD_TAIL_MARGIN \+ WGET_ACTIVE_IPD_MAX$' \
+	"$repo_root/src/apps/wget.asm"
+grep -Eq '^[[:space:]]*DEFINE[[:space:]]+TCP_ACTIVE_IPD_MAX_OVERRIDE[[:space:]]+WGET_ACTIVE_IPD_MAX$' \
+	"$repo_root/src/apps/wget.asm"
+grep -Eq '^[[:space:]]*LD[[:space:]]+HL,HOLD_ENTER_MARGIN$' \
+	"$repo_root/src/apps/wget.asm"
 # Universal/forced-2.2.2 FTP returns the first in-window burst directly. Only
 # the field-proven 2.2.1 profile enters the legacy app-side accumulator.
 awk '

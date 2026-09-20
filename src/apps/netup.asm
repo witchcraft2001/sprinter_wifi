@@ -1185,6 +1185,8 @@ MSG_PUBLISH_ENV
 	DB "Publishing NET_* environment variables.",0
 MSG_DONE
 	DB "NETUP done.",0
+MSG_FAILED
+	DB "NETUP failed.",0
 MSG_COMM_ERROR
 	DB "ESP communication error #"
 MSG_ERROR_NO
@@ -1269,6 +1271,7 @@ NETUP_CFG_NAME
 
 	ENDMODULE
 
+	DEFINE WCOMMON_FAIL_LINE
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	INCLUDE "isa.asm"

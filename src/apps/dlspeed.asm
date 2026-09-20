@@ -1400,6 +1400,8 @@ U32_POW10_TABLE
 	INCLUDE "wcommon.asm"
 	INCLUDE "isa.asm"
 	DEFINE	ESP_TCP_DIAGNOSTICS
+	; Mirror WGET: real active +IPD frames reach 2920 bytes.
+	DEFINE	TCP_ACTIVE_IPD_MAX_OVERRIDE 3000
 	INCLUDE "esp_tcp.asm"
 	INCLUDE "dlspeed_http.asm"
 	DEFINE	TPUT_ALIGNED

@@ -265,6 +265,15 @@ Common status codes for automation-friendly utilities:
 - `6` - remote server/protocol rejection (HTTP/FTP application-level error).
 - `7` - cancelled by the user (Esc/Ctrl+Z).
 
+The last line on screen mirrors the status. A successful run closes with
+`<NAME> done.` (`FTP done.`, `PING done.`, ...); a run that ends with status
+`2`-`6` prints its reason and then closes with `<NAME> failed.`. A usage
+error (`1`) ends on the usage text and a cancelled run (`7`) on its own
+`Aborted`/`Cancelled by user.` line, so neither adds a closing line. The
+line is printed from the shared exit point, so no error path can skip it.
+This applies to `FTP`, `WGET`, `TFTP`, `TELNET`, `PING`, `NETUP`, `NETRESET`,
+`NETPROBE`, `TCPTEST` and `UDPTEST`.
+
 Current utility-specific notes:
 
 - `PING.EXE` returns `0` when at least one reply was received, `3` when none

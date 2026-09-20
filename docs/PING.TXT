@@ -37,11 +37,12 @@ Behavior
           Packets: Sent = S, Received = R, Lost = L.
       PING done.
 
-  If no reply was received the closing line is "No replies received."
-  instead; an interrupted run prints "Cancelled by user." above the
-  statistics and no closing line. The sibling Ethernet PING utilities print
-  "RESULT OK"/"RESULT FAIL" here; this package closes every utility with
-  "<NAME> done.", which is the convention PING follows.
+  If no reply was received the run ends with "No replies received." and
+  "PING failed." instead; an interrupted run prints "Cancelled by user."
+  above the statistics and no closing line. The sibling Ethernet PING
+  utilities print "RESULT OK"/"RESULT FAIL" here; this package closes every
+  utility with "<NAME> done." or "<NAME> failed.", which is the convention
+  PING follows.
 
   The pause is timed like the gap in the sibling Ethernet PING utilities:
   whole seconds come from the DSS system clock, so requests go out one second
