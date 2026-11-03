@@ -54,8 +54,10 @@ Transfer reliability
   file. Range retries require an HTTP 206 response; a server that ignores Range
   is rejected instead of appending a duplicate full file.
 
-  If WGET prints "UART overrun detected", input data were lost. Download the
-  file again after lowering BAUD and running NETUP.
+  If WGET prints "UART overrun detected", the block being received was
+  discarded before it reached the file. When Content-Length is known WGET
+  reconnects and continues with a Range request from the bytes already
+  written, like any other short transfer; otherwise download the file again.
 
 Exit status
   0  File body downloaded.

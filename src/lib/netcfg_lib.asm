@@ -111,6 +111,7 @@ LOAD_PATH
 	RET
 	ENDIF
 
+	IFNDEF	NETCFG_NO_SAVE			; FTP never writes NET.CFG: drop the save path
 ; ------------------------------------------------------
 ; Save current config values to NET.CFG.
 ; Out: CF=0 - saved
@@ -152,6 +153,7 @@ SAVE
 	POP	AF
 	SCF
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Set safe default values.
@@ -372,6 +374,7 @@ APPLY_UART_BAUD
 	CALL	GET_UART_DIVISOR
 	JP	@WIFI.UART_SET_DIVISOR
 
+	IFNDEF	NETCFG_NO_BAUD_TEXT		; FTP drops this NETUP-only helper
 GET_UART_BAUD_TEXT
 	LD	HL,BAUD_230400
 	LD	DE,CFG_BAUD
@@ -399,6 +402,7 @@ GET_UART_BAUD_TEXT
 	RET	NC
 	LD	HL,BAUD_115200
 	RET
+	ENDIF
 
 GET_UART_DIVISOR
 	LD	HL,BAUD_230400
@@ -512,6 +516,7 @@ COPY_VALUE
 	LD	(DE),A
 	RET
 
+	IFNDEF	NETCFG_NO_SAVE
 ; ------------------------------------------------------
 ; Build NET.CFG text in CFG_BUFF.
 ; Out: HL - end of data
@@ -578,6 +583,7 @@ APPEND_FIELD
 	CALL	APPEND_STR
 	CALL	APPEND_IX_STR
 	JP	APPEND_CRLF
+	ENDIF
 
 ; ------------------------------------------------------
 ; Append ASCIIZ from DE to buffer at HL.
@@ -643,9 +649,11 @@ KEY_NTP		DB "NTP=",0
 KEY_AUTOJOIN	DB "AUTOJOIN=",0
 KEY_BAUD	DB "BAUD=",0
 
+	IFNDEF	NETCFG_NO_SAVE
 SAVE_HEADER
 	DB "# Sprinter ESP Network Kit configuration",13,10
 	DB "# Password is stored in clear text.",13,10,0
+	ENDIF
 
 CFG_SSID_SIZE		EQU 33
 CFG_PASS_SIZE		EQU 65

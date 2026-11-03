@@ -11,6 +11,7 @@ DIST_DIR_NAME="SPNET"
 # build/<UPPERCASE_NAME>.EXE. Add apps here only when their source is present.
 # Planned apps include: wget, ntp, tftp, ftp and chat.
 BUILD_APPS=(
+  hwtest
   netprobe
   netreset
   netcfg
@@ -74,6 +75,7 @@ DIST_DOC_FILES=(
 DIST_DOC_CP866_FILES=(
   READMERU.TXT
   docs/HOWTO_RU.TXT
+  docs/HWTEST.TXT
 )
 
 # Configuration examples copied to the distribution root.

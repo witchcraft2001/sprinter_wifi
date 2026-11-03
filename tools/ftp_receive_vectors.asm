@@ -97,6 +97,81 @@ TEST_START
 	OR	A
 	JP	NZ,FAILED
 
+; A UART error inside a sized download discards only the failed receive and
+; then follows the clean-stall REST recovery: the clean retained tail is
+; flushed exactly once, DATA_TOTAL stays the verified offset, the stale data
+; link is left for the caller to close, RTS is released once for that
+; cleanup, and the error no longer suppresses normal cleanup and hints.
+	LD	A,12
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	; RST DSS -> DSS_SPY: counts DSS_WRITE calls and records their length;
+	; every other function (the LINE_END print) just succeeds.
+	LD	A,0xC3
+	LD	(DSS),A
+	LD	HL,DSS_SPY
+	LD	(DSS+1),HL
+	XOR	A
+	LD	(DSS_WRITE_COUNT),A
+	LD	(MAIN.LIST_FLAG),A
+	LD	(MAIN.DEFERRED_CONTROL_SEEN),A
+	LD	(MAIN.PENDING_CONTROL_SEEN),A
+	LD	A,1
+	LD	(MAIN.DATA_EXPECTED_SEEN),A
+	LD	(MAIN.DATA_OPEN),A
+	LD	HL,1000
+	LD	(MAIN.DATA_EXPECTED),HL
+	LD	HL,0
+	LD	(MAIN.DATA_EXPECTED+2),HL
+	LD	(MAIN.DATA_TOTAL+2),HL
+	LD	HL,100
+	LD	(MAIN.DATA_TOTAL),HL
+	; 900 bytes remain, so the loop runs in retain-tail mode: receive one
+	; clean 5-byte data block (held, not written), then a block with OE.
+	LD	A,2
+	LD	(SPY_SEQ),A
+	LD	HL,MAIN.RECEIVE_STREAM_ANY_LINK
+	LD	DE,SEQ_RECEIVE_SPY
+	CALL	STUB_JP
+	LD	HL,MAIN.RECEIVE_ONE_ANY_LINK
+	CALL	STUB_JP
+	CALL	MAIN.RECV_DATA_TRANSFER
+	JP	C,FAILED
+	LD	A,(MAIN.TIMEOUT_RECOVERY)
+	CP	1
+	JP	NZ,FAILED
+	LD	A,(MAIN.UART_ERROR_REPORTED)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(MAIN.DATA_OPEN)
+	CP	1
+	JP	NZ,FAILED
+	LD	A,(MAIN.HOLD_MODE)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,(DSS_WRITE_COUNT)
+	CP	1
+	JP	NZ,FAILED
+	LD	HL,(DSS_WRITE_LEN)
+	LD	DE,5
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,(MAIN.DATA_TOTAL)
+	LD	DE,105
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	A,(RESUME_COUNT)
+	CP	1
+	JP	NZ,FAILED
+	; Later stages expect the plain single-result receive spy again.
+	LD	HL,MAIN.RECEIVE_STREAM_ANY_LINK
+	LD	DE,RECEIVE_SPY
+	CALL	STUB_JP
+	LD	HL,MAIN.RECEIVE_ONE_ANY_LINK
+	CALL	STUB_JP
+
 	; The real FTP 2.2.2 command reader must bypass the sleeping legacy poll,
 	; return the prompt byte, and retain an OE that the hardware read clears.
 	LD	A,5
@@ -273,6 +348,155 @@ TEST_START
 	OR	A
 	JP	NZ,FAILED
 
+	; The prompt wait reports a refused CIPSEND at once: "link is not valid"
+	; + ERROR means the control link is gone, "busy p..." that the command
+	; line was dropped unread. Ordinary lines before '>' stay transparent and
+	; a partial line never counts.
+	LD	A,15
+	LD	(STAGE),A
+	LD	HL,TCP.READ_BYTE_TIMEOUT
+	LD	DE,SCRIPT_READ
+	CALL	STUB_JP
+	LD	HL,IN_LINK_INVALID
+	LD	BC,IN_LINK_INVALID_LEN
+	CALL	SET_SCRIPT
+	CALL	TCP.WAIT_PROMPT
+	JP	NC,FAILED
+	CP	RES_ERROR
+	JP	NZ,FAILED
+	LD	A,16
+	LD	(STAGE),A
+	LD	HL,IN_BUSY
+	LD	BC,IN_BUSY_LEN
+	CALL	SET_SCRIPT
+	CALL	TCP.WAIT_PROMPT
+	JP	NC,FAILED
+	CP	RES_BUSY
+	JP	NZ,FAILED
+	LD	A,17
+	LD	(STAGE),A
+	LD	HL,IN_OK_PROMPT
+	LD	BC,IN_OK_PROMPT_LEN
+	CALL	SET_SCRIPT
+	CALL	TCP.WAIT_PROMPT
+	JP	C,FAILED
+	LD	A,18
+	LD	(STAGE),A
+	LD	HL,IN_PARTIAL_ERROR
+	LD	BC,IN_PARTIAL_ERROR_LEN
+	CALL	SET_SCRIPT
+	CALL	TCP.WAIT_PROMPT
+	JP	NC,FAILED
+	CP	RES_RS_TIMEOUT
+	JP	NZ,FAILED
+
+	; SEND_CONTROL: a refused send transmits nothing and reports the closed
+	; control link under its own hint.
+	LD	A,19
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_ERROR
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	NC,FAILED
+	CP	RES_NOT_CONN
+	JP	NZ,FAILED
+	LD	A,(TX_COUNT)
+	OR	A
+	JP	NZ,FAILED
+	LD	HL,(MAIN.CONTROL_ERROR_HINT)
+	LD	DE,MAIN.MSG_CONTROL_REFUSED
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+
+	; "busy p..." reissues the CIPSEND (the module dropped it unread) until
+	; the module takes it; the payload then goes through the send helper.
+	LD	A,20
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	XOR	A
+	LD	(SPY_RESULT),A
+	LD	A,2
+	LD	(SPY_BUSY),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	LD	A,(SEND_COUNT)
+	CP	3
+	JP	NZ,FAILED
+	LD	A,(TX_COUNT)
+	OR	A
+	JP	NZ,FAILED
+
+	; A silent prompt timeout releases the receiver and looks once more with
+	; the short retry timeout. A prompt that then appears sends the payload
+	; exactly once, and the default timeout is restored afterwards.
+	LD	A,21
+	LD	(STAGE),A
+	CALL	RESET_STATE
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	LD	HL,IN_OK_PROMPT
+	LD	BC,IN_OK_PROMPT_LEN
+	CALL	SET_SCRIPT
+	LD	A,LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	LD	A,(TX_COUNT)
+	CP	1
+	JP	NZ,FAILED
+	LD	HL,(SCRIPT_BC)
+	LD	DE,FTP_PROMPT_RETRY_TIMEOUT
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	LD	HL,(TCP.PROMPT_TIMEOUT)
+	LD	DE,TCP_DEFAULT_TIMEOUT
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAILED
+	; An exhausted script (silence again) still ends in the blind payload.
+	CALL	RESET_STATE
+	LD	A,RES_RS_TIMEOUT
+	LD	(SPY_RESULT),A
+	CALL	MAIN.SEND_CONTROL
+	JP	C,FAILED
+	LD	A,(TX_COUNT)
+	CP	1
+	JP	NZ,FAILED
+
+	; FLUSH_STALE_RX: the 2.2.2 profile drains by reading RBR and never
+	; issues the FCR reset (a static DR=1 must end at the byte cap); the
+	; 2.2.1 profile keeps UART_EMPTY_RS.
+	LD	A,22
+	LD	(STAGE),A
+	LD	HL,WIFI.UART_EMPTY_RS
+	LD	DE,EMPTY_RS_SPY
+	CALL	STUB_JP
+	LD	A,UART_RX_PROFILE_222
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	XOR	A
+	LD	(EMPTY_RS_COUNT),A
+	LD	A,LSR_DR | LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	CALL	TCP.FLUSH_STALE_RX
+	LD	A,(EMPTY_RS_COUNT)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,LSR_THRE | LSR_TEMT
+	LD	(REG_LSR),A
+	CALL	TCP.FLUSH_STALE_RX
+	LD	A,(EMPTY_RS_COUNT)
+	OR	A
+	JP	NZ,FAILED
+	LD	A,UART_RX_PROFILE_221
+	LD	(WCOMMON.UART_ESP_PROFILE),A
+	CALL	TCP.FLUSH_STALE_RX
+	LD	A,(EMPTY_RS_COUNT)
+	CP	1
+	JP	NZ,FAILED
+
 	; Fatal UART cleanup closes the local file but MUST NOT send CIPCLOSE or
 	; wait for ESP replies. The complete error exit still returns EXIT_NETWORK.
 	LD	A,9
@@ -342,6 +566,10 @@ RESET_STATE
 	LD	(RESUME_COUNT),A
 	LD	(TX_COUNT),A
 	LD	(TX_FAIL),A
+	LD	(SPY_BUSY),A
+	LD	(SEND_COUNT),A
+	LD	HL,0
+	LD	(SCRIPT_LEFT),HL
 	LD	HL,6000
 	LD	(MAIN.RECV_CAP),HL
 	LD	HL,MAIN.RECV_BUFFER
@@ -356,15 +584,96 @@ RECEIVE_SPY
 	SCF
 	RET
 
+; Sequenced receive: SPY_SEQ-1 clean 5-byte data-link blocks, then one
+; receive that fails with an overrun latched in LSR_ACCUM.
+SEQ_RECEIVE_SPY
+	LD	A,(SPY_SEQ)
+	DEC	A
+	LD	(SPY_SEQ),A
+	JR	Z,.ERROR
+	LD	A,DATA_LINK
+	LD	(TCP.LAST_IPD_LINK),A
+	XOR	A
+	LD	(TCP.LSR_ACCUM),A
+	LD	BC,5
+	RET				; CF=0, A=0
+.ERROR
+	LD	A,LSR_OE
+	LD	(TCP.LSR_ACCUM),A
+	LD	BC,0xAABB
+	LD	A,RES_RS_TIMEOUT
+	SCF
+	RET
+
+; RST DSS replacement for stage 12: record file writes, succeed otherwise.
+DSS_SPY
+	LD	A,C
+	CP	DSS_WRITE
+	JR	NZ,.OTHER
+	LD	(DSS_WRITE_LEN),DE
+	LD	HL,DSS_WRITE_COUNT
+	INC	(HL)
+.OTHER
+	XOR	A			; CF=0
+	RET
+
 SEND_SPY
 	LD	A,(ISA.RX_CRITICAL)
 	LD	(GUARD_SEEN),A
+	LD	HL,SEND_COUNT
+	INC	(HL)
 	LD	A,(SPY_LSR)
 	LD	(TCP.LSR_ACCUM),A
+	LD	A,(SPY_BUSY)
+	OR	A
+	JR	Z,.RESULT
+	DEC	A
+	LD	(SPY_BUSY),A
+	LD	A,RES_BUSY
+	SCF
+	RET
+.RESULT
 	LD	A,(SPY_RESULT)
 	OR	A
 	RET	Z
 	SCF
+	RET
+
+; Stands in for TCP.READ_BYTE_TIMEOUT: serves the scripted bytes, records the
+; caller's timeout, and times out once the script is exhausted.
+SCRIPT_READ
+	LD	(SCRIPT_BC),BC
+	PUSH	HL
+	LD	HL,(SCRIPT_LEFT)
+	LD	A,H
+	OR	L
+	JR	Z,.EMPTY
+	DEC	HL
+	LD	(SCRIPT_LEFT),HL
+	LD	HL,(SCRIPT_PTR)
+	LD	A,(HL)
+	INC	HL
+	LD	(SCRIPT_PTR),HL
+	POP	HL
+	LD	C,A
+	AND	A
+	RET
+.EMPTY
+	POP	HL
+	SCF
+	RET
+
+; HL = script, BC = length.
+SET_SCRIPT
+	LD	(SCRIPT_PTR),HL
+	LD	(SCRIPT_LEFT),BC
+	RET
+
+EMPTY_RS_SPY
+	PUSH	HL
+	LD	HL,EMPTY_RS_COUNT
+	INC	(HL)
+	POP	HL
 	RET
 
 ; Stands in for WIFI.UART_TX_BUFFER: records the fallback payload request.
@@ -433,6 +742,9 @@ SPY_RESULT DB 0
 SPY_LSR DB 0
 LEGACY_CALLED DB 0
 RESUME_COUNT DB 0
+SPY_SEQ DB 0
+DSS_WRITE_COUNT DB 0
+DSS_WRITE_LEN DW 0
 CLOSE_FILE_COUNT DB 0
 CLOSE_LINK_COUNT DB 0
 EXIT_CODE DB 0
@@ -441,3 +753,17 @@ TX_COUNT DB 0
 TX_FAIL DB 0
 TX_HL DW 0
 TX_BC DW 0
+SPY_BUSY DB 0
+SEND_COUNT DB 0
+EMPTY_RS_COUNT DB 0
+SCRIPT_PTR DW 0
+SCRIPT_LEFT DW 0
+SCRIPT_BC DW 0
+IN_LINK_INVALID	DB 13,10,"link is not valid",13,10,13,10,"ERROR",13,10
+IN_LINK_INVALID_LEN EQU $-IN_LINK_INVALID
+IN_BUSY		DB 13,10,"busy p...",13,10
+IN_BUSY_LEN	EQU $-IN_BUSY
+IN_OK_PROMPT	DB 13,10,"OK",13,10,13,10,">"
+IN_OK_PROMPT_LEN EQU $-IN_OK_PROMPT
+IN_PARTIAL_ERROR DB 13,10,"ERRO"
+IN_PARTIAL_ERROR_LEN EQU $-IN_PARTIAL_ERROR

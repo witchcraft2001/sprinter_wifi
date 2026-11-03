@@ -9,7 +9,44 @@ Usage
       Show current NET.CFG values.
 
   NETCFG.EXE /W
-      Open the interactive editor and save NET.CFG.
+      Open the interactive editor and save NET.CFG. Before asking for the
+      SSID, it offers to scan for Wi-Fi networks:
+
+          Scan for Wi-Fi networks? [Y/n]:
+
+      Answering Y (or Enter) finds the Sprinter-WiFi card, brings the ESP up
+      at whatever speed it currently answers to (the active NETUP session's
+      baud, then 115200), and runs AT+CWLAP. The result is a numbered list:
+
+          1. MyHomeNetwork                     -45dBm  ch6   WPA2
+          2. Office Wifi                       -60dBm  ch11  WPA2
+
+      Enter a number to use that network's SSID; choosing a network listed
+      as "Open" also clears the saved password and skips the PASS prompt.
+      Enter 0 (or answer N to the scan question) to type the SSID by hand
+      as before. Pressing Enter alone at the number prompt keeps the SSID
+      already shown; when NET.CFG has no SSID yet, Enter asks for it
+      instead. A scanned SSID is copied byte-for-byte, which is the only
+      reliable way to enter a long or non-ASCII network name.
+
+      The scan does not need a NETUP session. If one is active, its
+      negotiated NET_BAUD/NET_ESP_FLOW is tried first, then 115200; without
+      a session the order is reversed. The ESP is never reset and
+      AT+UART_CUR is never sent, so a live session stays usable afterwards.
+
+      Any failure while scanning (no card, ESP not responding, or an empty
+      list) prints a short reason and falls back to manual SSID entry; it
+      never aborts the write wizard.
+
+  NETCFG.EXE /S
+      Scan for Wi-Fi networks and print the list, then exit without editing
+      NET.CFG.
+
+  NETCFG.EXE /W /S
+      Combine both: skip the "Scan for Wi-Fi networks?" question and go
+      straight to scanning inside the write wizard.
+
+  /W and /S (also -w/-s) are case-insensitive and can appear in either order.
 
 Configuration
   The recommended runtime location is:
@@ -32,7 +69,28 @@ Important fields
   BAUD       UART speed after NETUP configures ESP. Supported values:
              230400, 115200, 57600, 38400, 19200, 9600.
 
+Notes on scanning
+  - Hidden networks (broadcasting an empty SSID) are not listed; join them
+    with manual SSID entry.
+  - The list shows at most 20 networks, the strongest ones first (the ESP
+    sorts the scan by signal). If more than that answer inside the scan
+    window, NETCFG says the list may be incomplete; move closer to the
+    access point or enter the SSID manually.
+  - A non-ASCII (UTF-8) SSID is stored as-is; it may not display correctly
+    in the DSS console's code page, but the saved bytes match what the
+    access point broadcasts.
+  - An SSID containing '#' still works when chosen from the scan list, but
+    NETUP will read back only the part before the '#' the next time NET.CFG
+    is parsed, because '#' starts a comment in that file. NETCFG warns about
+    this when such an SSID is selected or typed.
+
 Exit status
-  0  Success.
-  1  Invalid command line or usage error.
-  4  Configuration read/write error.
+  NETCFG.EXE and NETCFG.EXE /W
+    0  Success.
+    1  Invalid command line or usage error.
+    4  Configuration read/write error.
+
+  NETCFG.EXE /S
+    0  Scan completed (including an empty result).
+    2  Sprinter-WiFi card was not found.
+    3  ESP did not respond, or AT+CWLAP failed.

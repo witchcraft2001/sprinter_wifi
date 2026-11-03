@@ -3,6 +3,27 @@
 This package provides small Sprinter DSS utilities for the SprinterESP /
 Sprinter-WiFi card with ESP8266 ESP-AT firmware.
 
+## Board hardware diagnosis
+
+For board assembly diagnosis, use `HWTEST 1 TEST` (or slot `2`). It checks
+SCR data patterns, register isolation, internal modem/serial loopback and
+16-byte RX FIFO storage without ESP firmware. `HWTEST 1 BUS` repeats SCR
+writes/reads even when no UART is detected; `TX` sends 55h at 115200 8N1;
+`RTS` toggles the physical RTS output and prints MSR samples. Stop continuous
+modes with Esc/Ctrl+Z. Use the Russian `HWTEST.TXT` board probing guide for
+pin numbers and scope settings. Scope mode success means the mode stopped,
+not that hardware passed. No automatic reset or AT commands are issued.
+TEST/TX/RTS change the local UART configuration and clear FIFOs; run NETUP
+afterward. TX feeds junk into ESP: power-cycle it before AT diagnostics.
+BUS changes only the selected slot's SCR. Select the physical slot containing
+SprinterESP; do not probe an unrelated card occupying COM3.
+HWTEST rev.3 TX ignores receiver error flags (SIN can float with J2 fitted),
+while retaining a transmit-ready timeout. TEST still checks receiver errors.
+
+HWTEST exit status: `0` = TEST passed or scope mode stopped; `1` = usage;
+`2` = SCR mismatch / UART access unconfirmed; `3` = later UART test failed
+or timed out. See `docs/HWTEST.TXT` (UTF-8 source, distributed as CP866).
+
 ## Recommended firmware
 
 Use ESP-AT **V2.2.2.0**:
@@ -28,7 +49,10 @@ profile in the banner. The default transfer path remains active `+IPD`, because
 ## Utilities
 
 - `NETCFG.EXE` shows current `NET.CFG` values.
-- `NETCFG.EXE /W` edits and saves `NET.CFG`.
+- `NETCFG.EXE /W` edits and saves `NET.CFG`. It can scan for Wi-Fi networks
+  and let you pick one from a numbered list instead of typing the SSID.
+- `NETCFG.EXE /S` scans for Wi-Fi networks and prints the list without
+  editing `NET.CFG`; see `NETCFG.TXT`.
 - `NETUP.EXE` initializes the ESP module and connects to Wi-Fi using `NET.CFG`
   stored beside `NETUP.EXE`, so it also works when invoked through `PATH`.
   It detects the 2.2.1/2.2.2 ESP-AT profile once per run, keeps Wi-Fi settings
@@ -147,7 +171,8 @@ configuration in the common network kit location.
 1. Unpack the ZIP package to `C:\WIFI`, or use the OS-preinstalled copy.
 2. Add `C:\WIFI` to `PATH`, or change to `C:\WIFI` before running the tools.
 3. Run `NETCFG.EXE /W`.
-4. Enter `SSID` and `PASS`.
+4. Answer `Y` to scan for Wi-Fi networks and pick yours from the list, or
+   answer `N` (or enter `0` at the list) to type `SSID` and `PASS` by hand.
 5. Keep `DHCP=1` for normal home/router networks.
 6. Save the configuration.
 7. Run `NETUP.EXE`.
@@ -230,10 +255,13 @@ after an ESP reset. If `NETPROBE.EXE` fails after `NETUP.EXE` and `PING.EXE`
 have already succeeded, the network path may still be fine; run `NETRESET.EXE`
 and repeat `NETPROBE.EXE` for a clean firmware diagnostic.
 
-`WTERM.EXE` is useful for manual ESP-AT checks. It attaches to the active
-NETUP session and uses the published `NET_BAUD`/`NET_ESP_FLOW` values; it never
-resets ESP or sends `AT+UART_CUR`. After a manual command changes module state
-or leaves the stream confused, run `NETRESET.EXE` and then `NETUP.EXE`.
+`WTERM.EXE` is useful for manual ESP-AT checks. With an active NETUP session it
+attaches to it and uses the published `NET_BAUD`/`NET_ESP_FLOW` values; it never
+resets ESP or sends `AT+UART_CUR`. Without a session (NETUP was never run, or
+it failed before publishing one), WTERM still starts, at the ESP's power-up
+default of 115200/flow off, so it can be used to diagnose why NETUP failed.
+After a manual command changes module state or leaves the stream confused,
+run `NETRESET.EXE` and then `NETUP.EXE`.
 
 `PING.EXE` does not reset an ESP that was already brought up by `NETUP.EXE`.
 When its initial `AT` check fails, it retries and then uses the ESP-AT `+++`
@@ -300,15 +328,20 @@ Current utility-specific notes:
   invalid command line, `2` when hardware is not found, `3` on ESP/TCP/UART
   communication errors, timeout or incomplete transfer, `4` for a missing or
   invalid NETUP session, `5` for local DSS file/runtime memory errors, `6` on
-  FTP server errors, and `7` when cancelled by the user. UART integrity errors
-  also return `3`, take precedence over a
-  concurrent link close, and disable automatic REST recovery. Their UART
-  diagnostic replaces the generic server-timeout hint. Download the affected
-  file again with `-y`; do not resume it with `-r`.
-  After a UART integrity error FTP closes the local file and exits with `3`
-  without waiting for `CIPCLOSE` replies in the corrupted stream. RTS stays
-  paused; the next client's initialization handles stale ESP links. No ESP
-  reset or UART renegotiation is performed during this error exit.
+  FTP server errors, and `7` when cancelled by the user. A UART integrity
+  error (16550 OE/PE/FE/BI) takes precedence over a concurrent link close.
+  During a sized file download it is recoverable: the receive being read is
+  discarded before any byte reaches the disk, the clean retained tail is
+  flushed, and FTP tears down both links, drains the ESP, re-logins and
+  continues with REST from the verified offset (up to 12 restarts, exactly
+  like a clean data-link stall). The LSR diagnostic is printed first and
+  distinguishes a real FIFO overflow ("receive FIFO overflowed", check RTS/CTS
+  and BAUD) from an overrun flag raised while the FIFO was empty (a UART/bus
+  glitch that flow control cannot prevent). In listings and unknown-size
+  downloads the error stays fatal: FTP closes the local file and exits with
+  `3` without waiting for `CIPCLOSE` replies in the corrupted stream, RTS
+  stays paused, and the next client's initialization handles stale ESP
+  links. No ESP reset or UART renegotiation is performed in either case.
   The ESP-AT 2.2.2 active receive path holds interrupts off while draining
   the mapped UART, preserving the caller's interrupt state as in RTL's ISA
   access. Empty-FIFO polling keeps RTS stable instead of briefly resuming and

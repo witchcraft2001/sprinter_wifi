@@ -13,7 +13,7 @@ package:
 image:
 	tools/image.sh
 
-test: test-libman test-netup-busy test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-ping test-dlspeed test-race-server
+test: test-libman test-netup-busy test-netcfg-scan test-uart-profiles test-send-defer test-mux-demux test-mux-cmd test-listen test-recv-timeout test-recv-throughput test-ftp-burst test-progress test-ping test-dlspeed test-race-server
 	tools/test-zmodem.sh
 
 test-libman:
@@ -21,6 +21,9 @@ test-libman:
 
 test-netup-busy:
 	tools/test-netup-busy.sh
+
+test-netcfg-scan:
+	tools/test-netcfg-scan.sh
 
 test-uart-profiles:
 	tools/test-uart-profiles.sh

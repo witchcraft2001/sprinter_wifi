@@ -61,6 +61,10 @@ FTP_DRAIN_MAX_BYTES	EQU 8192		; safety cap on bytes discarded per drain
 FTP_SOFT_AT_RETRIES	EQU 12			; AT probes before giving up to a hard reset
 FTP_SOFT_AT_TIMEOUT	EQU 1200		; ms to wait for each AT reply
 FTP_SOFT_AT_DELAY	EQU 300			; ms between AT probes
+; SEND_CONTROL prompt handling.
+FTP_PROMPT_BUSY_RETRIES	EQU 8			; CIPSEND reissues while the ESP answers "busy p..."
+FTP_PROMPT_BUSY_DELAY	EQU 400			; ms between those reissues
+FTP_PROMPT_RETRY_TIMEOUT EQU 1000		; ms per byte for the prompt re-wait after PROMPT_RELEASE_RX
 DSS_CREATE_OVERWRITE	EQU 0x0A
 OUT_SIZE		EQU 80
 
@@ -1095,8 +1099,10 @@ ESP_PRELUDE
 		CALL	WCOMMON.CLEAN_ESP_LINKS		; drop any link a prior run left open
 		LD	HL,CMD_CIPMUX_1
 		CALL	SEND_CMD
+		IFDEF	ESP_AT_FORCE_222
 		XOR	A
 		CALL	TCP.SET_PASSIVE_RECEIVE
+		ENDIF
 		; A prior FTP build may have exited with ESP still in passive mode. The
 		; control greeting would then be a length-only +IPD which the active
 		; pre-login parser cannot consume. Always establish a known active state
@@ -1318,9 +1324,15 @@ REPORT_SESSION_SPEED
 		POP	HL				; HL = low
 		JP	TPUT.REPORT
 
+; Send the FTP command in CMD_BUFF over the control link.
+; Out: CF=0 once the payload is on the wire; CF=1 and A=RES_* otherwise, with
+;      CONTROL_ERROR_HINT naming the phase for NET_ERROR_EXIT.
 SEND_CONTROL
 		LD	HL,MSG_CONTROL_SEND_ERROR
 		LD	(CONTROL_ERROR_HINT),HL
+		LD	A,FTP_PROMPT_BUSY_RETRIES
+		LD	(PROMPT_BUSY_LEFT),A
+.SEND
 		XOR	A
 		LD	(TCP.LSR_ACCUM),A
 		CALL	PROMPT_GUARD_ON
@@ -1344,13 +1356,13 @@ SEND_CONTROL
 .UART_OK
 		POP	AF
 		RET	NC
-		; No '>' within the timeout. Whatever the ESP is doing, the payload is
-		; the right next byte stream: a module that did print the prompt (lost
-		; or still held back by flow control) is waiting for exactly these
-		; bytes, a stalled one executes the queued CIPSEND first and then takes
-		; them, and one that refused CIPSEND answers a harmless ERROR. Reissuing
-		; CIPSEND instead would be delivered to the server as payload. The reply
-		; wait that follows is the real verdict.
+.VERDICT
+		; The send helper stops before the payload whenever the prompt wait
+		; fails, so every path below transmits the payload at most once.
+		CP	RES_BUSY
+		JR	Z,.BUSY
+		CP	RES_ERROR
+		JR	Z,.REFUSED
 		CP	RES_RS_TIMEOUT
 		SCF
 		RET	NZ
@@ -1359,7 +1371,32 @@ SEND_CONTROL
 		LD	A,RES_RS_TIMEOUT
 		SCF
 		RET	NZ
+		; Silence. Release the receiver first (see PROMPT_RELEASE_RX), then
+		; look for the prompt once more, briefly: a held module answers at
+		; once, and a late ERROR/busy line gets its own verdict above.
+		CALL	PROMPT_RELEASE_RX
+		JR	C,.REWAIT
+		PRINTLN	MSG_RX_RELEASED
+.REWAIT
+		LD	HL,FTP_PROMPT_RETRY_TIMEOUT
+		LD	(TCP.PROMPT_TIMEOUT),HL
+		CALL	PROMPT_GUARD_ON
+		CALL	TCP.WAIT_PROMPT
+		CALL	PROMPT_GUARD_OFF
+		LD	HL,TCP_DEFAULT_TIMEOUT
+		LD	(TCP.PROMPT_TIMEOUT),HL
+		JR	NC,.PAYLOAD
+		CP	RES_RS_TIMEOUT
+		JR	NZ,.VERDICT
+		; No '>' at all. Whatever the ESP is doing, the payload is the right
+		; next byte stream: a module that did print the prompt (lost, or held
+		; back by flow control) is waiting for exactly these bytes, a stalled
+		; one executes the queued CIPSEND first and then takes them, and one
+		; that refused CIPSEND answers a harmless ERROR. Reissuing CIPSEND
+		; instead would be delivered to the server as payload. The reply wait
+		; that follows is the real verdict.
 		PRINTLN	MSG_PROMPT_LOST
+.PAYLOAD
 		LD	HL,CMD_BUFF
 		LD	BC,(CMD_LEN)
 		CALL	WIFI.UART_TX_BUFFER
@@ -1367,6 +1404,60 @@ SEND_CONTROL
 		RET	C
 		XOR	A
 		RET
+.BUSY
+		; "busy p...": the module dropped the CIPSEND line unread, so reissuing
+		; it cannot reach the server as payload. Give the module time first.
+		LD	A,(PROMPT_BUSY_LEFT)
+		AND	A
+		JR	Z,.BUSY_OUT
+		DEC	A
+		LD	(PROMPT_BUSY_LEFT),A
+		LD	HL,FTP_PROMPT_BUSY_DELAY
+		CALL	UTIL.DELAY
+		JP	.SEND
+.BUSY_OUT
+		LD	A,RES_BUSY
+		SCF
+		RET
+.REFUSED
+		; ERROR instead of '>': the ESP no longer has the control link ("link
+		; is not valid"). Nothing was transmitted; report the closed link.
+		LD	HL,MSG_CONTROL_REFUSED
+		LD	(CONTROL_ERROR_HINT),HL
+		LD	A,RES_NOT_CONN
+		SCF
+		RET
+
+; Undo a receiver hold before the prompt re-wait. TL16C550C 7.2: with auto-RTS
+; the RTS output is deasserted at the FIFO trigger level and "reasserted once
+; the RCV FIFO is emptied by reading the receiver buffer register". A receiver
+; FIFO reset (FCR) empties the FIFO without such a read, so a reset issued
+; while a stale tail sat at the trigger leaves RTS deasserted with nothing to
+; read: the ESP then holds every byte, the prompt included, until the program
+; ends. One RBR read plus a fresh MCR write clears that; both are harmless when
+; nothing was held. Out: CF=0 when bytes started arriving right after the
+; release (the hold was real), CF=1 otherwise.
+PROMPT_RELEASE_RX
+		CALL	ISA.ISA_OPEN
+		LD	A,(REG_LSR)
+		AND	LSR_DR
+		JR	NZ,.NOT_HELD		; bytes are already flowing
+		LD	A,(REG_RBR)
+		CALL	WIFI.UART_RX_PAUSE_OPEN
+		CALL	WIFI.UART_RX_RESUME_OPEN
+		LD	B,20			; 2 ms: a held byte shows within one byte time
+.POLL
+		LD	A,(REG_LSR)
+		AND	LSR_DR
+		JR	NZ,.HELD
+		CALL	UTIL.DELAY_100uS
+		DJNZ	.POLL
+.NOT_HELD
+		SCF
+		JP	ISA.ISA_CLOSE		; preserves flags
+.HELD
+		OR	A
+		JP	ISA.ISA_CLOSE
 
 ; The CIPSEND prompt is awaited through the byte reader, whose unguarded idle
 ; path raises RTS for a single LSR sample per tick (~13 us, three bit times at
@@ -2111,13 +2202,30 @@ RECV_DATA_TRANSFER
 		SCF
 		RET
 .UART_ERROR
-			; OE/PE/FE means an AT header or file byte was lost. The current
-			; output can no longer be repaired by REST from DATA_TOTAL: that
-			; offset is after potentially corrupt bytes. Fail this run instead
-			; of treating it as a clean close / auto-resume opportunity.
+			; OE/PE/FE means a byte of THIS receive was lost. Nothing from it
+			; reached the file: LSR_ACCUM is tested before HANDLE_DATA_BUFFER,
+			; so DATA_TOTAL still equals the bytes on disk plus the clean
+			; retained tail. A sized download therefore restarts with REST from
+			; that offset exactly like a clean stall; the caller closes the
+			; stale data link, drains the ESP and re-logins. Listings and
+			; unknown-size downloads have no safe restart offset and stay fatal.
 			CALL	WIFI.UART_RX_PAUSE
 			XOR	A
 			LD	(TRANSFER_ACTIVE),A
+			LD	A,(LIST_FLAG)
+			AND	A
+			JR	NZ,.UART_FATAL
+			LD	A,(DATA_EXPECTED_SEEN)
+			AND	A
+			JR	Z,.UART_FATAL
+			LD	A,1
+			LD	(TIMEOUT_RECOVERY),A
+			CALL	PRINT_UART_OVERRUN	; adds the resume note (TIMEOUT_RECOVERY=1)
+			; Recovered: cleanup and error hints work normally from here on.
+			XOR	A
+			LD	(UART_ERROR_REPORTED),A
+			JP	.CLOSED
+.UART_FATAL
 			CALL	PRINT_UART_OVERRUN
 			LD	A,RES_RS_TIMEOUT
 			SCF
@@ -3103,9 +3211,10 @@ PUT_CHAR
 		POP	HL,BC
 		RET
 
-; Print the exact UART error latch as well as the friendly explanation. This
-; distinguishes a real OE (bit 1) from PE/FE/BI or FIFO error (bit 7) on the
-; next real-hardware report instead of collapsing every condition to "overrun".
+; Print the exact UART error latch and a plain-language explanation. The text
+; and its decoding are cold and live in the WIN2 overlay (OVL_PRINT_UART_ERROR);
+; only the latch flag and the trace report (which reads the buffer page) stay
+; here. Callers hold RTS low; CALL_OVERLAY preserves the RECV_BUFFER page.
 PRINT_UART_OVERRUN
 		LD	A,1
 		LD	(UART_ERROR_REPORTED),A
@@ -3113,21 +3222,8 @@ PRINT_UART_OVERRUN
 		IFDEF FTP_UART_TRACE
 		CALL	UART_TRACE.REPORT
 		ENDIF
-		CALL	PRINT_UART_LSR
-		LD	A,(TCP.LSR_ACCUM)
-		AND	LSR_OE
-		JR	NZ,.OVERRUN
-		LD	A,(TCP.LSR_ACCUM)
-		AND	LSR_PE | LSR_FE | LSR_BI
-		JR	NZ,.FRAMING
-		PRINTLN MSG_UART_RX_ERROR
-		RET
-.OVERRUN
-		PRINTLN MSG_UART_OVERRUN
-		RET
-.FRAMING
-		PRINTLN MSG_UART_FRAMING
-		RET
+		LD	HL,OVL_PRINT_UART_ERROR
+		JP	CALL_OVERLAY
 
 ; Snapshot the exact active-receive state while RTS is still low. This runs
 ; only after a 20-second wait (before recovery or failure), never in the hot path.
@@ -3172,20 +3268,11 @@ PRINT_RX_TIMEOUT_DIAG
 		LD	DE,MSG_RX_DIAG_LAST_HEX
 		CALL	UTIL.HEXB
 		PRINTLN	MSG_RX_DIAG_LAST
-		; Reuse the existing exact LSR line, but not its explanatory error text:
-		; a clean recovery requires the error-bit mask to be zero.
+		; Reuse the exact LSR line, but not its explanatory error text: a clean
+		; recovery requires the error-bit mask to be zero.
+		LD	HL,OVL_PRINT_UART_LSR
+		JP	CALL_OVERLAY
 		ENDIF
-PRINT_UART_LSR
-		LD	A,(TCP.LSR_ACCUM)
-		LD	C,A
-		LD	DE,MSG_UART_LSR_ACC_HEX
-		CALL	UTIL.HEXB
-		LD	A,(TCP.LAST_LSR)
-		LD	C,A
-		LD	DE,MSG_UART_LSR_LAST_HEX
-		CALL	UTIL.HEXB
-		PRINTLN	MSG_UART_LSR
-		RET
 
 		IFNDEF FTP_UART_TRACE
 PRINT_U32_PTR_FTP
@@ -3315,6 +3402,8 @@ MSG_CONTROL_RECV_ERROR
 ; 226/221 waits may time out normally and must stay quiet.
 CONTROL_ERROR_HINT
 		DW 0
+PROMPT_BUSY_LEFT
+		DB 0
 MSG_CONNECTING
 		DB "Connecting to ",0
 MSG_COLON
@@ -3351,6 +3440,10 @@ MSG_FAILED
 		DB "FTP failed.",0
 MSG_PROMPT_LOST
 		DB "No '>' from ESP, sending anyway.",0
+MSG_RX_RELEASED
+		DB "UART RX was held; released.",0
+MSG_CONTROL_REFUSED
+		DB "ESP rejected CIPSEND: control link is closed.",0
 MSG_COMM_ERROR
 		DB "ESP communication error #"
 MSG_ERROR_NO
@@ -3362,20 +3455,9 @@ MSG_NET_ERROR_NO
 		; NET_REASON_TABLE and its hint strings live in the WIN2 cold overlay.
 MSG_FTP_ERROR
 		DB "FTP server returned error: ",0
-MSG_UART_OVERRUN
-		DB "UART overrun. Check RTS/CTS and BAUD.",0
+		; The UART error texts live in the WIN2 cold overlay (OVL_MSG_UART_*).
 UART_ERROR_REPORTED
 		DB 0
-MSG_UART_FRAMING
-		DB "UART framing/parity/break error. Check BAUD/session.",0
-MSG_UART_RX_ERROR
-		DB "UART receiver FIFO error. Received block was discarded.",0
-MSG_UART_LSR
-		DB "UART LSR accumulated=0x"
-MSG_UART_LSR_ACC_HEX
-		DB "xx, last=0x"
-MSG_UART_LSR_LAST_HEX
-		DB "xx",0
 		IFNDEF FTP_UART_TRACE
 MSG_RX_DIAG_HEADER
 		DB "RX timeout diagnostics:",0
@@ -3415,7 +3497,7 @@ MSG_INCOMPLETE
 MSG_NO_REST
 			DB "Server rejected REST; resume not supported. Re-run and choose Overwrite.",0
 MSG_AUTO_RESUME
-			DB "Data link closed early; resuming...",0
+			DB "Transfer interrupted; resuming...",0
 
 CMD_AT
 		DB "AT",13,10,0
@@ -3569,8 +3651,9 @@ HOLD_MODE
 		DB 0
 HOLD_LEN
 		DW 0
-; Set only when a clean sized-download timeout is converted into an incomplete
-; transfer so the caller can close the stale link and REST-resume safely.
+; Set when a sized download is cut short by a clean receive timeout or by a
+; UART integrity error, so the caller closes the stale link and REST-resumes
+; from DATA_TOTAL (verified bytes on disk plus the flushed clean tail).
 TIMEOUT_RECOVERY
 		DB 0
 ; FTP REST-resume state and 32-bit decimal scratch for the REST offset.
@@ -3649,9 +3732,12 @@ PASV_P2
 		; FTP reads NET_BAUD/NET_ESP_* from the NETUP environment and never
 		; loads NET.CFG. Do not reserve a dead 1.5 KiB parser buffer in WIN1.
 		DEFINE	NETCFG_SESSION_ONLY
+		DEFINE	NETCFG_NO_BAUD_TEXT		; NETUP-only helper, dead here
+		DEFINE	NETCFG_NO_SAVE			; FTP never writes NET.CFG
 		INCLUDE "netcfg_lib.asm"
 		DEFINE WCOMMON_USE_NETCFG
 		DEFINE WCOMMON_FAIL_LINE
+		DEFINE WCOMMON_NO_INIT_ESP		; NETRESET-only bring-up, dead here
 		INCLUDE "wcommon.asm"
 		INCLUDE "dss_error.asm"
 		INCLUDE "isa.asm"
@@ -3662,6 +3748,14 @@ PASV_P2
 		; Only FTP opts into fast 2.2.2 command-byte polling. Keep other clients
 		; and the field-proven 2.2.1 command reader unchanged.
 		DEFINE ESP_TCP_FAST_COMMAND_RX
+		; FTP only ever uses the CIPMUX=1 link API from esp_tcp_multi.asm.
+		; Drop the single-connection OPEN/CLOSE/SEND/RECEIVE code from this
+		; image (about 0.5 KB); other clients keep it and stay byte-identical.
+		DEFINE ESP_TCP_NO_SINGLE
+		; Let the CIPSEND prompt wait report a refused send ("link is not
+		; valid" + ERROR, "busy p...") at once, and take its per-byte timeout
+		; from TCP.PROMPT_TIMEOUT so SEND_CONTROL can run a short retry wait.
+		DEFINE ESP_TCP_PROMPT_LINES
 		INCLUDE "esp_tcp.asm"
 		DEFINE	ESP_TCP_MULTI_DIAGNOSTICS
 		INCLUDE "esp_tcp_multi.asm"
@@ -3679,6 +3773,10 @@ PASV_P2
 		IFNDEF	ESP_AT_FORCE_222
 		DEFINE	WIFI_STABLE_ACTIVE_RX
 		ENDIF
+		; Drain stale UART bytes by reading them instead of an FCR reset (see
+		; TCP.FLUSH_STALE_RX), and drop the hardware-reset helper NETRESET owns.
+		DEFINE ESPLIB_TX_CMD_DRAIN
+		DEFINE ESPLIB_NO_RESET
 		INCLUDE "esplib.asm"
 
 		MODULE MAIN
@@ -3828,6 +3926,87 @@ MSG_NETR_RXTO
 		DB "No reply from the server - it may be down or too slow (timeout).",0
 MSG_NETR_NOCONN
 		DB "The connection was closed before the transfer finished.",0
+
+; UART integrity diagnostics (cold). Prints the exact LSR latch, then decodes
+; it. A genuine receive-FIFO overflow leaves the FIFO full, so the guarded
+; 2.2.2 reader, which stops at the first error sample, always sees DR=1 with
+; OE. OE together with DR=0 was raised while the FIFO was empty: the UART
+; flagged an overrun that flow control could not have prevented, so the usual
+; RTS/CTS/BAUD advice is wrong for it and is not printed. The 2.2.1 reader
+; keeps draining after an error, so its last sample is unrelated to the
+; event and gets the generic text. Ends with the resume note when the caller
+; has already latched TIMEOUT_RECOVERY.
+OVL_PRINT_UART_ERROR
+		CALL	OVL_PRINT_UART_LSR
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_OE
+		JR	Z,.NOT_OE
+		IFDEF	ESP_AT_FORCE_221
+		JR	.OVERRUN
+		ELSE
+		IFNDEF	ESP_AT_FORCE_222
+		LD	A,(WCOMMON.UART_ESP_PROFILE)
+		CP	UART_RX_PROFILE_222
+		JR	NZ,.OVERRUN
+		ENDIF
+		LD	A,(TCP.LAST_LSR)
+		AND	LSR_DR
+		JR	NZ,.OVERRUN
+		PRINTLN	OVL_MSG_UART_OE_EMPTY
+		JR	.TAIL
+		ENDIF
+.OVERRUN
+		PRINTLN	OVL_MSG_UART_OVERRUN
+		JR	.TAIL
+.NOT_OE
+		LD	A,(TCP.LSR_ACCUM)
+		AND	LSR_PE | LSR_FE | LSR_BI
+		JR	Z,.FIFO_ERROR
+		PRINTLN	OVL_MSG_UART_FRAMING
+		JR	.TAIL
+.FIFO_ERROR
+		PRINTLN	OVL_MSG_UART_RX_ERROR
+.TAIL
+		PRINTLN	OVL_MSG_UART_DISCARDED
+		LD	A,(TIMEOUT_RECOVERY)
+		AND	A
+		RET	Z
+		PRINTLN	OVL_MSG_UART_RESUME
+		RET
+
+; "UART LSR accumulated=0xNN, last=0xNN": every error bit seen during the
+; failed receive, and the raw sample that first reported one.
+OVL_PRINT_UART_LSR
+		LD	A,(TCP.LSR_ACCUM)
+		LD	C,A
+		LD	DE,OVL_MSG_UART_LSR_ACC_HEX
+		CALL	UTIL.HEXB
+		LD	A,(TCP.LAST_LSR)
+		LD	C,A
+		LD	DE,OVL_MSG_UART_LSR_LAST_HEX
+		CALL	UTIL.HEXB
+		PRINTLN	OVL_MSG_UART_LSR
+		RET
+
+OVL_MSG_UART_LSR
+		DB "UART LSR accumulated=0x"
+OVL_MSG_UART_LSR_ACC_HEX
+		DB "xx, last=0x"
+OVL_MSG_UART_LSR_LAST_HEX
+		DB "xx",0
+OVL_MSG_UART_OVERRUN
+		DB "UART overrun: receive FIFO overflowed. Check RTS/CTS and BAUD.",0
+OVL_MSG_UART_OE_EMPTY
+		DB "UART raised its overrun flag while the FIFO was empty:",13,10
+		DB "a UART/bus glitch, not an RTS/CTS or BAUD problem.",0
+OVL_MSG_UART_FRAMING
+		DB "UART framing/parity/break error. Check BAUD/session.",0
+OVL_MSG_UART_RX_ERROR
+		DB "UART receiver FIFO error.",0
+OVL_MSG_UART_DISCARDED
+		DB "Received block discarded; nothing unverified was written.",0
+OVL_MSG_UART_RESUME
+		DB "Resuming from the last verified offset.",0
 OVL_END
 		ENT
 OVERLAY_SIZE	EQU OVL_END - OVL_BASE

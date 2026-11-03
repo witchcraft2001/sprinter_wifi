@@ -29,9 +29,10 @@ What you need
 
       NETCFG /W
 
-  Set:
-      SSID = your Wi-Fi name
-      PASS = your Wi-Fi password
+  Answer Y to scan for Wi-Fi networks and pick yours from the numbered list
+  (this is the reliable way to enter a long or non-ASCII SSID), or answer N
+  to type SSID/PASS by hand as before. Then set:
+      PASS = your Wi-Fi password   (skipped if you picked an open network)
       DHCP = 1            (leave 1 for a normal home router)
       BAUD = 115200       (use 57600 or 38400 if 115200 loses bytes)
   Save. Settings are stored in C:\WIFI\NET.CFG.
@@ -62,7 +63,9 @@ Everyday commands (run after NETUP)
                             NTP server and timezone are taken from the
                             NET_NTP/NET_TZ variables published by NETUP.
   WTERM                     open a manual ESP-AT terminal for hand-typed
-                            commands.
+                            commands. Works even without NETUP (falls back
+                            to 115200/flow off), so it can help diagnose a
+                            NETUP run that failed.
 
   Overwrite/resume of an existing local file (WGET, FTP, TFTP):
     if the file exists, the tool asks [R]esume / [O]verwrite / [C]ancel.

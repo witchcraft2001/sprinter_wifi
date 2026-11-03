@@ -292,6 +292,7 @@ RVM_SAME
 ; ------------------------------------------------------
 ; Init basic parameters of ESP
 ; ------------------------------------------------------
+	IFNDEF	WCOMMON_NO_INIT_ESP				; FTP drops this NETRESET-only bring-up
 	;;IFUSED INIT_ESP
 INIT_ESP
 	PUSH	BC, DE
@@ -322,6 +323,7 @@ INIT_ESP
 	POP		DE,BC
 	RET
 	;;ENDIF
+	ENDIF
 	IFDEF	_WCOMMON_NETCFG
 UART_FLOW_VERIFY_CMD
 	DB	"AT",13,10,0
@@ -578,6 +580,27 @@ REQUIRE_NET_UP
 	INC	DE
 	JR	.STRMATCH
 
+	IFDEF	WCOMMON_NET_SESSION_QUERY
+; ------------------------------------------------------
+; Has NETUP published a session? Only tools that must also run without one
+; (WTERM's 115200 fallback, the NETCFG scan wizard) opt in; everything else
+; uses REQUIRE_NET_UP, which checks the complete session and exits on failure.
+; Out: CF=0 - env NET equals "WIFI"; CF=1 - no session. Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+NET_SESSION_IS_WIFI
+	LD	HL,N_NET_KEY
+	LD	DE,ENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	SCF
+	RET	Z				; NET not set
+	LD	HL,ENV_VAL_BUF
+	LD	DE,V_WIFI
+	JP	@UTIL.STRCMP			; CF=0 - equal
+	ENDIF
+
 N_NET_KEY	DB "NET",0
 N_ESP_HW_KEY	DB "NET_ESP_HW",0
 N_ESP_FW_KEY	DB "NET_ESP_FW",0
@@ -610,8 +633,10 @@ COMM_ERROR_NO
 MSG_PRESS_AKEY
 	DB "Press any key to continue...",0
 
+	IFNDEF	WCOMMON_NO_INIT_ESP
 MSG_ESP_RESET
 	DB "Reset ESP module.",0
+	ENDIF
 
 MSG_UART_INIT
 	DB "Reset UART.",0

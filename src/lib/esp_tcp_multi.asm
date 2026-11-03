@@ -115,7 +115,7 @@ START_SEND_BUFFER_LINK
 	LD	DE,CMD_CRLF
 	CALL	APPEND_STR
 
-	CALL	WIFI.UART_EMPTY_RS
+	CALL	FLUSH_STALE_RX
 	LD	HL,CMD_BUFFER
 	CALL	WIFI.UART_TX_STRING
 	JR	C,.TX_TIMEOUT
@@ -135,6 +135,55 @@ START_SEND_BUFFER_LINK
 	LD	A,RES_TX_TIMEOUT
 	SCF
 	RET
+
+; ------------------------------------------------------
+; Discard stale UART bytes before a command goes out.
+; The 2.2.2 profile drains by reading RBR. TL16C550C section 7.2: with a
+; trigger level of 1, 4 or 8 the auto-RTS output is deasserted when the FIFO
+; reaches the trigger and "reasserted once the RCV FIFO is emptied by reading
+; the receiver buffer register". A receiver-FIFO reset through FCR (what
+; UART_EMPTY_RS does) empties the FIFO without that read: if an unsolicited
+; tail ("1,CLOSED", a late "SEND OK", a Wi-Fi event) had reached the trigger
+; while FTP was busy with DSS, RTS stays deasserted with nothing left to
+; drain, and every following ESP byte, the CIPSEND prompt included, is held
+; by CTS until the program ends. Bytes the ESP releases while RTS comes back
+; are discarded too (short idle gap), up to a byte cap. Errors latched by
+; those stale bytes are cleared with them; they never reached a parser.
+; The 2.2.1 profile keeps UART_EMPTY_RS unchanged.
+; ------------------------------------------------------
+FLUSH_IDLE_SAMPLES	EQU 3			; empty LSR samples 100 us apart that end the drain
+FLUSH_STALE_RX
+	IFDEF ESP_AT_FORCE_221
+	JP	WIFI.UART_EMPTY_RS
+	ELSE
+	IFNDEF ESP_AT_FORCE_222
+	LD	A,(WCOMMON.UART_ESP_PROFILE)
+	CP	UART_RX_PROFILE_222
+	JP	NZ,WIFI.UART_EMPTY_RS
+	ENDIF
+	PUSH	BC,HL
+	CALL	ISA.ISA_OPEN
+	LD	B,0			; 256-byte cap
+.NEXT
+	LD	C,FLUSH_IDLE_SAMPLES
+.SAMPLE
+	LD	HL,REG_LSR
+	LD	A,(HL)
+	AND	LSR_DR
+	JR	NZ,.TAKE
+	CALL	UTIL.DELAY_100uS
+	DEC	C
+	JR	NZ,.SAMPLE
+	JR	.DONE
+.TAKE
+	LD	HL,REG_RBR
+	LD	A,(HL)
+	DJNZ	.NEXT
+.DONE
+	CALL	ISA.ISA_CLOSE
+	POP	HL,BC
+	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Receive one +IPD payload block in multi-connection mode.
@@ -394,6 +443,10 @@ RECEIVE_ANY_LINK_BURST
 	; ------------------------------------------------------
 	; ESP-AT 2.2.2 passive receive backend.
 	;
+	; Assembled only for an explicitly forced 2.2.2 image: the universal
+	; executable never selects it (RECEIVE_ANY_LINK jumps here only under
+	; ESP_AT_FORCE_222), and FTP's WIN1 image has no room for ~480 dead bytes.
+	;
 	; AT+CIPRECVMODE=1 makes +IPD report only the amount buffered by ESP.
 	; Read the advertised bytes with AT+CIPRECVDATA instead of accepting a
 	; full TCP burst straight into the 16550.  The ESP receive buffer then
@@ -404,6 +457,7 @@ RECEIVE_ANY_LINK_BURST
 ; previous one has been read. Its documented socket buffer is 5760 bytes, and
 ; FTP's WIN2 receive area is larger, so fetch the complete notification rather
 ; than leaving a partial record that would stall the transfer.
+	IFDEF	ESP_AT_FORCE_222
 PASSIVE_READ_MAX	EQU 5760
 
 RECEIVE_ANY_LINK_PASSIVE
@@ -710,6 +764,7 @@ WAIT_PASSIVE_IPD_OR_CLOSE
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+	ENDIF	; ESP_AT_FORCE_222 passive backend
 
 ; ------------------------------------------------------
 ; Wait until ESP reports SEND OK in multi-connection mode.
@@ -924,13 +979,15 @@ APPEND_LINK_ID
 	LD	(HL),A
 	RET
 
-; Enable or disable the runtime passive backend. The firmware profile says
-; whether passive receive is supported; this latch says that FTP successfully
-; configured it for the *current* session.
+; Enable or disable the runtime passive backend (forced 2.2.2 image only).
+; The firmware profile says whether passive receive is supported; this latch
+; says that FTP successfully configured it for the *current* session.
 ; In: A=0 active, A!=0 passive.
+	IFDEF	ESP_AT_FORCE_222
 SET_PASSIVE_RECEIVE
 	LD	(PASSIVE_RECEIVE_ENABLED),A
 	RET
+	ENDIF
 
 ; Return CF=0 when ASCIIZ string at HL contains ASCIIZ substring at DE.
 LINE_CONTAINS
@@ -979,16 +1036,20 @@ CMD_CIPCLOSE_LINK_PREFIX
 	DB	"AT+CIPCLOSE=",0
 CMD_COMMA
 	DB	",",0
+	IFDEF	ESP_AT_FORCE_222
 CMD_CIPRECVDATA_PREFIX
 	DB	"AT+CIPRECVDATA=",0
 PASSIVE_DATA_PREFIX
 	DB	"+CIPRECVDATA:",0
+	ENDIF
 
 LINK_ID		DB 0
 LAST_IPD_LINK	DB 0
 PAYLOAD_LINK	DB 0
 IPD_DELIM	DB 0
+	IFDEF	ESP_AT_FORCE_222
 PASSIVE_RECEIVE_ENABLED DB 0
+	ENDIF
 	IFNDEF	ESP_AT_FORCE_221
 ; State used only by RECEIVE_ANY_LINK_BURST. A parsed different-link payload or
 ; terminal result survives one return so the public receive ordering is exact.

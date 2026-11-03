@@ -71,12 +71,18 @@ START
     PRINTLN MSG_START
 
 	CALL	@WCOMMON.FIND_SWF
-	; WTERM is a client of the active NETUP session. Load its published
-	; firmware/flow profile before touching the local 16550, exactly as PING
-	; and the transfer utilities do. This is essential at 230400: ESP flow=3
-	; needs MCR_AFE|RTS, not the standalone terminal's old manual default.
-	CALL	WCOMMON.REQUIRE_NET_UP
+	; WTERM is normally a client of the active NETUP session: load its
+	; published firmware/flow profile before touching the local 16550,
+	; exactly as PING and the transfer utilities do. This is essential at
+	; 230400: ESP flow=3 needs MCR_AFE|RTS, not the standalone terminal's old
+	; manual default. But a failed or partial NETUP run must not make WTERM
+	; itself unusable for diagnosing it: without a NET=WIFI session, fall
+	; back to the ESP's own power-up default (115200, flow off) instead of
+	; refusing to start.
+	CALL	WCOMMON.NET_SESSION_IS_WIFI
+	JR	C,.NO_SESSION
 
+	CALL	WCOMMON.REQUIRE_NET_UP
 	PRINTLN WCOMMON.MSG_UART_INIT
 	; Attach to the live NETUP session. AT+UART_CUR is session state on the
 	; module: resetting ESP here while NET_BAUD is 230400 leaves the terminal
@@ -84,6 +90,12 @@ START
 	; safe power-up default is deliberately not used: run NETUP after NETRESET
 	; to publish the actual session parameters first.
 	CALL	WCOMMON.APPLY_NET_BAUD
+	JR	.UART_READY
+.NO_SESSION
+	PRINTLN	MSG_NO_SESSION
+	CALL	WIFI.UART_SET_DEFAULT_DIVISOR
+	CALL	WIFI.UART_FLOW_OFF
+.UART_READY
 	CALL	WIFI.UART_INIT
 	CALL	WCOMMON.SYNC_ESP_COMMAND
 	AND	A
@@ -245,6 +257,8 @@ MSG_ATTACH_ERROR
 	DB "Cannot attach to ESP at NET_BAUD (error #"
 MSG_ATTACH_ERROR_NO
 	DB "0). Run NETUP or NETRESET.",0
+MSG_NO_SESSION
+	DB "No NETUP session - using 115200, flow off.",0
 MSG_HLP
 	DB 13,10,"Enter ESP AT command or Alt+x to close terminal.",0
 MSG_EXIT
@@ -287,6 +301,7 @@ BUFF_TEST1	DS RS_BUFF_SIZE,0
 	ENDMODULE
 
 	DEFINE WCOMMON_USE_NETCFG
+	DEFINE WCOMMON_NET_SESSION_QUERY	; 115200 fallback when NETUP published no session
 	INCLUDE "wcommon.asm"
 	INCLUDE "dss_error.asm"
 	;INCLUDE "util.asm"

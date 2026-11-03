@@ -679,6 +679,7 @@ UVR_CANCEL_INT
 ; ------------------------------------------------------
 ; Reset ESP module
 ; ------------------------------------------------------
+	IFNDEF	ESPLIB_NO_RESET						; FTP drops this NETRESET/NETUP-only helper
 	;IFUSED	ESP_RESET
 ESP_RESET
 	PUSH	AF,HL
@@ -701,6 +702,7 @@ ESP_RESET
 	POP		HL,AF
 	RET
 	;ENDIF
+	ENDIF
 
 ; ------------------------------------------------------
 ; UART TX Command
@@ -730,7 +732,13 @@ UART_TX_CMD
 	LD		(DE), A
 
 	LD		(WAIT_MS), BC
+	IFDEF	ESPLIB_TX_CMD_DRAIN
+	; FTP: drain stale bytes by reading them (see TCP.FLUSH_STALE_RX); the
+	; FCR receiver reset below can leave auto-RTS deasserted on the TL16C550C.
+	CALL	@TCP.FLUSH_STALE_RX
+	ELSE
 	CALL	UART_EMPTY_RS
+	ENDIF
 
 	; HL - Buffer, BC - Size
 	;CALL	UTIL.STRLEN

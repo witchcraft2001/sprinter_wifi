@@ -59,7 +59,8 @@ On Sprinter DSS:
 
 ```text
 NETCFG.EXE       show current NET.CFG values
-NETCFG.EXE /W    edit and save NET.CFG interactively
+NETCFG.EXE /W    edit and save NET.CFG interactively (offers a Wi-Fi scan)
+NETCFG.EXE /S    scan and list Wi-Fi networks without editing NET.CFG
 NETUP.EXE        initialize ESP and connect using NET.CFG
 TCPTEST.EXE      connect to example.com:80 and print a short HTTP response
 TCPTEST.EXE host port path

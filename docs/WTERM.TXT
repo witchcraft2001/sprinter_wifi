@@ -13,20 +13,31 @@ Controls
 
 Typical use
   WTERM is useful for commands that are not available as separate utilities.
-  Run NETUP.EXE first. WTERM attaches to the active NETUP session, using its
-  published baud rate and flow-control mode; it does not reset ESP or send
-  AT+UART_CUR.
+  Normally, run NETUP.EXE first: WTERM then attaches to the active NETUP
+  session, using its published baud rate and flow-control mode; it does not
+  reset ESP or send AT+UART_CUR.
+
+  Running NETUP is no longer required to start WTERM. Without a NET=WIFI
+  session (NETUP was never run, or it failed before publishing one), WTERM
+  prints "No NETUP session - using 115200, flow off." and starts the ESP's
+  own power-up default instead of refusing to start. This is the way to
+  reach the ESP manually (for example to try AT+CWLAP) when NETUP itself did
+  not complete. If a NET=WIFI session does exist but is incomplete or
+  malformed, WTERM still reports it and exits (see status 4 below), since a
+  half-published session cannot be trusted for the negotiated baud/flow.
 
 After use
   Run NETRESET.EXE before automated utilities if the ESP stream looks confused
   or if manual commands changed module state.
 
 Baud rate
-  WTERM uses NET_BAUD and NET_ESP_FLOW published by NETUP. Do not change the
-  ESP UART speed manually in WTERM unless you are prepared to recover with
-  NETRESET.EXE followed by NETUP.EXE.
+  With an active NETUP session, WTERM uses its published NET_BAUD and
+  NET_ESP_FLOW. Without one, it uses the ESP's power-up default (115200,
+  flow off). Do not change the ESP UART speed manually in WTERM unless you
+  are prepared to recover with NETRESET.EXE followed by NETUP.EXE.
 
 Exit status
   0  Terminal exited normally.
   2  Sprinter-WiFi hardware was not found.
   3  ESP/UART communication error.
+  4  A NET=WIFI session exists but is incomplete or invalid.

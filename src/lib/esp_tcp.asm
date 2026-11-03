@@ -87,6 +87,11 @@ RES_CONN_EVT		EQU 21	; WAIT_IPD_HEADER_MUX matched a spontaneous
 ; single-connection app (ftp/wget/tftp/etc, which never define ESP_TCP_MUX)
 ; byte-identical while freeing image bytes for the mux-only UNETESP.DLL build.
 	IFNDEF ESP_TCP_MUX
+; ESP_TCP_NO_SINGLE (opt-in, FTP only): omit the single-connection API
+; (OPEN/CLOSE/SEND_BUFFER*/RECEIVE/WAIT_SEND_OK and their AT strings). FTP
+; talks through esp_tcp_multi.asm only and its WIN1 image is at the ceiling;
+; every other client leaves this undefined and stays byte-identical.
+	IFNDEF ESP_TCP_NO_SINGLE
 ; ------------------------------------------------------
 ; Open a single TCP connection.
 ; In: HL - host ASCIIZ, DE - port ASCIIZ.
@@ -118,6 +123,7 @@ OPEN
 	LD	HL,CMD_BUFFER
 	LD	BC,TCP_OPEN_TIMEOUT
 	JP	TX_CMD_BUSY_RETRY
+	ENDIF	; ESP_TCP_NO_SINGLE
 
 ; ------------------------------------------------------
 ; Send the AT command at HL (timeout BC), retrying while the ESP answers
@@ -155,6 +161,7 @@ TX_CMD_BUSY_RETRY
 	SCF
 	RET
 
+	IFNDEF ESP_TCP_NO_SINGLE
 ; ------------------------------------------------------
 ; Close the current TCP connection.
 ; Out: CF=0/A=0 on success, CF=1/A=ESP result code on failure.
@@ -168,8 +175,10 @@ CLOSE
 	RET	Z
 	SCF
 	RET
+	ENDIF	; ESP_TCP_NO_SINGLE
 	ENDIF
 
+	IFNDEF ESP_TCP_NO_SINGLE
 ; ------------------------------------------------------
 ; Send a raw TCP payload.
 ; In: HL - payload, BC - payload length.
@@ -183,6 +192,7 @@ SEND_BUFFER
 	ELSE
 	JP	WAIT_SEND_OK
 	ENDIF
+	ENDIF	; ESP_TCP_NO_SINGLE
 
 ; ------------------------------------------------------
 ; Send a raw TCP payload and return immediately after UART transmit.
@@ -195,9 +205,11 @@ SEND_BUFFER
 ;   payload, so such callers should scan for +IPD themselves after this call.
 ; ------------------------------------------------------
 	IFNDEF ESP_TCP_MUX
+	IFNDEF ESP_TCP_NO_SINGLE
 SEND_BUFFER_NO_WAIT
 	CALL	START_SEND_BUFFER
 	RET
+	ENDIF	; ESP_TCP_NO_SINGLE
 	ENDIF
 
 	IFDEF ESP_TCP_MUX
@@ -235,6 +247,7 @@ ASYNC_RESET
 	RET
 	ENDIF
 
+	IFNDEF ESP_TCP_NO_SINGLE
 START_SEND_BUFFER
 	LD	(SEND_PTR),HL
 	LD	(SEND_LEN),BC
@@ -306,8 +319,10 @@ START_SEND_BUFFER
 	LD	A,RES_TX_TIMEOUT
 	SCF
 	RET
+	ENDIF	; ESP_TCP_NO_SINGLE
 
 	IFNDEF ESP_TCP_MUX
+	IFNDEF ESP_TCP_NO_SINGLE
 ; ------------------------------------------------------
 ; Receive one +IPD payload block.
 ; In: HL - destination buffer, BC - max stored bytes, DE - timeout ms.
@@ -411,6 +426,7 @@ RECEIVE
 .DONE
 	CALL	ISA.ISA_CLOSE
 	RET
+	ENDIF	; ESP_TCP_NO_SINGLE
 	ENDIF
 
 ; CF=0 when there is enough caller buffer left to consume another full
@@ -438,6 +454,9 @@ CAN_READ_ANOTHER_ACTIVE_IPD
 WAIT_PROMPT
 	PUSH	IX
 	LD	IX,IPD_PREFIX
+	IFDEF ESP_TCP_PROMPT_LINES
+	CALL	PROMPT_LINE_RESET
+	ENDIF
 	IFDEF ESP_TCP_MUX
 	; A suspended wait (ASYNC_MODE) resumes exactly where it left off,
 	; including a half-matched "+IPD," prefix - restarting the match there
@@ -453,7 +472,11 @@ WAIT_PROMPT
 	IFDEF ESP_TCP_MUX
 	LD	BC,(WSO_TIMEOUT)	; slice in async mode, 5 s otherwise
 	ELSE
+	IFDEF ESP_TCP_PROMPT_LINES
+	LD	BC,(PROMPT_TIMEOUT)	; 5 s, or the short retry wait FTP sets
+	ELSE
 	LD	BC,TCP_DEFAULT_TIMEOUT
+	ENDIF
 	ENDIF
 	IFDEF ESP_TCP_MUX
 	LD	A,(MUX_WINDOW_OPEN)
@@ -475,6 +498,10 @@ WAIT_PROMPT
 	LD	E,A
 	CP	'>'
 	JR	Z,.OK_POP
+	IFDEF ESP_TCP_PROMPT_LINES
+	CALL	PROMPT_LINE_FEED	; CF=1: the module refused the send
+	JP	C,.LINE_POP
+	ENDIF
 	LD	A,(IX+0)
 	CP	E
 	JR	NZ,.IPD_RESET
@@ -502,6 +529,9 @@ WAIT_PROMPT
 	ENDIF
 	JR	C,.TIMEOUT_POP
 	LD	IX,IPD_PREFIX
+	IFDEF ESP_TCP_PROMPT_LINES
+	CALL	PROMPT_LINE_RESET
+	ENDIF
 	JR	.NEXT
 .OK_POP
 	POP	IX
@@ -529,7 +559,69 @@ WAIT_PROMPT
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+	IFDEF ESP_TCP_PROMPT_LINES
+.LINE_POP
+	POP	IX			; A = RES_ERROR / RES_BUSY, CF=1
+	RET
 
+; Track the current AT line during the prompt wait, so a module that refuses
+; the CIPSEND is reported at once instead of after the full prompt timeout:
+; "link is not valid" followed by ERROR (the link is gone), or "busy p..."
+; (the command line was dropped unread and may be reissued). Ordinary lines
+; ("OK", "Recv N bytes") stay transparent; a partial line never counts.
+; In: E = received byte (preserved). Out: CF=1 and A = RES_ERROR / RES_BUSY
+; on such a line, otherwise CF=0.
+PROMPT_LINE_RESET
+	LD	HL,LINE_BUFFER
+	LD	(PROMPT_LINE_PTR),HL
+	RET
+
+PROMPT_LINE_FEED
+	LD	A,E
+	CP	13
+	RET	Z			; CR: CF=0
+	PUSH	DE
+	LD	HL,(PROMPT_LINE_PTR)
+	CP	10
+	JR	Z,.END
+	LD	DE,LINE_BUFFER+TCP_LINE_SIZE-1
+	OR	A
+	SBC	HL,DE
+	ADD	HL,DE
+	JR	NC,.FULL		; keep the terminator slot; drop the overflow
+	POP	DE
+	LD	(HL),E
+	INC	HL
+	LD	(PROMPT_LINE_PTR),HL
+	OR	A			; CF=0
+	RET
+.FULL
+	POP	DE
+	OR	A
+	RET
+.END
+	LD	(HL),0
+	CALL	PROMPT_LINE_RESET
+	LD	HL,MSG_ERROR
+	LD	DE,LINE_BUFFER
+	CALL	UTIL.STRCMP		; CF=0: the line is exactly "ERROR"
+	LD	A,RES_ERROR
+	JR	NC,.VERDICT
+	LD	HL,LINE_BUFFER
+	LD	DE,WIFI.MSG_BUSY
+	CALL	UTIL.STARTSWITH		; Z: "busy p..." / "busy s..."
+	LD	A,RES_BUSY
+	JR	Z,.VERDICT
+	POP	DE
+	OR	A			; CF=0: an ordinary line
+	RET
+.VERDICT
+	POP	DE
+	SCF
+	RET
+	ENDIF
+
+	IFNDEF ESP_TCP_NO_SINGLE
 ; ------------------------------------------------------
 ; Wait until ESP reports SEND OK / ERROR / FAIL.
 ; Like WAIT_PROMPT, this is IPD-aware: when the line being accumulated
@@ -849,6 +941,7 @@ WAIT_SEND_OK
 	LD	A,RES_RS_TIMEOUT
 	SCF
 	RET
+	ENDIF	; ESP_TCP_NO_SINGLE
 
 	IFNDEF ESP_TCP_MUX
 ; ------------------------------------------------------
@@ -3145,16 +3238,22 @@ APPEND_IX_STR
 	JR	APPEND_IX_STR
 
 	IFNDEF ESP_TCP_MUX
+	IFNDEF ESP_TCP_NO_SINGLE
 CMD_CIPSTART_PREFIX
 	DB	"AT+CIPSTART=",34,"TCP",34,",",34,0
+	ENDIF
 CMD_CIPSTART_MIDDLE
 	DB	34,",",0
 	ENDIF
+	IFNDEF ESP_TCP_NO_SINGLE
 CMD_CIPSEND_PREFIX
 	DB	"AT+CIPSEND=",0
+	ENDIF
 	IFNDEF ESP_TCP_MUX
+	IFNDEF ESP_TCP_NO_SINGLE
 CMD_CIPCLOSE
 	DB	"AT+CIPCLOSE",13,10,0
+	ENDIF
 	ENDIF
 CMD_CRLF
 	DB	13,10,0
@@ -3231,6 +3330,10 @@ DIAG_END
 	ENDIF
 
 LINE_REMAIN	DB 0
+	IFDEF ESP_TCP_PROMPT_LINES
+PROMPT_LINE_PTR	DW 0			; PROMPT_LINE_FEED store pointer
+PROMPT_TIMEOUT	DW TCP_DEFAULT_TIMEOUT	; per-byte WAIT_PROMPT timeout; FTP shortens it for its retry wait
+	ENDIF
 
 	IFNDEF ESP_TCP_MUX
 ; TX_CMD_BUSY_RETRY state

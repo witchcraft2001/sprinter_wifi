@@ -35,8 +35,19 @@ Flags
   A clean data-link timeout in a sized download preserves the verified bytes,
   closes the stale links, reconnects, and continues with REST. Before recovery
   FTP prints RX timeout diagnostics (total/expected/held bytes, +IPD parser
-  phase, payload-left, last header byte, and UART LSR). UART integrity errors
-  are never auto-resumed because the saved file offset is then untrustworthy.
+  phase, payload-left, last header byte, and UART LSR).
+  A UART integrity error (overrun, framing, parity or break reported by the
+  16550) during a sized download is handled the same way: the block being
+  received is discarded before anything reaches the disk, so the file offset
+  stays trustworthy, and FTP reconnects and continues with REST from it after
+  printing the LSR diagnostic ("UART LSR accumulated=0xNN, last=0xNN"). Up to
+  12 such restarts are made per download. Listings and downloads of unknown
+  size cannot restart and still fail with exit status 3.
+  The diagnostic tells the two overrun cases apart: "receive FIFO overflowed"
+  means the ESP kept sending while the Sprinter could not read (check RTS/CTS
+  wiring and BAUD), while "overrun flag while the FIFO was empty" means the
+  UART reported an overrun that flow control could not have prevented; such
+  glitches are rare and the automatic restart is the intended remedy.
 
 Run NETUP first. FTP.EXE uses the active network connection and does not join
 Wi-Fi by itself.
@@ -80,8 +91,20 @@ Exit Codes
 
 Notes
 -----
+  "UART RX was held; released." means the Sprinter's UART had stopped the
+  ESP (hardware RTS) with nothing left to read, so the ESP could not deliver
+  its CIPSEND prompt; FTP released the receiver and went on normally. The
+  16550 raises RTS again only when a read empties its FIFO, and a FIFO reset
+  issued while stale ESP output sat at the trigger level used to leave it
+  low; FTP now drains such output by reading it, so this line should be rare.
   "No '>' from ESP, sending anyway." means the ESP did not print its
-  AT+CIPSEND prompt in time. FTP then sends the control command regardless:
-  a module that is merely slow still takes it, and if the ESP really is
-  stuck the following reply wait reports the error. Seeing this line now and
-  then is harmless; seeing it on every command is worth reporting.
+  AT+CIPSEND prompt in time, even after that release. FTP then sends the
+  control command regardless: a module that is merely slow still takes it,
+  and if the ESP really is stuck the following reply wait reports the error.
+  Seeing this line now and then is harmless; seeing it on every command is
+  worth reporting.
+  "ESP rejected CIPSEND: control link is closed." means the ESP answered
+  ERROR instead of the prompt because it no longer has the control
+  connection (the server or the Wi-Fi link dropped it). Nothing was sent;
+  FTP stops with exit status 3. A "busy p..." answer to CIPSEND is retried a
+  few times automatically before it is reported as error #9.
